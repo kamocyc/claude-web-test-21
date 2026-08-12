@@ -88,7 +88,10 @@ export function computeDemand(inp: DemandInputs): DemandState {
       60 * safe(inp.unmetInputDemand, Math.max(1, inp.industryCapacity)) +
       35 * Math.min(1, inp.lumberShortfall / 20) +
       (inp.population > 60 && inp.industryCapacity < 4 ? 40 : 0) -
-      95 * Math.max(0, Math.min(1, inp.starvedFraction)) -
+      // ペナルティを強くしすぎると、不足を解消する当の生産施設（製材所など）
+      // まで建たなくなり、「原料不足 → 工業需要マイナス → 製材所が建たない →
+      // 永久に原料不足」というデッドロックになる。抑制はするが止めない。
+      45 * Math.max(0, Math.min(1, inp.starvedFraction)) -
       taxI,
   );
 

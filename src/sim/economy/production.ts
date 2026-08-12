@@ -25,6 +25,11 @@ export interface ProductionStats {
   inputConsumingBuildings: number;
   /** 入力不足の総量（需要モデルへ返す）。 */
   unmetInputDemand: number;
+  /**
+   * 資源ごとの不足量。
+   * 「足りていない資源を作る建物」を建ちやすくするために使う。
+   */
+  unmetByGood: Float64Array;
   industryCapacity: number;
 }
 
@@ -36,6 +41,7 @@ export function newProductionStats(): ProductionStats {
     starvedBuildings: 0,
     inputConsumingBuildings: 0,
     unmetInputDemand: 0,
+    unmetByGood: new Float64Array(8),
     industryCapacity: 0,
   };
 }
@@ -68,6 +74,7 @@ export function runProduction(
   stats.starvedBuildings = 0;
   stats.inputConsumingBuildings = 0;
   stats.unmetInputDemand = 0;
+  stats.unmetByGood.fill(0);
   stats.industryCapacity = 0;
 
   const month = clock.month;
@@ -113,6 +120,7 @@ export function runProduction(
         haveTotal += have;
         const r = wanted > 0 ? Math.min(1, have / wanted) : 1;
         if (r < minRatio) minRatio = r;
+        if (r < 1) stats.unmetByGood[need.good]! += wanted - have;
       }
       if (a.anyInput) {
         const perOutput = a.inputs[0]!.per;

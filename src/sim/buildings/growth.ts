@@ -114,6 +114,11 @@ export class GrowthSystem {
     rng: Rng,
     lumberAvailable: number,
     cityPopulation: number,
+    /** 資源ごとの不足量。足りない資源を作る建物が選ばれやすくなる。 */
+    unmetByGood?: Float64Array,
+    /** 資源ごとの在庫と時間生産量。原料が地元で手に入るかの判定に使う。 */
+    goodsStock?: Float64Array,
+    goodsProduced?: Float64Array,
   ): { lumberUsed: number } {
     if (this.dirty) this.rebuildIndex(world);
     if (this.candidates.length === 0) return { lumberUsed: 0 };
@@ -152,12 +157,20 @@ export class GrowthSystem {
         continue;
       }
 
-      const archId = pickArchetype(zone, s, rng, cityPopulation);
+      let archId = pickArchetype(zone, s, rng, cityPopulation, unmetByGood, goodsStock, goodsProduced);
       if (archId < 0) continue;
-      const a = archetype(archId);
+      let a = archetype(archId);
+
+      // 選んだ建物が入らなければ、入る中で最も小さいものに落とす。
+      // ここで諦めると、区画の隅に残った 1 マスの空きに 2×2 の建物ばかり
+      // 抽選され続けて永久に埋まらない（人口が伸び止まる原因になっていた）。
+      if (!footprintFree(world, tile, a.w, a.h)) {
+        const fallback = smallestFitting(world, tile, zone, cityPopulation, unmetByGood, goodsStock, goodsProduced);
+        if (fallback < 0) continue;
+        archId = fallback;
+        a = archetype(archId);
+      }
       const level = a.minLevel;
-      // フットプリントが入るか
-      if (!footprintFree(world, tile, a.w, a.h)) continue;
 
       const handle = buildings.create(world, archId, tile, level);
       if (handle !== 0) {
@@ -216,6 +229,30 @@ export class GrowthSystem {
   }
 }
 
+/**
+ * その業種が今の街で成り立つか（原料が地元で手に入るか）。
+ *
+ * 「不足していない」だけでは足りない。街のどこにも在庫も生産も無い資源は、
+ * まだ誰も欲しがっていないので不足量が 0 に見えるだけで、実際には手に入らない。
+ */
+function inputsObtainable(
+  archId: number,
+  unmetByGood?: Float64Array,
+  goodsStock?: Float64Array,
+  goodsProduced?: Float64Array,
+): boolean {
+  const a = archetype(archId);
+  if (a.inputs.length === 0) return true;
+  if (!unmetByGood) return true;
+  const ok = (g: number): boolean => {
+    if ((unmetByGood[g] ?? 0) > 20) return false;
+    if (!goodsStock || !goodsProduced) return true;
+    return (goodsStock[g] ?? 0) > 0 || (goodsProduced[g] ?? 0) > 0;
+  };
+  // anyInput の建物は「どれか 1 つ」手に入れば操業できる。
+  return a.anyInput ? a.inputs.some((i) => ok(i.good)) : a.inputs.every((i) => ok(i.good));
+}
+
 function footprintFree(world: World, origin: number, w: number, h: number): boolean {
   const ox = tileX(origin);
   const oy = tileY(origin);
@@ -230,6 +267,39 @@ function footprintFree(world: World, origin: number, w: number, h: number): bool
     }
   }
   return true;
+}
+
+/**
+ * そのタイルに実際に収まる建物のうち、最も専有面積が小さいものを返す。
+ * 区画の端に残った狭い空きを埋めるための保険。
+ */
+function smallestFitting(
+  world: World,
+  tile: number,
+  zone: Zone,
+  cityPopulation: number,
+  unmetByGood?: Float64Array,
+  goodsStock?: Float64Array,
+  goodsProduced?: Float64Array,
+): number {
+  const list = ZONE_ARCHETYPES[zone];
+  if (!list || list.length === 0) return -1;
+  let best = -1;
+  let bestArea = Infinity;
+  for (const id of list) {
+    const a = archetype(id);
+    if (cityPopulation < a.minCityPopulation) continue;
+    // 原料が手に入らない業種で穴埋めしない。
+    // 小さいというだけで町工場を置いていくと、区画が分断されて
+    // 本当に必要な 2×2 の食品工場・製材所がどこにも入らなくなる。
+    if (!inputsObtainable(id, unmetByGood, goodsStock, goodsProduced)) continue;
+    const area = a.w * a.h;
+    if (area >= bestArea) continue;
+    if (!footprintFree(world, tile, a.w, a.h)) continue;
+    best = id;
+    bestArea = area;
+  }
+  return best;
 }
 
 /** 接道判定。建物のフットプリントに隣接する道路があるか。 */
@@ -256,7 +326,15 @@ function neighborDensity(world: World, tile: number): number {
 }
 
 /** ゾーンと魅力度からアーキタイプを選ぶ。魅力度が高いほど高密度の建物が出る。 */
-function pickArchetype(zone: Zone, desirability: number, rng: Rng, cityPopulation: number): number {
+function pickArchetype(
+  zone: Zone,
+  desirability: number,
+  rng: Rng,
+  cityPopulation: number,
+  unmetByGood?: Float64Array,
+  goodsStock?: Float64Array,
+  goodsProduced?: Float64Array,
+): number {
   const all = ZONE_ARCHETYPES[zone];
   if (!all || all.length === 0) return -1;
   // 市の規模に達していない建物は候補から外す（タワーマンションは大都市になってから）。
@@ -276,7 +354,23 @@ function pickArchetype(zone: Zone, desirability: number, rng: Rng, cityPopulatio
     const a = archetype(id);
     const density = a.minLevel / 5;
     // desirability と density が近いものを好む
-    return Math.exp(-Math.abs(desirability - density) * 4) + 0.05;
+    let w = Math.exp(-Math.abs(desirability - density) * 4) + 0.05;
+    // 街に足りていない資源を作る建物は儲かるので建ちやすい。
+    // これが無いと、原木が山積みでも製材所が偶然建つのを待つことになり、
+    // サプライチェーンの欠けた輪がいつまでも埋まらない。
+    //
+    // ただし「原料が手に入らない業種」は逆に抑える。品薄だからという理由だけで
+    // 建てると、木材が無いのに町工場ばかり数百棟建って全部休止する
+    // （実際にそうなった）。作れる見込みのある業種だけを後押しする。
+    if (unmetByGood && a.output !== 0) {
+      if (inputsObtainable(id, unmetByGood, goodsStock, goodsProduced)) {
+        const shortage = unmetByGood[a.output] ?? 0;
+        w *= 1 + 3 * Math.min(1, shortage / 40);
+      } else {
+        w *= 0.15;
+      }
+    }
+    return w;
   });
   const pick = rng.weightedPick(weights);
   return pick < 0 ? list[0]! : list[pick]!;

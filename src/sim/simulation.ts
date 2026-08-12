@@ -2,12 +2,15 @@ import {
   COST_SMOOTHING_LAMBDA,
   FREIGHT_DISPATCH_INTERVAL,
   LUMBER_IMPORT_YEN,
+  NEUTRAL_TAX_PCT,
   RAIL_BUILD_COST,
   ROAD_ACCESS_RADIUS,
   STOCKOUT_ABANDON_DAYS,
   TICKS_PER_DAY,
   TICKS_PER_HOUR,
   VOLUME_DECAY,
+  MAP_H,
+  MAP_W,
 } from '@shared/constants';
 import {
   DemandKind,
@@ -15,6 +18,7 @@ import {
   Mode,
   ROAD_BUILD_COST,
   RoadClass,
+  ZONE_NAMES_JA,
   Zone,
 } from '@shared/enums';
 import { ActivitySystem, newActivityStats } from '@sim/agents/activity';
@@ -23,9 +27,10 @@ import { Destinations } from '@sim/agents/destinations';
 import { LifecycleSystem, createCitizen, newHouseholdId, resetHouseholdIds } from '@sim/agents/lifecycle';
 import { Arch, archetype, isShop } from '@sim/buildings/archetypes';
 import { BuildingStore, handleSlot } from '@sim/buildings/buildings';
-import { computeDemand, type DemandState } from '@sim/buildings/demand';
+import { computeDemand, taxPenalty, type DemandState } from '@sim/buildings/demand';
 import { GrowthSystem } from '@sim/buildings/growth';
 import { Clock } from '@sim/core/clock';
+import type { AlertKind } from '@sim/core/events';
 import { hashArrays } from '@sim/core/hash';
 import { Rng } from '@sim/core/rng';
 import { TimeWheel } from '@sim/core/timeWheel';
@@ -136,47 +141,91 @@ export class Simulation {
     switch (cmd.t) {
       case 'buildRoad': {
         let built = 0;
+        let blockedByTerrain = 0;
+        let outOfMoney = false;
         for (const tile of cmd.tiles) {
           const cost = ROAD_BUILD_COST[cmd.cls]!;
           if (this.world.road[tile] === cmd.cls) continue;
-          if (!this.world.canBuildRoad(tile)) continue;
-          if (!this.budget.spend(cost)) break;
+          if (!this.world.canBuildRoad(tile)) {
+            blockedByTerrain++;
+            continue;
+          }
+          if (!this.budget.spend(cost)) {
+            outOfMoney = true;
+            break;
+          }
           this.clearBuildingAt(tile);
           if (this.world.setRoad(tile, cmd.cls)) built++;
           else this.budget.refund(cost);
         }
         if (built > 0) this.onNetworkChanged();
+        else if (outOfMoney) this.notify('budgetDeficit', cmd.tiles[0] ?? 0, '資金が足りず道路を敷けませんでした');
+        else if (blockedByTerrain > 0) {
+          this.notify('noRoadAccess', cmd.tiles[0] ?? 0, '海・河川・山地・急斜面には道路を敷けません');
+        }
         break;
       }
       case 'buildRail': {
         let built = 0;
+        let blocked = 0;
+        let outOfMoney = false;
         for (const tile of cmd.tiles) {
           if (this.world.rail[tile] !== 0) continue;
-          if (!this.world.canBuildRail(tile)) continue;
-          if (!this.budget.spend(RAIL_BUILD_COST)) break;
+          if (!this.world.canBuildRail(tile)) {
+            blocked++;
+            continue;
+          }
+          if (!this.budget.spend(RAIL_BUILD_COST)) {
+            outOfMoney = true;
+            break;
+          }
           this.clearBuildingAt(tile);
           if (this.world.setRail(tile, true)) built++;
           else this.budget.refund(RAIL_BUILD_COST);
         }
         if (built > 0) this.onNetworkChanged();
+        else if (outOfMoney) this.notify('budgetDeficit', cmd.tiles[0] ?? 0, '資金が足りず線路を敷けませんでした');
+        else if (blocked > 0) this.notify('noRoadAccess', cmd.tiles[0] ?? 0, 'ここには線路を敷けません');
         break;
       }
       case 'zonePaint': {
-        let changed = false;
+        let changed = 0;
+        let rejected = 0;
         for (const tile of cmd.tiles) {
-          if (this.world.setZone(tile, cmd.zone)) changed = true;
+          if (this.world.setZone(tile, cmd.zone)) changed++;
+          else if (cmd.zone !== Zone.None && this.world.zone[tile] !== cmd.zone) rejected++;
         }
-        if (changed) {
-          this.growth.markDirty();
+        if (changed > 0) this.growth.markDirty();
+        else if (rejected > 0) {
+          // 水田は低湿地のみ、林業は森林のみ、といった地形制約で弾かれた場合
+          this.notify(
+            'noRoadAccess',
+            cmd.tiles[0] ?? 0,
+            `${ZONE_NAMES_JA[cmd.zone] ?? '用途地域'}はこの地形には指定できません`,
+          );
         }
         break;
       }
       case 'placeBuilding': {
         const a = archetype(cmd.archetype);
-        if (!this.budget.spend(a.buildCost)) break;
+        // 先に置けるかを見る。黙って何も起きないと、プレイヤは
+        // 「ゲームが反応していない」としか受け取れない。
+        if (!this.canPlace(cmd.archetype, cmd.tile)) {
+          this.notify(
+            'noRoadAccess',
+            cmd.tile,
+            `${a.nameJa}はここに建てられません（道路・線路・既存の建物・急斜面・水面は不可）`,
+          );
+          break;
+        }
+        if (!this.budget.spend(a.buildCost)) {
+          this.notify('budgetDeficit', cmd.tile, `資金が足りません（${a.nameJa} は ${a.buildCost.toLocaleString('ja-JP')}円）`);
+          break;
+        }
         const handle = this.buildings.create(this.world, cmd.archetype, cmd.tile, 1);
         if (handle === 0) {
           this.budget.refund(a.buildCost);
+          this.notify('noRoadAccess', cmd.tile, `${a.nameJa}はここに建てられません`);
           break;
         }
         if (cmd.archetype === Arch.Station) {
@@ -220,6 +269,27 @@ export class Simulation {
       default:
         break;
     }
+  }
+
+  /** 操作が通らなかった理由をプレイヤに伝える。 */
+  private notify(kind: AlertKind, tile: number, message: string): void {
+    this.world.events.push({ t: 'alert', kind, tile, message });
+  }
+
+  /** その建物をそのタイルに置けるか（フットプリント全域を見る）。 */
+  canPlace(archId: number, tile: number): boolean {
+    const a = archetype(archId);
+    const ox = tileX(tile);
+    const oy = tileY(tile);
+    for (let dy = 0; dy < a.h; dy++) {
+      for (let dx = 0; dx < a.w; dx++) {
+        const x = ox + dx;
+        const y = oy + dy;
+        if (x < 0 || y < 0 || x >= MAP_W || y >= MAP_H) return false;
+        if (!this.world.canBuildStructure(idx(x, y))) return false;
+      }
+    }
+    return true;
   }
 
   /** タイル上の建物を撤去する（駅なら駅リストからも消す）。 */
@@ -305,6 +375,9 @@ export class Simulation {
       this.rng,
       this.lumberPool + Math.max(0, importable),
       this.cachedPopulation,
+      this.production.unmetByGood,
+      this.production.stock,
+      this.production.produced,
     );
     if (grow.lumberUsed > 0) this.spendLumber(grow.lumberUsed);
 
@@ -360,15 +433,28 @@ export class Simulation {
       if (this.buildings.stockoutDays[s]! < STOCKOUT_ABANDON_DAYS) continue;
       const a = archetype(this.buildings.archetypeId[s]!);
       if (!isShop(a.id)) {
-        // 生産施設は稼働停止の警告だけ出して存続させる
-        if (this.buildings.stockoutDays[s]! % 10 === 0) {
-          this.world.events.push({
-            t: 'alert',
-            kind: 'materialShortage',
-            tile: this.buildings.originTile[s]!,
-            message: `${a.nameJa}が原材料不足で操業できていません`,
-          });
+        // 生産施設は猶予を長く取る。サプライチェーンが立ち上がるには数週間かかる。
+        // ただし永久に残すと、動かない工場が区画を占拠し続け、
+        // 本当に必要な業種（製材所・食品工場）が入る土地が無くなる。
+        if (this.buildings.stockoutDays[s]! < STOCKOUT_ABANDON_DAYS * 5) {
+          if (this.buildings.stockoutDays[s]! % 10 === 0) {
+            this.world.events.push({
+              t: 'alert',
+              kind: 'materialShortage',
+              tile: this.buildings.originTile[s]!,
+              message: `${a.nameJa}が原材料不足で操業できていません`,
+            });
+          }
+          continue;
         }
+        this.world.events.push({
+          t: 'alert',
+          kind: 'materialShortage',
+          tile: this.buildings.originTile[s]!,
+          message: `${a.nameJa}が原材料不足のまま操業できず廃業しました`,
+        });
+        this.buildings.destroy(this.world, s);
+        this.growth.markDirty();
         continue;
       }
       this.world.events.push({
@@ -423,17 +509,7 @@ export class Simulation {
       taxPct: this.budget.taxPct,
     });
 
-    // 転入。住宅需要が正で空き家があるときだけ人が来る。
-    //
-    // 小さいうちは流入を厚くする。人口比だけで決めると、街を作り始めた直後は
-    // 1 日数人しか来ず、家だけが並んで誰も住んでいない状態が延々と続く。
-    // 実際にも、新しい住宅地には最初にまとまって人が入る。
-    if (this.demand.residential > 10) {
-      const vacant = this.lifecycle.stats.housingIndex.totalVacant;
-      const base = pop < 400 ? 70 : Math.max(12, pop * 0.03);
-      const wanted = Math.ceil((this.demand.residential / 100) * Math.min(base, vacant));
-      if (wanted > 0) this.lifecycle.immigrate(lctx, Math.min(120, wanted));
-    }
+    this.immigration(lctx, pop);
 
     // 日次統計を確定させてリセット
     this.dailyStats = { ...stats, modeCounts: [...stats.modeCounts] as [number, number, number, number] };
@@ -444,15 +520,67 @@ export class Simulation {
   }
 
   /**
+   * 転入。
+   *
+   * **建設needs と転入needs を同じ信号で判定してはいけない。**
+   * 「空き家が多い」は *これ以上家を建てるな* という信号であって、
+   * *人が引っ越して来るな* という信号ではない。むしろ空き家があるからこそ移り住める。
+   *
+   * 両者を `demand.residential` ひとつで見ていたため、
+   * 家が建った瞬間に空き家率 100% で需要がマイナスに振れ、
+   * 「家は建つ → 全部空き家 → 需要マイナス → 誰も来ない → 永久に人口 0」
+   * というデッドロックに入っていた。
+   *
+   * 転入は「空き住戸があるか」と「街が住むに値するか」で決める。
+   */
+  private immigration(lctx: Parameters<LifecycleSystem['daily']>[0], pop: number): void {
+    const vacant = this.lifecycle.stats.housingIndex.totalVacant;
+    if (vacant <= 0) return;
+
+    const employed = this.lifecycle.stats.employed;
+    const unemployed = this.lifecycle.stats.unemployed;
+    const employable = employed + unemployed;
+    // 求人が余っていれば人は来る。失業者が余っていれば来ない。
+    // 人口 0 のときは「まだ誰も試していない新天地」として少し前向きに見る。
+    const jobBalance =
+      employable > 0
+        ? Math.max(-1, Math.min(1, (this.lifecycle.stats.jobIndex.totalVacant - unemployed) / employable))
+        : 0.3;
+    const happiness = this.averageHappiness();
+    const taxPct = this.budget.taxPct[Zone.ResidentialLow] ?? NEUTRAL_TAX_PCT;
+
+    let appeal =
+      0.45 +
+      0.35 * jobBalance +
+      0.3 * ((happiness - 110) / 145) -
+      0.02 * taxPenalty(taxPct);
+    appeal = Math.max(0, Math.min(1, appeal));
+    if (appeal <= 0.02) return;
+
+    // 小さいうちは流入を厚くする。人口比だけで決めると、街を作り始めた直後は
+    // 1 日数人しか来ず、家だけが並んで誰も住んでいない状態が延々と続く。
+    const base = pop < 400 ? 70 : Math.max(12, pop * 0.03);
+    const wanted = Math.ceil(appeal * Math.min(base, vacant));
+    if (wanted > 0) this.lifecycle.immigrate(lctx, Math.min(120, wanted));
+  }
+
+  /**
    * 建設で消費した木材を、まず地元の在庫から、足りない分を輸入で賄う。
    * 輸入分は現金で支払うので、林業〜製材所を整備したプレイヤは建設費が下がる。
    */
   private spendLumber(amount: number): void {
     let remaining = amount;
+    // 製材所の在庫を根こそぎ持っていかない。
+    // 建設が全部さらうと、木材を原料にする町工場・工場にトラックが運ぶ分が
+    // 一切残らず、日用品の生産が永久に 0 になる（実際にそうなっていた）。
+    // 半分は産業向けに残し、足りない分は輸入で埋める。
+    const INDUSTRY_RESERVE = 0.5;
     for (const s of this.buildings.each()) {
       if (remaining <= 0) break;
       if (this.buildings.outGood[s] !== Good.Lumber) continue;
-      const take = Math.min(remaining, this.buildings.outAmt[s]!);
+      const available = this.buildings.outAmt[s]! * (1 - INDUSTRY_RESERVE);
+      const take = Math.min(remaining, available);
+      if (take <= 0) continue;
       this.buildings.outAmt[s] = this.buildings.outAmt[s]! - take;
       this.lumberPool = Math.max(0, this.lumberPool - take);
       remaining -= take;
