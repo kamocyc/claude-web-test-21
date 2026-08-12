@@ -19,6 +19,7 @@ import {
   type ModeOption,
   type ModeTimes,
 } from '@sim/network/modeChoice';
+import { pathPosition, type PathPose } from '@sim/network/pathfinder';
 import type { Router } from '@sim/network/router';
 import type { TazMatrix } from '@sim/network/tazMatrix';
 import { MODE_NAMES_JA } from '@shared/enums';
@@ -459,41 +460,25 @@ function destTileOf(ctx: ActivityContext, slot: number): number {
   return ctx.buildings.originTile[slot]!;
 }
 
-/** 市民が「移動中」かつ経路を持つとき、現在位置をワールド座標で返す（描画用）。 */
+/**
+ * 市民が「移動中」かつ経路を持つとき、現在位置をワールド座標で返す（描画用）。
+ *
+ * `tick` は端数を含んでよい。描画側はフレームごとの端数 tick を渡すことで、
+ * 12 tick/秒のシミュレーションでも 60fps の滑らかな動きになる。
+ */
 export function citizenPosition(
   citizens: CitizenStore,
   graph: Graph,
   id: number,
   tick: number,
-  out: { x: number; z: number; heading: number },
+  out: PathPose,
 ): boolean {
   const path = citizens.tripPath[id];
-  if (!path || path.edges.length === 0) return false;
+  if (!path) return false;
   const depart = citizens.tripDepartTick[id]!;
   const arrive = citizens.tripArriveTick[id]!;
   const total = Math.max(1, arrive - depart);
-  const t = Math.max(0, Math.min(1, (tick - depart) / total));
-  // 経路長に対する進捗で位置を決める
-  const target = t * path.lengthM;
-  let acc = 0;
-  for (let e = 0; e < path.edges.length; e++) {
-    const len = graph.edgeLenM[path.edges[e]!]!;
-    if (acc + len >= target || e === path.edges.length - 1) {
-      const a = path.nodes[e]!;
-      const b = path.nodes[e + 1]!;
-      const f = len > 0 ? Math.max(0, Math.min(1, (target - acc) / len)) : 0;
-      const ax = graph.nodeX[a]!;
-      const az = graph.nodeZ[a]!;
-      const bx = graph.nodeX[b]!;
-      const bz = graph.nodeZ[b]!;
-      out.x = ax + (bx - ax) * f;
-      out.z = az + (bz - az) * f;
-      out.heading = Math.atan2(bx - ax, bz - az);
-      return true;
-    }
-    acc += len;
-  }
-  return false;
+  return pathPosition(graph, path, (tick - depart) / total, out);
 }
 
 export { CitizenFlag };

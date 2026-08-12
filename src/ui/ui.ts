@@ -305,7 +305,14 @@ export class Ui {
 
   // ================= 更新（4Hz） =================
 
-  update(sim: Simulation, now: number, fps: number, drawCalls: number, visibleAgents: number): void {
+  update(
+    sim: Simulation,
+    now: number,
+    fps: number,
+    drawCalls: number,
+    visibleAgents: number,
+    visibleVehicles = 0,
+  ): void {
     if (now - this.lastUpdate < 250) return;
     this.lastUpdate = now;
 
@@ -317,7 +324,7 @@ export class Ui {
     this.renderDemand(sim);
     this.applyUnlocks(counts.population);
     this.renderInspector(sim);
-    this.renderStats(sim, fps, drawCalls, visibleAgents);
+    this.renderStats(sim, fps, drawCalls, visibleAgents, visibleVehicles);
     this.renderAlerts();
     this.renderTutorial(now);
   }
@@ -590,7 +597,13 @@ export class Ui {
     );
   }
 
-  private renderStats(sim: Simulation, fps: number, drawCalls: number, visibleAgents: number): void {
+  private renderStats(
+    sim: Simulation,
+    fps: number,
+    drawCalls: number,
+    visibleAgents: number,
+    visibleVehicles: number,
+  ): void {
     if (!this.statsPanel.classList.contains('open')) return;
     const s = sim.stats();
     this.statsPanel.replaceChildren();
@@ -658,6 +671,7 @@ export class Ui {
     row('FPS', String(Math.round(fps)));
     row('ドローコール', String(drawCalls));
     row('描画中の市民', String(visibleAgents));
+    row('描画中の車両', String(visibleVehicles));
     row('経路キャッシュ率', `${Math.round(s.cacheHitRate * 100)}%`);
     row('経路探索/tick', String(s.searchesThisTick));
     row('出発準備待ち', String(s.routeQueueDepth));

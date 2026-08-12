@@ -178,3 +178,50 @@ export class Pathfinder {
     return Infinity;
   }
 }
+
+/** 経路上のある地点の姿勢。描画が読む。 */
+export interface PathPose {
+  x: number;
+  z: number;
+  /** three.js の Y 軸回転に直接渡せる向き。 */
+  heading: number;
+  /** 今いるエッジの index。徒歩区間／車道／線路の判定に使う。 */
+  edge: number;
+}
+
+/**
+ * 経路長に対する進捗 f (0..1) からワールド座標を求める。
+ *
+ * 市民もトラックも、シミュレーションは位置を持たず
+ * (出発 tick, 到着 tick, 経路) しか持たない。位置はここで描画時に復元する。
+ * 市民用とトラック用に同じ弧長走査を二重に書いていたのでここへ一本化した。
+ *
+ * `edge` を返すのが要点。自動車の経路は両端に徒歩区間を含み（駐車して歩く）、
+ * 鉄道の経路は両端に駅までの徒歩区間を含む。これを見ないと
+ * 「歩道を走る車」や「線路を降りて歩く電車」が描かれる。
+ */
+export function pathPosition(graph: Graph, path: Path, f: number, out: PathPose): boolean {
+  if (path.edges.length === 0) return false;
+  const target = Math.max(0, Math.min(1, f)) * path.lengthM;
+  let acc = 0;
+  for (let e = 0; e < path.edges.length; e++) {
+    const edge = path.edges[e]!;
+    const len = graph.edgeLenM[edge]!;
+    if (acc + len >= target || e === path.edges.length - 1) {
+      const a = path.nodes[e]!;
+      const b = path.nodes[e + 1]!;
+      const lf = len > 0 ? Math.max(0, Math.min(1, (target - acc) / len)) : 0;
+      const ax = graph.nodeX[a]!;
+      const az = graph.nodeZ[a]!;
+      const bx = graph.nodeX[b]!;
+      const bz = graph.nodeZ[b]!;
+      out.x = ax + (bx - ax) * lf;
+      out.z = az + (bz - az) * lf;
+      out.heading = Math.atan2(bx - ax, bz - az);
+      out.edge = edge;
+      return true;
+    }
+    acc += len;
+  }
+  return false;
+}

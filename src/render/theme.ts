@@ -1,5 +1,5 @@
 import { Color } from 'three';
-import { Overlay, RoadClass, Season, Terrain, Zone } from '@shared/enums';
+import { Good, Overlay, RoadClass, Season, Terrain, Zone } from '@shared/enums';
 
 /**
  * 配色。日本の風景を意識した落ち着いた色調にする。
@@ -44,6 +44,44 @@ export const PADDY_SEASON_COLORS: Record<number, number> = {
   [Season.Autumn]: 0xd8b34a,
   [Season.Winter]: 0xa08a68,
 };
+
+/**
+ * 自家用車の車体色。日本の保有台数の色分布に寄せてある（白・銀・黒で 8 割）。
+ * 累積確率 0..99 の閾値と対で持つ。
+ */
+export const CAR_COLORS: { upTo: number; color: number }[] = [
+  { upTo: 40, color: 0xe8e8e8 }, // 白（パール含む）
+  { upTo: 65, color: 0xa8adb2 }, // シルバー
+  { upTo: 85, color: 0x2a2d33 }, // 黒
+  { upTo: 93, color: 0x3a5a8a }, // 紺
+  { upTo: 100, color: 0x8f3a3a }, // 赤
+];
+
+export function carColor(hash: number): number {
+  const h = hash % 100;
+  for (const c of CAR_COLORS) {
+    if (h < c.upTo) return c.color;
+  }
+  return CAR_COLORS[CAR_COLORS.length - 1]!.color;
+}
+
+/**
+ * トラックの車体色。積荷で塗り分ける。
+ * 何がどこへ流れているかが、街を眺めるだけで読み取れるようにするため。
+ */
+export const CARGO_COLORS: Record<number, number> = {
+  [Good.None]: 0x8a8f95, // 空車（帰路）
+  [Good.Rice]: 0xd9c67a,
+  [Good.Vegetables]: 0x5a9a4a,
+  [Good.Logs]: 0x7a5a38,
+  [Good.Lumber]: 0xc09a5e,
+  [Good.Food]: 0xd97f3a,
+  [Good.ConsumerGoods]: 0x4a6a9a,
+};
+
+/** 電車の車体色。先頭車だけ帯を濃くして向きが分かるようにする。 */
+export const TRAIN_BODY_COLOR = 0xd8dde4;
+export const TRAIN_HEAD_COLOR = 0x3f6fa8;
 
 /** 建物の形状キーごとの色と高さ（レベル 1 のとき、m）。 */
 export interface MeshStyle {

@@ -240,7 +240,7 @@ export class App {
 
   private selectAt(tile: number): void {
     const target = { x: (tileX(tile) + 0.5) * TILE_M, z: (tileY(tile) + 0.5) * TILE_M };
-    const pos = { x: 0, z: 0, heading: 0 };
+    const pos = { x: 0, z: 0, heading: 0, edge: -1 };
     let bestId = -1;
     let bestD2 = (TILE_M * 2.5) ** 2;
     const c = this.sim.citizens;
@@ -302,7 +302,7 @@ export class App {
       this.drainEvents();
 
       if (this.followCitizen >= 0 && this.sim.citizens.isAlive(this.followCitizen)) {
-        const pos = { x: 0, z: 0, heading: 0 };
+        const pos = { x: 0, z: 0, heading: 0, edge: -1 };
         if (citizenPosition(this.sim.citizens, this.sim.graph, this.followCitizen, this.sim.clock.tick, pos)) {
           this.renderer.focusOn(pos.x, pos.z);
         }
@@ -317,8 +317,16 @@ export class App {
         this.renderer.showRoute(this.sim.citizens.tripPath[this.ui.selectedCitizen] ?? null, this.sim);
       }
 
-      this.renderer.render(this.sim, dt);
-      this.ui.update(this.sim, now, this.fps, this.renderer.drawCalls, this.renderer.visibleAgents);
+      // 端数 tick を渡して補間させる。これが無いと車も人も 12 段階/秒で飛ぶ。
+      this.renderer.render(this.sim, dt, this.speed > 0 ? this.accumulator : 0);
+      this.ui.update(
+        this.sim,
+        now,
+        this.fps,
+        this.renderer.drawCalls,
+        this.renderer.visibleAgents,
+        this.renderer.visibleVehicles,
+      );
 
       requestAnimationFrame(loop);
     };

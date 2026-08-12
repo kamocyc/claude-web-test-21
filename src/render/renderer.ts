@@ -163,7 +163,11 @@ export class Renderer {
     geom.setDrawRange(0, n);
   }
 
-  render(sim: Simulation, dt: number): void {
+  /**
+   * @param tickFraction 直近 tick からの端数 (0..1)。エージェントの補間に使う。
+   *   これが無いと 12 tick/秒のシミュレーションのカクつきがそのまま見える。
+   */
+  render(sim: Simulation, dt: number, tickFraction = 0): void {
     this.rig.update(dt);
 
     // 時刻に応じた空と日照
@@ -185,7 +189,7 @@ export class Renderer {
 
     this.terrain.update(sim);
     this.buildings.update(sim);
-    this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance);
+    this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance, tickFraction);
 
     this.renderer.render(this.scene, this.rig.camera);
     this.drawCalls = this.renderer.info.render.calls;

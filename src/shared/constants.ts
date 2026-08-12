@@ -184,6 +184,25 @@ export const STOCKOUT_ABANDON_DAYS = 20;
 /** 同時に描画する市民インスタンスの上限。 */
 export const MAX_VISIBLE_AGENTS = 4000;
 export const MAX_VISIBLE_VEHICLES = 3000;
+/** 描画するトラックの上限。シミュレーション側の上限より少ないと黙って消えるので揃える。 */
+export const MAX_VISIBLE_TRUCKS = MAX_TRUCKS;
+/** 描画する電車の車両数の上限（編成数ではなく 1 両単位）。 */
+export const MAX_VISIBLE_TRAIN_CARS = 512;
 /** これより遠い歩行者は描画しない (m)。 */
 export const AGENT_DRAW_DISTANCE_M = 700;
 export const VEHICLE_DRAW_DISTANCE_M = 1400;
+/** 電車は車より遠くからでも見える（大きいので引きの画でも意味がある）。 */
+export const TRAIN_DRAW_DISTANCE_M = 3400;
+/** カメラがこれより引いたら歩行者は描かない (m)。1px 未満にしかならない。 */
+export const PEDESTRIAN_LOD_DISTANCE_M = 460;
+/** 路上駐車を描く距離 (m)。歩行者より遠くまで見える。 */
+export const PARKED_CAR_LOD_DISTANCE_M = 900;
+/** 1 つの接道タイルに置く駐車の上限。 */
+export const PARKED_CARS_PER_TILE = 4;
+/** 車線中心のオフセット (m)。日本は左側通行なので進行方向の左に寄せる。 */
+export const LANE_OFFSET_M = 2.2;
+/** 1 編成の両数。1 両だとただの箱に見えて電車と分からない。 */
+export const TRAIN_CARS = 3;
+/** 1 両の長さ (m) と連結面の間隔 (m)。 */
+export const TRAIN_CAR_LENGTH_M = 19;
+export const TRAIN_CAR_GAP_M = 1.4;
