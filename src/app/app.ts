@@ -138,7 +138,7 @@ export class App {
         this.setSpeed(this.speed === 0 ? 1 : 0);
       }
       if (e.key >= '1' && e.key <= '4') {
-        this.setSpeed([0, 1, 3, 10][Number(e.key) - 1]!);
+        this.setSpeed([0, 1, 4, 20][Number(e.key) - 1]!);
       }
       if (e.key === 'Escape') {
         this.ui.selectedCitizen = -1;

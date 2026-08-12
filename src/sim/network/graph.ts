@@ -1,4 +1,4 @@
-import { RAIL_SPEED_KMH, TILE_COUNT, TILE_M } from '@shared/constants';
+import { RAIL_SPEED_KMH, SIM_PER_RENDER, TILE_COUNT, TILE_SPAN_M } from '@shared/constants';
 import {
   BOARD_PENALTY_MIN,
   DEFAULT_HEADWAY_MIN,
@@ -156,8 +156,8 @@ export class Graph {
         const b = this.roadNodeAt[j]!;
         if (b < 0) continue;
         const rc = Math.min(world.road[i]!, world.road[j]!);
-        addEdge(a, b, TILE_M, ModeBit.Walk | ModeBit.Bike | ModeBit.Car, rc, 0);
-        addEdge(b, a, TILE_M, ModeBit.Walk | ModeBit.Bike | ModeBit.Car, rc, 0);
+        addEdge(a, b, TILE_SPAN_M, ModeBit.Walk | ModeBit.Bike | ModeBit.Car, rc, 0);
+        addEdge(b, a, TILE_SPAN_M, ModeBit.Walk | ModeBit.Bike | ModeBit.Car, rc, 0);
       }
     }
 
@@ -175,8 +175,8 @@ export class Graph {
         const j = idx(x + dx, y + dy);
         const b = this.railNodeAt[j]!;
         if (b < 0) continue;
-        addEdge(a, b, TILE_M, ModeBit.Rail, 0, 0);
-        addEdge(b, a, TILE_M, ModeBit.Rail, 0, 0);
+        addEdge(a, b, TILE_SPAN_M, ModeBit.Rail, 0, 0);
+        addEdge(b, a, TILE_SPAN_M, ModeBit.Rail, 0, 0);
       }
     }
 
@@ -197,7 +197,7 @@ export class Graph {
           const j = idx(x + dx, y + dy);
           const r = this.roadNodeAt[j]!;
           if (r < 0) continue;
-          const d = Math.hypot(dx, dy) * TILE_M;
+          const d = Math.hypot(dx, dy) * TILE_SPAN_M;
           addEdge(r, s, d, ModeBit.Walk, 0, 0);
           addEdge(s, r, d, ModeBit.Walk, 0, 0);
         }
@@ -299,11 +299,19 @@ export class Graph {
     }
   }
 
-  /** ノード間の直線距離 (m)。A* のヒューリスティックに使う。 */
+  /**
+   * ノード間の直線距離（シミュレーション上の実距離 m）。A* のヒューリスティックに使う。
+   *
+   * nodeX/nodeZ は描画単位なので、必ず SIM_PER_RENDER を掛けて実距離に直すこと。
+   * ここを掛け忘れるとヒューリスティックが実コストより小さくなりすぎて、
+   * A* が「黙って」最短でない経路を返す。症状は「車が変な道を通る」だけで、
+   * 目視では追えない。test/pathfinding.test.ts の
+   * 「A* の結果がダイクストラと一致する」が唯一の検出手段になっている。
+   */
   straightLineM(a: number, b: number): number {
     const dx = this.nodeX[a]! - this.nodeX[b]!;
     const dz = this.nodeZ[a]! - this.nodeZ[b]!;
-    return Math.sqrt(dx * dx + dz * dz);
+    return Math.sqrt(dx * dx + dz * dz) * SIM_PER_RENDER;
   }
 
   /**

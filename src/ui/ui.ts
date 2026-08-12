@@ -358,10 +358,12 @@ export class Ui {
     sc.id = 'speed';
     this.speedButtons = [];
     for (const [label, speed] of [
+      // 1 日はそれぞれ実時間 32 / 8 / 1.6 分。×1 は街を眺めるための速度で、
+      // 人も車も電車も現実的な速さに見える。発展させたいときは早送りする。
       ['❚❚', 0],
       ['▶', 1],
-      ['▶▶', 3],
-      ['▶▶▶', 10],
+      ['▶▶', 4],
+      ['▶▶▶', 20],
     ] as const) {
       const b = btn(label, () => {
         this.cb.onSpeed(speed);

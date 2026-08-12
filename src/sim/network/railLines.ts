@@ -1,4 +1,11 @@
-import { DEFAULT_HEADWAY_MIN, RAIL_SPEED_KMH, TRAIN_CARS, TRAIN_CAR_GAP_M, TRAIN_CAR_LENGTH_M } from '@shared/constants';
+import {
+  DEFAULT_HEADWAY_MIN,
+  RAIL_SPEED_KMH,
+  SIM_PER_RENDER,
+  TRAIN_CARS,
+  TRAIN_CAR_GAP_M,
+  TRAIN_CAR_LENGTH_M,
+} from '@shared/constants';
 import { ModeBit } from '@shared/enums';
 import { Graph, NodeKind } from './graph';
 
@@ -17,16 +24,20 @@ import { Graph, NodeKind } from './graph';
  */
 
 const RAIL_MS = (RAIL_SPEED_KMH * 1000) / 3600;
-/** 連結面間の距離 (m)。 */
-export const TRAIN_CAR_PITCH_M = TRAIN_CAR_LENGTH_M + TRAIN_CAR_GAP_M;
-/** 1 編成の全長 (m)。これより短い線には電車を走らせない。 */
+/**
+ * 連結面間の距離。**シミュレーション実距離 (m)**。
+ * 車両の寸法は描画単位で決まっているので、線路上に並べるために実距離へ直す。
+ */
+export const TRAIN_CAR_PITCH_M = (TRAIN_CAR_LENGTH_M + TRAIN_CAR_GAP_M) * SIM_PER_RENDER;
+/** 1 編成の全長（実距離 m）。これより短い線には電車を走らせない。 */
 export const TRAIN_LENGTH_M = TRAIN_CARS * TRAIN_CAR_PITCH_M;
 
 export interface RailLine {
   /** 連続した線路ノード列。 */
   nodes: Int32Array;
-  /** nodes[i] までの起点からの累積距離 (m)。長さは nodes.length。 */
+  /** nodes[i] までの起点からのシミュレーション実距離 (m)。長さは nodes.length。 */
   cumM: Float32Array;
+  /** 線路の全長（実距離 m）。 */
   lengthM: number;
   /**
    * この線に駅が接続しているか。
@@ -149,7 +160,9 @@ function buildLine(graph: Graph, nodes: number[]): RailLine {
     arr[i] = u;
     if (i > 0) {
       const p = nodes[i - 1]!;
-      acc += Math.hypot(graph.nodeX[u]! - graph.nodeX[p]!, graph.nodeZ[u]! - graph.nodeZ[p]!);
+      // nodeX/nodeZ は描画単位。電車の速度は実距離で決まるので実距離に直す。
+      acc +=
+        Math.hypot(graph.nodeX[u]! - graph.nodeX[p]!, graph.nodeZ[u]! - graph.nodeZ[p]!) * SIM_PER_RENDER;
     }
     cum[i] = acc;
     if (!served && hasStation(graph, u)) served = true;
@@ -157,7 +170,10 @@ function buildLine(graph: Graph, nodes: number[]): RailLine {
   return { nodes: arr, cumM: cum, lengthM: acc, served };
 }
 
-/** 起点から distM の地点の姿勢を求める。forward=false なら向きを反転する。 */
+/**
+ * 起点から distM（実距離 m）の地点の姿勢を求める。forward=false なら向きを反転する。
+ * 返す x/z は描画単位（cumM 内での比率で補間するので単位の混在は起きない）。
+ */
 export function railPoseAt(graph: Graph, line: RailLine, distM: number, forward: boolean, out: RailPose): boolean {
   const n = line.nodes.length;
   if (n < 2) return false;

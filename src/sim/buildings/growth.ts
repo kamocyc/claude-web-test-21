@@ -48,6 +48,12 @@ export class GrowthSystem {
    * タイルの魅力度 0..1。
    * 鉄道アクセスの重みを地価に次ぐ大きさにしてあるのは意図的な設計判断で、
    * 「駅を先に敷いて周りをゾーニングしたプレイヤが報われる」ようにするため。
+   *
+   * ただし鉄道が無くても成長できる下限は必ず残すこと。鉄道は人口 400 で
+   * 解禁されるので、それ以前に成長できないとゲームが始まらない。
+   * 実距離スケールにしたとき、駅の徒歩圏が「1 分」から「10 分前後」になって
+   * transit の寄与が事実上消え、街全体がレベルアップの閾値 0.62 を
+   * 下回って人口が固定された（実際にそうなった）。基礎値で補ってある。
    */
   desirability(world: World, tile: number, zone: Zone): number {
     // 接道が無ければ絶対に建たない。道路設計をゲームにする一番の要。
@@ -55,7 +61,9 @@ export class GrowthSystem {
 
     const lv = world.landValue[tile]! / 255;
     const ta = world.transitAccess[tile]!;
-    const transit = ta >= 255 ? 0 : Math.exp(-ta / 8);
+    // ta は駅までの徒歩「分」。実距離スケールでは 900m = 約 11 分になるので、
+    // 減衰の時定数もそれに合わせる（8 分だと 900m の駅が「遠い」扱いになる）。
+    const transit = ta >= 255 ? 0 : Math.exp(-ta / 12);
     const svc = world.svcMask[tile]!;
     const svcScore =
       (((svc & Service.Education) !== 0 ? 1 : 0) +
@@ -67,7 +75,7 @@ export class GrowthSystem {
     const poll = world.pollution[tile]! / 255;
     const noise = world.noise[tile]! / 255;
 
-    let s = 0.28 * lv + 0.22 * transit + 0.16 * svcScore + 0.08 * flat + 0.2;
+    let s = 0.28 * lv + 0.22 * transit + 0.16 * svcScore + 0.08 * flat + 0.34;
 
     switch (zone) {
       case Zone.ResidentialLow:
@@ -83,7 +91,7 @@ export class GrowthSystem {
       case Zone.IndustrialLight:
       case Zone.IndustrialHeavy:
         // 工業は地価が安い方が良い。公害も気にしない。
-        s = 0.10 * (1 - lv) + 0.30 * transit * 0.4 + 0.10 * flat + 0.35;
+        s = 0.10 * (1 - lv) + 0.30 * transit * 0.4 + 0.10 * flat + 0.42;
         break;
       case Zone.AgriPaddy:
         s = 0.5 + 0.3 * (1 - Math.min(1, world.waterAccess[tile]! / 10)) - 0.2 * poll;

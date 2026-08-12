@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TILE_M } from '@shared/constants';
+import { TILE_SPAN_M } from '@shared/constants';
 import { Mode } from '@shared/enums';
 import { Pathfinder, pathPosition, type PathPose } from '@sim/network/pathfinder';
 import {
@@ -35,7 +35,8 @@ describe('線路の折れ線抽出', () => {
     const lines = traceRailLines(graph);
     expect(lines).toHaveLength(1);
     expect(lines[0]!.nodes.length).toBe(41);
-    expect(lines[0]!.lengthM).toBeCloseTo(40 * TILE_M, 3);
+    // 線路長はシミュレーション上の実距離（描画単位ではない）
+    expect(lines[0]!.lengthM).toBeCloseTo(40 * TILE_SPAN_M, 3);
     // 累積距離は単調増加
     for (let i = 1; i < lines[0]!.cumM.length; i++) {
       expect(lines[0]!.cumM[i]!).toBeGreaterThan(lines[0]!.cumM[i - 1]!);
@@ -78,7 +79,7 @@ describe('線路の折れ線抽出', () => {
 
   it('編成長より短い線路には電車を走らせない', () => {
     const world = makeTestWorld();
-    // 3 タイル = 20m。編成長 (約 61m) に満たない
+    // 3 タイル = 300m。編成長（約 900m）に満たない
     layRail(world, 20, 20, 20, 22);
     const graph = buildGraph(world, [idx(21, 21)]);
 

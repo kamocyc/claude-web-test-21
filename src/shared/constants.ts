@@ -1,9 +1,31 @@
 /** ゲーム全体のチューニング定数。ここ以外にマジックナンバーを置かない。 */
 
 // ---------- ワールド ----------
-/** 1 タイルの一辺 (m)。一戸建ての敷地（約 100m²）が 1 タイルに収まる大きさ。 */
+/**
+ * 1 タイルの「描画上の」一辺。ワールド座標・カメラ・建物や人や車両の寸法はこの単位。
+ * シミュレーション上の実距離ではないことに注意（下の TILE_SPAN_M を参照）。
+ */
 export const TILE_M = 10;
-/** 320 タイル = 3.2km 四方。1 万人なら人口密度 1000 人/km² 前後の地方都市になる。 */
+/**
+ * 1 タイルがシミュレーション上で表す実距離 (m)。地図は 1/15 スケールで描いている。
+ *
+ * 描画とシミュレーションで距離の単位を分けているのは、
+ * 「1 日が実用的な長さで進む」ことと「人や車が現実的な速さに見える」ことを
+ * 同時に成り立たせるため。この 2 つは次の式で結ばれている。
+ *
+ *   1 日の実時間（分） = 19152 ÷ （歩行者の見た目の速さ[m/s] × 1 タイルの実距離[m]）
+ *
+ * 10m/タイルのままだと、歩行者が歩く速さに見える時計では 1 日が実時間 8 時間になる。
+ * 150m にすることで 1 日 32 分に収まり、見た目とシミュレーションが完全に一致する。
+ *
+ * 副次的に、これまで非現実的だった距離がすべて現実的な値になる
+ * （駅の徒歩圏 120m → 900m、平均通勤 3 分 → 30 分前後、自転車と徒歩の
+ * 距離上限が初めて実際に効くようになる）。
+ */
+export const TILE_SPAN_M = 150;
+/** シミュレーション実距離 ÷ 描画単位。描画座標から実距離を出すときに掛ける。 */
+export const SIM_PER_RENDER = TILE_SPAN_M / TILE_M;
+/** 320 タイル = 48km 四方。市街地はこのうち数 km を占める。 */
 export const MAP_W = 320;
 export const MAP_H = 320;
 export const TILE_COUNT = MAP_W * MAP_H;
@@ -26,8 +48,15 @@ export const TICKS_PER_DAY = 1440;
 export const DAYS_PER_MONTH = 30;
 export const MONTHS_PER_YEAR = 12;
 export const DAYS_PER_YEAR = DAYS_PER_MONTH * MONTHS_PER_YEAR;
-/** ×1 速度で 1 実秒あたり何 tick 進めるか。 */
-export const TICKS_PER_SECOND_AT_1X = 12;
+/**
+ * ×1 速度で 1 実秒あたり何 tick 進めるか。
+ *
+ * 0.75 = 1 tick が 1.33 実秒、1 日が実時間 32 分。
+ * この値と TILE_SPAN_M の組み合わせで、歩行者が毎秒 0.4 タイル（＝歩く速さ）に見える。
+ * 上げると街の発展は速くなるが、その分だけ人も車も電車も速く見える。
+ * 12（1 日 2 分）だった頃は電車が地図を 0.2 秒で横断していた。
+ */
+export const TICKS_PER_SECOND_AT_1X = 0.75;
 /** 1 フレームで消化する tick の上限。長い tick が続いても死のスパイラルに入らないための蓋。 */
 export const MAX_TICKS_PER_FRAME = 8;
 
@@ -64,8 +93,8 @@ export const COST_PERTURBATION = 0.05;
 export const VOLUME_DECAY = 1 / 60;
 
 // ---------- 公共交通 ----------
-/** 駅の徒歩アクセス圏（タイル）。 */
-export const STATION_WALK_RADIUS = 12;
+/** 駅の徒歩アクセス圏（タイル）。8 タイル = 1.2km。 */
+export const STATION_WALK_RADIUS = 8;
 /** 待ち時間の体感重み（分/分）。 */
 export const WAIT_WEIGHT = 2.0;
 /** アクセス・イグレス徒歩の体感重み。 */
@@ -101,8 +130,11 @@ export const PURPOSE_MODE_BIAS: number[][] = [
 export const VOT_BASE_YEN_PER_MIN = 20;
 /** 徒歩でこれを超える所要時間なら徒歩は選択肢から外す（分）。 */
 export const MAX_WALK_MIN = 45;
-/** 自転車の最大距離 (m)。 */
-export const MAX_BIKE_M = 8000;
+/**
+ * 自転車の最大距離 (m)。5km ＝ 約 20 分。
+ * 実距離スケール以前は街全体が 3.2km しかなく、この上限は一度も効かなかった。
+ */
+export const MAX_BIKE_M = 5000;
 /** 運賃 */
 export const RAIL_FARE_BASE_YEN = 140;
 export const RAIL_FARE_PER_KM_YEN = 15;

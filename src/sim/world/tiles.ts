@@ -1,4 +1,4 @@
-import { CHUNK, CHUNKS_X, MAP_H, MAP_W, TAZ, TAZ_X, TILE_M } from '@shared/constants';
+import { CHUNK, CHUNKS_X, MAP_H, MAP_W, TAZ, TAZ_X, TILE_M, TILE_SPAN_M } from '@shared/constants';
 
 /** タイル座標のユーティリティ。すべてインライン展開されうる小さな純粋関数。 */
 
@@ -15,7 +15,7 @@ export function inBounds(x: number, y: number): boolean {
   return x >= 0 && y >= 0 && x < MAP_W && y < MAP_H;
 }
 
-/** タイル中心のワールド座標 (m)。 */
+/** タイル中心のワールド座標（描画単位）。実距離ではない。 */
 export function tileCenterX(i: number): number {
   return (tileX(i) + 0.5) * TILE_M;
 }
@@ -27,11 +27,11 @@ export function tileCenterZ(i: number): number {
 export function tileManhattan(a: number, b: number): number {
   return Math.abs(tileX(a) - tileX(b)) + Math.abs(tileY(a) - tileY(b));
 }
-/** ユークリッド距離 (m)。 */
+/** ユークリッド距離（シミュレーション上の実距離 m）。 */
 export function tileDistanceM(a: number, b: number): number {
   const dx = tileX(a) - tileX(b);
   const dy = tileY(a) - tileY(b);
-  return Math.sqrt(dx * dx + dy * dy) * TILE_M;
+  return Math.sqrt(dx * dx + dy * dy) * TILE_SPAN_M;
 }
 
 export function chunkOf(i: number): number {

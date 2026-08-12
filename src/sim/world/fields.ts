@@ -1,4 +1,4 @@
-import { MAP_H, MAP_W, STATION_WALK_RADIUS, TILE_COUNT, TILE_M } from '@shared/constants';
+import { MAP_H, MAP_W, STATION_WALK_RADIUS, TILE_COUNT, TILE_SPAN_M } from '@shared/constants';
 import { Terrain } from '@shared/enums';
 import { archetype } from '@sim/buildings/archetypes';
 import type { BuildingStore } from '@sim/buildings/buildings';
@@ -134,7 +134,7 @@ export function updateTransitAccess(world: World, stationTiles: readonly number[
       }
     }
   }
-  const walkMinPerTile = TILE_M / ((4.8 * 1000) / 60); // 分/タイル
+  const walkMinPerTile = TILE_SPAN_M / ((4.8 * 1000) / 60); // 分/タイル
   for (let i = 0; i < TILE_COUNT; i++) {
     const d = dist[i]!;
     world.transitAccess[i] = d === 65535 ? 255 : Math.min(254, Math.round(d * walkMinPerTile));
@@ -151,10 +151,14 @@ export function updateLandValue(world: World, buildings: BuildingStore): void {
   for (let i = 0; i < TILE_COUNT; i++) {
     const t = world.terrain[i]!;
     if (t === Terrain.Sea || t === Terrain.Mountain) continue;
-    let v = 26;
+    // 基礎値。鉄道が無い街でも地価が成立する下限。
+    // 実距離スケール以前は transitAccess が街じゅうで「徒歩 3 分」になっていて、
+    // 下の鉄道ボーナスが事実上の基礎値として常時乗っていた。実距離にすると
+    // それが駅の近くだけに戻るので、消えた分をここで持つ。
+    let v = 50;
     // 平坦さ
     v += Math.max(0, 20 - world.slope[i]! * 0.25);
-    // 鉄道アクセス: 徒歩 5 分圏を強く優遇する
+    // 鉄道アクセス: 徒歩 14 分圏（約 1.1km）を優遇する
     const ta = world.transitAccess[i]!;
     if (ta < 255) v += Math.max(0, 42 - ta * 3);
     // 海・河川の眺望
