@@ -36,8 +36,14 @@ export const MAX_TICKS_PER_FRAME = 8;
 export const MAX_EXPANSIONS_PER_TICK = 40_000;
 /** 1 クエリあたりの展開上限。超えたら探索失敗として扱う。 */
 export const MAX_EXPANSIONS_PER_PATH = 6_000;
-/** 経路キャッシュのエントリ上限（LRU）。 */
-export const PATH_CACHE_CAPACITY = 20_000;
+/**
+ * 経路キャッシュのエントリ上限（LRU）。
+ *
+ * 人口 7000 の街で実測すると、必要なキー数（出発ノード×到着ノード×モード）は
+ * 2 万を超える。上限が足りないと追い出しが常時起きてヒット率が 75% まで落ち、
+ * 1 tick の処理時間が 1.3ms まで悪化する（＝×10 速度でフレーム予算を食い潰す）。
+ */
+export const PATH_CACHE_CAPACITY = 120_000;
 /** 建物 → 最寄り道路ノードを探す最大距離（タイル）。これを超えると「接道なし」。 */
 export const ROAD_ACCESS_RADIUS = 4;
 

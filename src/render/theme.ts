@@ -70,20 +70,20 @@ const style = (
 
 export const MESH_STYLES: Record<string, MeshStyle> = {
   // 住宅: 瓦屋根の切妻
-  house: style(0xe8e3d6, 5, 2.5, true, 0x4a5560, 0.66),
-  apartment: style(0xdcd6c6, 8, 3.5, true, 0x54525c, 0.78),
+  house: style(0xeae5d8, 5, 2.5, true, 0x69747f, 0.62),
+  apartment: style(0xded8c8, 8, 3.5, true, 0x6d6a75, 0.74),
   mansion: style(0xcfcabb, 16, 8, false, 0x4a4a52, 0.84),
   tower: style(0xc4c8cf, 46, 14, false, 0x4a4a52, 0.7),
   // 商業
   konbini: style(0xf2f2ee, 4.5, 1.5, false, 0x4a4a52, 0.8),
-  shotengai: style(0xe0c9a8, 6, 2.5, true, 0x6b4a3a, 0.92),
+  shotengai: style(0xe2ccab, 6, 2.5, true, 0x8a6350, 0.9),
   supermarket: style(0xe6e2d4, 7, 2, false, 0x4a4a52, 0.9),
   zakkyo: style(0xd6d2c8, 14, 7, false, 0x4a4a52, 0.88),
   office: style(0xb9c4cf, 24, 11, false, 0x4a4a52, 0.86),
   // 工業
-  smallfactory: style(0xbdb7a8, 6, 2, true, 0x7a6a55, 0.86),
+  smallfactory: style(0xbdb7a8, 6, 2, true, 0x93826a, 0.84),
   factory: style(0xa8a294, 11, 4, false, 0x6b665c, 0.9),
-  sawmill: style(0x9c8b6f, 9, 3, true, 0x6b5a45, 0.9),
+  sawmill: style(0x9c8b6f, 9, 3, true, 0x87735a, 0.88),
   ricemill: style(0xcfc7b2, 10, 3, false, 0x6b665c, 0.9),
   warehouse: style(0xb0aca0, 8, 2, false, 0x6b665c, 0.94),
   // 農林（背が低く、地面の色が主役）
@@ -91,14 +91,14 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
   field: style(0xb08d5a, 0.5, 0, false, 0x4a4a52, 0.96),
   forestry: style(0x2f7a45, 3.5, 0, false, 0x4a4a52, 0.9),
   // 公共
-  station: style(0xdfe4ea, 9, 0, true, 0x3a4a5a, 0.9),
-  school: style(0xe4dcc6, 10, 0, true, 0x5a6a72, 0.9),
+  station: style(0xdfe4ea, 9, 0, true, 0x54687e, 0.9),
+  school: style(0xe4dcc6, 10, 0, true, 0x74858e, 0.9),
   hospital: style(0xf0f0ee, 14, 0, false, 0x4a4a52, 0.88),
-  police: style(0xd6dce6, 6, 0, true, 0x3a4a6a, 0.8),
+  police: style(0xd6dce6, 6, 0, true, 0x4e6288, 0.8),
   fire: style(0xe6b8b0, 9, 0, false, 0x6b3a3a, 0.86),
   park: style(0x6fbf6f, 1.2, 0, false, 0x4a4a52, 0.95),
-  shrine: style(0xc4553f, 7, 0, true, 0x3a3a42, 0.7),
-  cityhall: style(0xd8d4c8, 16, 0, true, 0x44505c, 0.9),
+  shrine: style(0xc4553f, 7, 0, true, 0x54545e, 0.7),
+  cityhall: style(0xd8d4c8, 16, 0, true, 0x5c6a78, 0.9),
 };
 
 export function meshStyle(key: string): MeshStyle {

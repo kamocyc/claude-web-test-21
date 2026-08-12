@@ -185,7 +185,8 @@ function main(): void {
   console.log('\n----- 性能 -----');
   console.log(`1 tick の平均処理時間: ${tickMsAvg.toFixed(3)} ms`);
   console.log(`グラフ: ${sim.graph.nodeCount} ノード / ${sim.graph.edgeCount} エッジ`);
-  console.log(`（×10 速度 = 1 フレーム 10 tick 想定で ${(tickMsAvg * 10).toFixed(2)} ms/フレーム）`);
+  // ×10 速度は 12 tick/秒 × 10 = 120 tick/秒。60fps なら 1 フレームあたり 2 tick。
+  console.log(`（×10 速度 = 120 tick/秒。60fps なら 1 フレーム 2 tick で ${(tickMsAvg * 2).toFixed(2)} ms）`);
 
   const monthly = sim.budget.history[sim.budget.history.length - 1];
   if (monthly) {

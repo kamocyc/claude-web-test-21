@@ -172,10 +172,10 @@ describe('経路キャッシュ', () => {
   it('容量を超えても上限内に収まる（メモリリークしない）', () => {
     const cache = new PathCache();
     const rng = new Rng(3);
-    for (let i = 0; i < 40_000; i++) {
+    for (let i = 0; i < 200_000; i++) {
       const p = { nodes: new Int32Array(0), edges: new Int32Array(0), costSec: 1, lengthM: 1, mode: Mode.Car, version: 1 };
       cache.set(rng.int(100000), rng.int(100000), Mode.Car, p);
     }
-    expect(cache.size).toBeLessThanOrEqual(20_000);
+    expect(cache.size).toBeLessThanOrEqual(120_000);
   });
 });

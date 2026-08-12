@@ -133,7 +133,7 @@ export class BuildingLayer {
 
       // 瓦屋根
       if (roof) {
-        const roofH = Math.min(4.5, Math.max(1.6, height * 0.28));
+        const roofH = Math.min(5.5, Math.max(2.2, height * 0.42));
         this.pos.set(cxw, groundY + height, czw);
         this.scl.set(w * 1.16, roofH, d * 1.16);
         this.mat.compose(this.pos, this.quat, this.scl);

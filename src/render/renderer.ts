@@ -185,7 +185,7 @@ export class Renderer {
 
     this.terrain.update(sim);
     this.buildings.update(sim);
-    this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.zoomFraction);
+    this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance);
 
     this.renderer.render(this.scene, this.rig.camera);
     this.drawCalls = this.renderer.info.render.calls;

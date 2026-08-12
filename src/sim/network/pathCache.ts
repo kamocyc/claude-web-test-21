@@ -53,13 +53,41 @@ export class PathCache {
     this.map.set(PathCache.key(origin, dest, mode), { path, lastUsed: ++this.clock });
   }
 
-  /** 最も長く使われていないエントリを 1/16 まとめて捨てる（毎回 1 件だと走査コストが割に合わない）。 */
+  /**
+   * 古いエントリをまとめて捨てる。
+   *
+   * 全件を lastUsed で整列させると、容量が大きいほど破棄のたびに
+   * 数ミリ秒のフレーム落ちが出る。標本から「古い側 1/8」の境界を推定し、
+   * それより古いものを 1 パスで消す。厳密な LRU ではないが、
+   * 目的（古いものから減らす）には十分で、O(n) で済む。
+   */
   private evict(): void {
-    const target = Math.max(1, PATH_CACHE_CAPACITY >> 4);
-    const entries: { k: number; t: number }[] = [];
-    for (const [k, e] of this.map) entries.push({ k, t: e.lastUsed });
-    entries.sort((a, b) => a.t - b.t);
-    for (let i = 0; i < target && i < entries.length; i++) this.map.delete(entries[i]!.k);
+    const SAMPLE = 1024;
+    const samples: number[] = [];
+    let seen = 0;
+    for (const e of this.map.values()) {
+      // 均等に間引いて標本を取る
+      if (seen % Math.max(1, Math.floor(this.map.size / SAMPLE)) === 0) samples.push(e.lastUsed);
+      seen++;
+      if (samples.length >= SAMPLE) break;
+    }
+    if (samples.length === 0) {
+      this.map.clear();
+      return;
+    }
+    samples.sort((a, b) => a - b);
+    const threshold = samples[Math.floor(samples.length / 8)] ?? samples[0]!;
+    for (const [k, e] of this.map) {
+      if (e.lastUsed <= threshold) this.map.delete(k);
+    }
+    // 標本の偏りで 1 件も減らなかった場合の保険
+    if (this.map.size >= PATH_CACHE_CAPACITY) {
+      let drop = Math.max(1, PATH_CACHE_CAPACITY >> 3);
+      for (const k of this.map.keys()) {
+        this.map.delete(k);
+        if (--drop <= 0) break;
+      }
+    }
   }
 
   get size(): number {

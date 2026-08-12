@@ -424,9 +424,15 @@ export class Simulation {
     });
 
     // 転入。住宅需要が正で空き家があるときだけ人が来る。
+    //
+    // 小さいうちは流入を厚くする。人口比だけで決めると、街を作り始めた直後は
+    // 1 日数人しか来ず、家だけが並んで誰も住んでいない状態が延々と続く。
+    // 実際にも、新しい住宅地には最初にまとまって人が入る。
     if (this.demand.residential > 10) {
-      const wanted = Math.ceil((this.demand.residential / 100) * Math.max(4, pop * 0.02));
-      this.lifecycle.immigrate(lctx, Math.min(60, wanted));
+      const vacant = this.lifecycle.stats.housingIndex.totalVacant;
+      const base = pop < 400 ? 70 : Math.max(12, pop * 0.03);
+      const wanted = Math.ceil((this.demand.residential / 100) * Math.min(base, vacant));
+      if (wanted > 0) this.lifecycle.immigrate(lctx, Math.min(120, wanted));
     }
 
     // 日次統計を確定させてリセット
