@@ -1,0 +1,305 @@
+:root {
+  --bg: rgba(22, 26, 32, 0.92);
+  --bg-solid: #1a1e24;
+  --panel: rgba(30, 35, 43, 0.94);
+  --line: rgba(255, 255, 255, 0.12);
+  --text: #e8e6e1;
+  --muted: #9aa0a8;
+  --accent: #f0b429;
+  --good: #58c07a;
+  --bad: #e06060;
+  font-family: 'Hiragino Sans', 'Noto Sans JP', 'Yu Gothic', Meiryo, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0e1116;
+  color: var(--text);
+}
+
+#viewport {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+#ui-root {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+#ui-root > * {
+  pointer-events: auto;
+}
+
+.panel {
+  position: absolute;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+
+.panel h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+/* ---- 上部バー ---- */
+#topbar {
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  white-space: nowrap;
+  padding: 8px 16px;
+}
+
+#topbar .stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 70px;
+}
+
+#topbar .stat .label {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+#topbar .stat .value {
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+#speed-controls {
+  display: flex;
+  gap: 4px;
+}
+
+button {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 9px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+button:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+button.active {
+  background: var(--accent);
+  color: #221a05;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- 左のツールパレット ---- */
+#toolbar {
+  left: 10px;
+  top: 70px;
+  width: 190px;
+  max-height: calc(100vh - 200px);
+  overflow-y: auto;
+}
+
+#toolbar .group {
+  margin-bottom: 10px;
+}
+
+#toolbar .group-title {
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 4px;
+  letter-spacing: 0.08em;
+}
+
+#toolbar .buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+#toolbar button {
+  flex: 1 1 auto;
+  min-width: 54px;
+  text-align: center;
+}
+
+.swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+
+/* ---- 右の情報パネル ---- */
+#sidebar {
+  right: 10px;
+  top: 70px;
+  width: 268px;
+  max-height: calc(100vh - 90px);
+  overflow-y: auto;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 0;
+}
+
+.row .k {
+  color: var(--muted);
+}
+
+.row .v {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 8px 0;
+}
+
+/* ---- 需要バー ---- */
+.demand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+}
+
+.demand .name {
+  width: 30px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.demand .track {
+  flex: 1;
+  height: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  position: relative;
+  overflow: hidden;
+}
+
+.demand .fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  border-radius: 3px;
+}
+
+.demand .num {
+  width: 30px;
+  text-align: right;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 市民インスペクタ ---- */
+#inspector {
+  left: 10px;
+  bottom: 10px;
+  width: 320px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+#inspector .title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+#inspector .mode-line {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+#inspector .mode-line.chosen {
+  background: rgba(240, 180, 41, 0.22);
+  font-weight: 600;
+}
+
+#inspector .mode-line.unavailable {
+  color: var(--muted);
+  opacity: 0.55;
+}
+
+/* ---- アラート ---- */
+#alerts {
+  right: 10px;
+  bottom: 10px;
+  width: 268px;
+  max-height: 26vh;
+  overflow-y: auto;
+  font-size: 11px;
+}
+
+#alerts .alert {
+  padding: 3px 0;
+  border-bottom: 1px solid var(--line);
+  color: #e8c88a;
+}
+
+/* ---- 下部のヒント ---- */
+#hint {
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: var(--muted);
+  padding: 6px 14px;
+}
+
+.tiny {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.good {
+  color: var(--good);
+}
+.bad {
+  color: var(--bad);
+}
