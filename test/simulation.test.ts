@@ -324,10 +324,9 @@ describe('財政', () => {
     for (let i = 1; i < history.length; i++) {
       const prev = history[i - 1]!;
       const cur = history[i]!;
-      // 月次決算の間に建設支出があるため、決算そのものの整合だけを検査する
       expect(cur.net).toBe(cur.income - cur.expense);
-      expect(Number.isFinite(cur.cashAfter)).toBe(true);
-      expect(Number.isFinite(prev.cashAfter)).toBe(true);
+      // 建設・撤去・輸入も台帳に載るので、現金の増減が厳密に説明できる
+      expect(cur.cashAfter).toBe(prev.cashAfter + cur.net - cur.capex);
     }
   });
 

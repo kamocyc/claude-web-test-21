@@ -297,6 +297,10 @@ export class App {
           steps++;
         }
         if (this.accumulator > MAX_TICKS_PER_FRAME) this.accumulator = 0;
+      } else {
+        // 停止中も操作は効かせる。tick が回らないとコマンドが適用されず、
+        // 道路を引いても現れない・課金もされない、という状態になっていた。
+        this.sim.flushCommands();
       }
 
       this.drainEvents();

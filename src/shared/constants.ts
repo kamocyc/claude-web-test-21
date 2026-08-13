@@ -59,6 +59,16 @@ export const DAYS_PER_YEAR = DAYS_PER_MONTH * MONTHS_PER_YEAR;
 export const TICKS_PER_SECOND_AT_1X = 0.75;
 /** 1 フレームで消化する tick の上限。長い tick が続いても死のスパイラルに入らないための蓋。 */
 export const MAX_TICKS_PER_FRAME = 8;
+/**
+ * 経済の反応を回す周期（tick）。
+ *
+ * 転入・求職・地価は元は「1 日 1 回」だった。1 日が 2 実分だった頃はそれで
+ * 十分だったが、移動の見た目を実トリップに合わせて 1 日 = 32 実分にしたため、
+ * 実時間で見ると 16 倍遅くなり「家を建てても 30 分誰も来ない」状態になった。
+ * 1 日の長さと移動の見た目は変えず、経済の時間だけデフォルメして取り戻す。
+ */
+export const ECONOMY_PERIOD_TICKS = 120; // 2 シミュレーション時間 = ×1 で 2.7 実分
+export const ECONOMY_PERIODS_PER_DAY = TICKS_PER_DAY / ECONOMY_PERIOD_TICKS;
 
 // ---------- 経路探索 ----------
 /** 1 tick あたりに許す A* のノード展開総数。フレーム落ちを防ぐ予算。 */
@@ -125,6 +135,7 @@ export const PURPOSE_MODE_BIAS: number[][] = [
   /* 買い物     */ [1, 2, 5, 0],
   /* レジャー   */ [1, 2, 2, 3],
   /* 帰宅       */ [0, 1, 0, 3],
+  /* 業務移動   */ [0, 1, 4, 3],
 ];
 /** 時間価値 (円/分) の基礎値。所得で増える。 */
 export const VOT_BASE_YEN_PER_MIN = 20;
@@ -167,18 +178,32 @@ export const TARGET_TFR = 1.8;
 /** 就労年齢。 */
 export const WORK_AGE_MIN = 18;
 export const RETIRE_AGE = 65;
+/** 夜勤の割合。 */
+export const NIGHT_SHIFT_SHARE = 0.08;
+/** 早番（シフト勤務）の割合。夜勤に当たらなかった就業者から抽選する。 */
+export const SHIFT_WORK_SHARE = 0.25;
 /** 求職時に評価する求人候補数。 */
 export const JOB_SAMPLE_COUNT = 8;
-/** 1 日に処理する求職者数の上限。 */
-export const JOB_SEEKERS_PER_DAY = 400;
+/** 1 経済期に処理する求職者数の上限（日換算で約 960 人）。 */
+export const JOB_SEEKERS_PER_PERIOD = 80;
 /** 転居判定のしきい値（不満が連続してこの日数を超えたら引っ越す）。 */
 export const RELOCATE_PATIENCE_DAYS = 30;
 
 // ---------- 建物・成長 ----------
 /** 1 tick に評価するゾーンタイル数。 */
 export const GROWTH_SCAN_PER_TICK = 128;
-/** レベルアップ / 廃墟化の判定に必要な連続日数。 */
-export const UPGRADE_PATIENCE_DAYS = 20;
+/**
+ * 建設確率の係数。実際の確率は `GROWTH_BUILD_RATE × 需要 × 魅力度^2`。
+ * 1 tick が 1/12 実秒だった頃の 0.02 のままだと、ゾーニングしてから最初の 1 軒が
+ * 建つまで ×1 で 50 実分かかる。時計を遅くした分をここで戻す。
+ */
+export const GROWTH_BUILD_RATE = 0.1;
+/**
+ * レベルアップ / 廃墟化の判定に必要な連続日数。
+ * 育つ側だけ速める。廃墟化と廃業まで速めると、サプライチェーンが立ち上がる前に
+ * 上流が全滅する（過去に実際に起きた）ので据え置く。
+ */
+export const UPGRADE_PATIENCE_DAYS = 5;
 export const ABANDON_PATIENCE_DAYS = 30;
 /** 建設に必要な資材（1 建物あたり）。林業チェーンが街の成長速度を律速する。 */
 export const CONSTRUCTION_LUMBER = 4;

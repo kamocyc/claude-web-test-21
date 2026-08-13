@@ -1,10 +1,12 @@
 import {
   DAYS_PER_YEAR,
-  JOB_SEEKERS_PER_DAY,
+  JOB_SEEKERS_PER_PERIOD,
   MORTALITY_A,
   MORTALITY_B,
+  NIGHT_SHIFT_SHARE,
   RELOCATE_PATIENCE_DAYS,
   RETIRE_AGE,
+  SHIFT_WORK_SHARE,
   TARGET_TFR,
   WORK_AGE_MIN,
 } from '@shared/constants';
@@ -95,7 +97,7 @@ export function createCitizen(
   c.set(id, CitizenFlag.Retired, age >= RETIRE_AGE);
   c.set(id, CitizenFlag.Student, age >= 6 && age < 18);
 
-  c.scheduleId[id] = pickSchedule(age, false, age >= RETIRE_AGE, rng.chance(0.08));
+  c.scheduleId[id] = pickSchedule(age, false, age >= RETIRE_AGE, rng.chance(NIGHT_SHIFT_SHARE));
   c.scheduleStep[id] = 0;
   c.state[id] = Activity.AtHome;
   c.unhappyDays[id] = 0;
@@ -130,6 +132,9 @@ export function resetHouseholdIds(): void {
  */
 export class LifecycleSystem {
   private slice = 0;
+  /** 求職の走査位置。未就業者を一巡させるための回転カーソル。 */
+  private jobCursor = 0;
+  private readonly seekers: number[] = [];
   readonly stats: LifecycleStats = {
     births: 0,
     deaths: 0,
@@ -142,6 +147,70 @@ export class LifecycleSystem {
     housingIndex: { byTaz: [], totalVacant: 0, totalDwellings: 0 },
   };
 
+  /**
+   * 労働市場。経済期ごと（2 シミュレーション時間 = ×1 で約 2.7 実分）に回す。
+   *
+   * 元は日次ライフサイクルの中にあり、しかも「市民 1 人につき 7 日に 1 回」しか
+   * 求職しなかった。1 日が 32 実分になった今それは ×1 で 3.7 実時間に 1 回であり、
+   * 商店を建てても就業者が 0 のまま、失業率も下がらないという体感になっていた。
+   *
+   * 求職の実行は回転カーソルで分散させる。先頭から N 人だけ処理すると、
+   * ID の大きい市民が永久に職に就けない。
+   */
+  updateLabourMarket(ctx: LifecycleContext): void {
+    const c = ctx.citizens;
+    const b = ctx.buildings;
+    const rng = ctx.rng;
+
+    const jobIndex = buildJobIndex(b);
+    this.stats.jobIndex = jobIndex;
+    this.stats.housingIndex = buildHousingIndex(b);
+
+    let employed = 0;
+    let unemployed = 0;
+    let homeless = 0;
+    this.seekers.length = 0;
+
+    for (const id of c.each()) {
+      if (c.homeBuilding[id] === 0) homeless++;
+      if (c.has(id, CitizenFlag.Employed)) {
+        employed++;
+        continue;
+      }
+      const age = c.age[id]!;
+      if (age < WORK_AGE_MIN || age >= RETIRE_AGE) continue;
+      unemployed++;
+      if (!c.has(id, CitizenFlag.Retired) && c.homeBuilding[id] !== 0) this.seekers.push(id);
+    }
+
+    this.stats.employed = employed;
+    this.stats.unemployed = unemployed;
+    this.stats.homeless = homeless;
+
+    const n = this.seekers.length;
+    if (n === 0) {
+      this.jobCursor = 0;
+      return;
+    }
+    const attempts = Math.min(n, JOB_SEEKERS_PER_PERIOD);
+    for (let k = 0; k < attempts; k++) {
+      const id = this.seekers[(this.jobCursor + k) % n]!;
+      if (!seekJob(c, b, ctx.taz, jobIndex, rng, id)) continue;
+      c.scheduleId[id] = pickSchedule(
+        c.age[id]!,
+        true,
+        false,
+        rng.chance(NIGHT_SHIFT_SHARE),
+        rng.chance(SHIFT_WORK_SHARE),
+      );
+      // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
+      const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
+      c.set(id, CitizenFlag.TransitPass, homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15);
+      ctx.activity.initCitizen(ctx as never, id);
+    }
+    this.jobCursor = (this.jobCursor + attempts) % n;
+  }
+
   daily(ctx: LifecycleContext): void {
     const c = ctx.citizens;
     const b = ctx.buildings;
@@ -152,19 +221,13 @@ export class LifecycleSystem {
     this.stats.immigrants = 0;
     this.stats.emigrants = 0;
 
-    const jobIndex = buildJobIndex(b);
+    // 求職と雇用統計は経済期ごと（updateLabourMarket）に回すので、ここでは扱わない。
     const housingIndex = buildHousingIndex(b);
-    this.stats.jobIndex = jobIndex;
     this.stats.housingIndex = housingIndex;
 
     const dayOfYear = ctx.clock.dayOfYear;
     const slice = this.slice;
     this.slice = (this.slice + 1) % 7;
-
-    let employed = 0;
-    let unemployed = 0;
-    let homeless = 0;
-    let jobSeekers = 0;
 
     for (const id of c.each()) {
       // --- 参照の健全性: 建物が壊れていたら参照を切る ---
@@ -174,10 +237,6 @@ export class LifecycleSystem {
         c.incomeYenMo[id] = 0;
         c.set(id, CitizenFlag.Employed, false);
       }
-
-      if (c.homeBuilding[id] === 0) homeless++;
-      if (c.has(id, CitizenFlag.Employed)) employed++;
-      else if (c.age[id]! >= WORK_AGE_MIN && c.age[id]! < RETIRE_AGE) unemployed++;
 
       // 週に 1 度だけ重い処理を回す
       if (id % 7 !== slice) continue;
@@ -205,28 +264,6 @@ export class LifecycleSystem {
         this.kill(ctx, id);
         this.stats.deaths++;
         continue;
-      }
-
-      // --- 求職 ---
-      if (
-        !c.has(id, CitizenFlag.Employed) &&
-        !c.has(id, CitizenFlag.Retired) &&
-        age >= WORK_AGE_MIN &&
-        age < RETIRE_AGE &&
-        c.homeBuilding[id] !== 0 &&
-        jobSeekers < JOB_SEEKERS_PER_DAY
-      ) {
-        jobSeekers++;
-        if (seekJob(c, b, ctx.taz, jobIndex, rng, id)) {
-          c.scheduleId[id] = pickSchedule(age, true, false, rng.chance(0.08));
-          // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
-          const homeTile = b.valid(c.homeBuilding[id]!)
-            ? b.originTile[handleSlot(c.homeBuilding[id]!)]!
-            : -1;
-          const pass = homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15;
-          c.set(id, CitizenFlag.TransitPass, pass);
-          ctx.activity.initCitizen(ctx as never, id);
-        }
       }
 
       // --- 住居探し・転居 ---
@@ -302,10 +339,6 @@ export class LifecycleSystem {
         c.happiness[id] = Math.max(0, Math.min(255, c.happiness[id]! + delta));
       }
     }
-
-    this.stats.employed = employed;
-    this.stats.unemployed = unemployed;
-    this.stats.homeless = homeless;
   }
 
   /**

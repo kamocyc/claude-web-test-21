@@ -285,23 +285,49 @@ button:disabled {
   display: flex;
   gap: 9px;
   align-items: flex-end;
-  height: 78px;
+}
+/*
+ * トラックの高さは px で持たせる。col を高さ auto のまま .bar に height:100% を
+ * 指定すると、不定高さに対する % 指定として無視されてバーが 0px に潰れる
+ * （実際にそうなっていて、需要バーが一切表示されていなかった）。
+ */
+#rci .col {
+  display: flex;
+  flex-direction: column;
 }
 #rci .bar {
   width: 17px;
-  height: 100%;
+  height: 78px;
   background: rgba(255, 255, 255, 0.08);
   border-radius: 3px;
   position: relative;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
+  overflow: hidden;
+}
+/* 中央が需要 0。上へ伸びれば需要あり、下へ伸びれば供給過剰。 */
+#rci .bar::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.28);
 }
 #rci .bar i {
   display: block;
+  position: absolute;
+  left: 0;
   width: 100%;
-  border-radius: 3px;
   transition: height 0.35s;
+}
+#rci .bar i.up {
+  bottom: 50%;
+  border-radius: 3px 3px 0 0;
+}
+#rci .bar i.down {
+  top: 50%;
+  border-radius: 0 0 3px 3px;
+  opacity: 0.4;
 }
 #rci .lab {
   text-align: center;

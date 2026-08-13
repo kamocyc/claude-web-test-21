@@ -145,13 +145,18 @@ export class Ui {
     const colors = ['var(--r)', 'var(--c)', 'var(--i)', 'var(--a)'];
     const labels = ['住', '商', '工', '農'];
     for (let i = 0; i < 4; i++) {
-      const col = el('div');
+      const col = el('div', 'col');
+      // 上半分が正の需要、下半分が負の需要。中央が 0。
       const bar = el('div', 'bar');
-      const fill = el('i');
-      fill.style.background = colors[i]!;
-      fill.style.height = '0%';
-      bar.appendChild(fill);
-      this.rciFills.push(fill);
+      const up = el('i', 'up');
+      const down = el('i', 'down');
+      up.style.background = colors[i]!;
+      down.style.background = colors[i]!;
+      up.style.height = '0%';
+      down.style.height = '0%';
+      bar.appendChild(up);
+      bar.appendChild(down);
+      this.rciFills.push(up, down);
       col.appendChild(bar);
       col.appendChild(el('div', 'lab', labels[i]!));
       rci.appendChild(col);
@@ -341,6 +346,9 @@ export class Ui {
     };
     add('人口', s.population.toLocaleString('ja-JP'));
     add('資金', man(s.cash), s.cash < 0 ? 'bad' : undefined);
+    // 決算を待たずに今の収支が分かるようにする
+    const net = s.finance.net;
+    add('収支/月', `${net >= 0 ? '+' : ''}${man(net)}`, net < 0 ? 'bad' : net > 0 ? 'good' : undefined);
     add('幸福度', `${Math.round((s.avgHappiness / 255) * 100)}%`, s.avgHappiness < 90 ? 'bad' : s.avgHappiness > 170 ? 'good' : undefined);
     const jobless = s.employed + s.unemployed;
     add('失業率', jobless > 0 ? `${Math.round((s.unemployed / jobless) * 100)}%` : '—', s.unemployed > s.employed * 0.2 ? 'bad' : undefined);
@@ -414,9 +422,11 @@ export class Ui {
     const d = sim.stats().demand;
     const values = [d.residential, d.commercial, d.industrial, d.agriculture];
     for (let i = 0; i < 4; i++) {
-      const v = Math.max(0, values[i]!);
-      this.rciFills[i]!.style.height = `${Math.min(100, v)}%`;
-      this.rciFills[i]!.style.opacity = values[i]! < 0 ? '0.25' : '1';
+      const v = Math.max(-100, Math.min(100, values[i]!));
+      // 高さはトラック全体（＝上下 2 分割）に対する割合なので半分にする。
+      // 需要 100 で上半分をちょうど埋める。
+      this.rciFills[i * 2]!.style.height = `${Math.max(0, v) / 2}%`;
+      this.rciFills[i * 2 + 1]!.style.height = `${Math.max(0, -v) / 2}%`;
     }
   }
 
@@ -638,12 +648,27 @@ export class Ui {
     row('累計配送', sim.freight.totalDelivered.toLocaleString('ja-JP'));
     row('在庫切れ', String(s.stockouts), s.stockouts > 20 ? 'bad' : undefined);
 
+    // 決算を待たずに今の収支が見えるようにする（月換算の run-rate）
+    head('収支（今の月換算）');
+    const f = s.finance;
+    row('住民税・固定資産税', man(f.incomeResidential));
+    row('商業', man(f.incomeCommercial));
+    row('工業', man(f.incomeIndustrial));
+    row('農林', man(f.incomeAgriculture));
+    row('収入 合計', man(f.income), 'good');
+    row('道路 維持', `-${man(f.upkeepRoads)}`);
+    row('鉄道 維持', `-${man(f.upkeepRail)}`);
+    row('施設 維持', `-${man(f.upkeepServices)}`);
+    row('支出 合計', `-${man(f.expense)}`, 'bad');
+    row('収支', `${f.net >= 0 ? '+' : ''}${man(f.net)}`, f.net < 0 ? 'bad' : 'good');
+    row('今月の建設費', `-${man(s.capexThisMonth)}`);
+    if (s.deficitMonths > 0) row('赤字が続いた月数', String(s.deficitMonths), 'bad');
+
     head('財政');
     row('建物数', s.buildings.toLocaleString('ja-JP'));
     if (s.lastReport) {
-      row('先月の収入', man(s.lastReport.income));
-      row('先月の支出', man(s.lastReport.expense));
-      row('収支', man(s.lastReport.net), s.lastReport.net < 0 ? 'bad' : 'good');
+      row('先月の収支', `${s.lastReport.net >= 0 ? '+' : ''}${man(s.lastReport.net)}`, s.lastReport.net < 0 ? 'bad' : 'good');
+      row('先月の建設費', `-${man(s.lastReport.capex)}`);
     }
     for (const [label, zone] of [
       ['住宅税', Zone.ResidentialLow],

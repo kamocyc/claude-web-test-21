@@ -1,6 +1,7 @@
 import {
   ABANDON_PATIENCE_DAYS,
   CONSTRUCTION_LUMBER,
+  GROWTH_BUILD_RATE,
   GROWTH_SCAN_PER_TICK,
   TILE_COUNT,
   UPGRADE_PATIENCE_DAYS,
@@ -156,7 +157,7 @@ export class GrowthSystem {
       if (s <= 0) continue;
 
       // 確率 = k * 需要 * S^2
-      const p = 0.02 * (d / 100) * s * s;
+      const p = GROWTH_BUILD_RATE * (d / 100) * s * s;
       if (!rng.chance(p)) continue;
 
       // 木材が要る（林業チェーンが街の成長速度を律速する）

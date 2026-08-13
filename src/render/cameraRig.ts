@@ -96,14 +96,27 @@ export class CameraRig {
     window.addEventListener('blur', () => this.keys.clear());
   }
 
-  /** 画面上の移動量だけ注視点を動かす。 */
-  private panScreen(dx: number, dy: number): void {
-    const scale = this.distance * 0.0016;
+  /**
+   * カメラの向きを基準に注視点を動かす。
+   *
+   * カメラ位置は `target + d·cosE·(sin az, _, cos az)` なので、
+   *   前 = (-sin az, -cos az)、右 = (cos az, -sin az)
+   * になる。ここを rot(+az) で書くと 45°（既定の方位角）でちょうど 90° ずれて、
+   * W が画面の右へ、D が手前へ動く。キー操作とドラッグで 2 回同じ式を書くと
+   * また片方だけ直す羽目になるので、両方ここを通す。
+   */
+  private panLocal(right: number, forward: number, scale: number): void {
     const cos = Math.cos(this.azimuth);
     const sin = Math.sin(this.azimuth);
-    this.target.x += (dx * cos - dy * sin) * scale;
-    this.target.z += (dx * sin + dy * cos) * scale;
+    this.target.x += (right * cos - forward * sin) * scale;
+    this.target.z += (-right * sin - forward * cos) * scale;
     this.clampTarget();
+  }
+
+  /** 画面上の移動量だけ注視点を動かす。 */
+  private panScreen(dx: number, dy: number): void {
+    // 画面下方向（+dy）は奥から手前 = 後ろ向き
+    this.panLocal(dx, -dy, this.distance * 0.0016);
   }
 
   private clampTarget(): void {
@@ -118,20 +131,15 @@ export class CameraRig {
   }
 
   update(dt: number): void {
-    // キーボードによるパン
-    let kx = 0;
-    let kz = 0;
-    if (this.keys.has('w') || this.keys.has('arrowup')) kz -= 1;
-    if (this.keys.has('s') || this.keys.has('arrowdown')) kz += 1;
-    if (this.keys.has('a') || this.keys.has('arrowleft')) kx -= 1;
-    if (this.keys.has('d') || this.keys.has('arrowright')) kx += 1;
-    if (kx !== 0 || kz !== 0) {
-      const speed = this.distance * 1.1 * dt;
-      const cos = Math.cos(this.azimuth);
-      const sin = Math.sin(this.azimuth);
-      this.target.x += (kx * cos - kz * sin) * speed;
-      this.target.z += (kx * sin + kz * cos) * speed;
-      this.clampTarget();
+    // キーボードによるパン（W = 画面の奥）
+    let right = 0;
+    let forward = 0;
+    if (this.keys.has('w') || this.keys.has('arrowup')) forward += 1;
+    if (this.keys.has('s') || this.keys.has('arrowdown')) forward -= 1;
+    if (this.keys.has('a') || this.keys.has('arrowleft')) right -= 1;
+    if (this.keys.has('d') || this.keys.has('arrowright')) right += 1;
+    if (right !== 0 || forward !== 0) {
+      this.panLocal(right, forward, this.distance * 1.1 * dt);
     }
     if (this.keys.has('q')) this.azimuth += dt * 1.2;
     if (this.keys.has('e')) this.azimuth -= dt * 1.2;

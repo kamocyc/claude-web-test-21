@@ -5,8 +5,10 @@ import { runHeadless } from '@sim/harness';
 import { Simulation } from '@sim/simulation';
 import { idx } from '@sim/world/tiles';
 import { CitizenFlag } from '@sim/agents/citizens';
+import { SCHEDULES, ScheduleKind } from '@sim/agents/schedules';
 import { handleSlot } from '@sim/buildings/buildings';
 import { Arch } from '@sim/buildings/archetypes';
+import { traceRailLines, trainHeads } from '@sim/network/railLines';
 
 /**
  * 統合テスト。
@@ -226,6 +228,99 @@ describe('プレイヤ操作への応答', () => {
     sim.enqueue({ t: 'placeBuilding', archetype: Arch.Station, tile: idx(59, 59) });
     sim.tick();
     expect(w.transitAccess[probe]).toBeLessThan(255); // 徒歩圏に入った
+  });
+
+  it('一時停止中でもコマンドが適用される', () => {
+    const sim = new Simulation(20);
+    const tiles: number[] = [];
+    for (let x = 60; x < 70; x++) {
+      const t = idx(x, 60);
+      sim.world.terrain[t] = 0;
+      sim.world.slope[t] = 0;
+      tiles.push(t);
+    }
+    const before = sim.budget.cash;
+    sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles });
+    // tick を回さずに反映される（停止中に街を作れる）
+    sim.flushCommands();
+    expect(sim.world.road[tiles[0]!]).toBe(RoadClass.Street);
+    expect(sim.budget.cash).toBeLessThan(before);
+    expect(sim.clock.tick).toBe(0);
+  });
+
+  it('駅を撤去すると電車が走らなくなる', () => {
+    const sim = new Simulation(21);
+    const w = sim.world;
+    for (let y = 56; y <= 70; y++) {
+      for (let x = 55; x <= 70; x++) {
+        const t = idx(x, y);
+        w.terrain[t] = 0;
+        w.slope[t] = 0;
+      }
+    }
+    const roads: number[] = [];
+    for (let x = 55; x <= 70; x++) roads.push(idx(x, 62));
+    const rails: number[] = [];
+    for (let y = 56; y <= 70; y++) rails.push(idx(58, y));
+    sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles: roads });
+    sim.enqueue({ t: 'buildRail', tiles: rails });
+    sim.tick();
+
+    const stationTile = idx(59, 60); // 2×2 なので道路(y=62)に掛からない位置に置く
+    sim.enqueue({ t: 'placeBuilding', archetype: Arch.Station, tile: stationTile });
+    sim.tick();
+
+    const heads = Array.from({ length: 64 }, () => ({ distM: 0, forward: true }));
+    const withStation = traceRailLines(sim.graph);
+    expect(withStation.some((l) => l.served)).toBe(true);
+    expect(withStation.reduce((n, l) => n + trainHeads(l, 0, heads), 0)).toBeGreaterThan(0);
+
+    // 駅は「建物」なので、撤去してもグラフのバージョンが動かず、
+    // 描画側の線路キャッシュが古いまま電車を走らせ続けていた。
+    const versionBefore = sim.graph.version;
+    sim.enqueue({ t: 'bulldoze', tiles: [stationTile] });
+    sim.tick();
+    expect(sim.graph.version).not.toBe(versionBefore);
+
+    const without = traceRailLines(sim.graph);
+    expect(without.some((l) => l.served)).toBe(false);
+    expect(without.reduce((n, l) => n + trainHeads(l, 0, heads), 0)).toBe(0);
+  });
+
+  it('寄り道をやめた市民が自宅にワープしない', () => {
+    const sim = new Simulation(22);
+    const w = sim.world;
+    for (let y = 58; y <= 64; y++) {
+      for (let x = 58; x <= 68; x++) {
+        const t = idx(x, y);
+        w.terrain[t] = 0;
+        w.slope[t] = 0;
+      }
+    }
+    const roads: number[] = [];
+    for (let x = 58; x <= 68; x++) roads.push(idx(x, 60));
+    sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles: roads });
+    sim.tick();
+
+    const homeTile = idx(59, 61);
+    const home = sim.buildings.create(w, Arch.House, homeTile, 1);
+    expect(home).not.toBe(0);
+    const id = sim.addCitizen(35, home);
+
+    // 勤務中で、次のステップは買い物。街に商店が 1 軒も無いので行き先は見つからない。
+    const c = sim.citizens;
+    const workTile = idx(66, 61);
+    const steps = SCHEDULES[ScheduleKind.OfficeWorker]!.steps;
+    c.scheduleId[id] = ScheduleKind.OfficeWorker;
+    c.scheduleStep[id] = steps.findIndex((s) => s.activity === Activity.Shopping);
+    c.state[id] = Activity.AtWork;
+    c.currentTile[id] = workTile;
+    sim.wheel.schedule(id, sim.clock.tick, sim.clock.tick);
+    sim.tick();
+
+    // 以前はここで自宅に瞬間移動していた。帰宅トリップが発生しなくなる原因。
+    expect(c.currentTile[id]).toBe(workTile);
+    expect(c.state[id]).toBe(Activity.AtWork);
   });
 
   it('税率を上げると住宅需要が下がる', () => {

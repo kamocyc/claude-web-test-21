@@ -167,6 +167,7 @@ export const Activity = {
   Leisure: 5, // レジャー中
   WaitingForRoute: 6, // 経路探索待ち
   Traveling: 7, // 移動中
+  Business: 8, // 業務で外出中（勤務先とは別の事業所にいる）
 } as const;
 export type Activity = (typeof Activity)[keyof typeof Activity];
 
@@ -179,6 +180,7 @@ export const ACTIVITY_NAMES_JA: Record<number, string> = {
   [Activity.Leisure]: 'レジャー',
   [Activity.WaitingForRoute]: '出発準備',
   [Activity.Traveling]: '移動中',
+  [Activity.Business]: '外回り',
 };
 
 /** 移動の目的。交通手段選択のバイアスに使う。 */
@@ -188,6 +190,7 @@ export const Purpose = {
   Shopping: 2, // 買い物
   Leisure: 3, // レジャー
   Home: 4, // 帰宅
+  Business: 5, // 業務移動
 } as const;
 export type Purpose = (typeof Purpose)[keyof typeof Purpose];
 
@@ -197,6 +200,7 @@ export const PURPOSE_NAMES_JA: Record<number, string> = {
   [Purpose.Shopping]: '買い物',
   [Purpose.Leisure]: 'レジャー',
   [Purpose.Home]: '帰宅',
+  [Purpose.Business]: '業務',
 };
 
 /** 資源（財）。サプライチェーンの単位。 */

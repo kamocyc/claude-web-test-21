@@ -1,5 +1,7 @@
 import {
   COST_SMOOTHING_LAMBDA,
+  ECONOMY_PERIODS_PER_DAY,
+  ECONOMY_PERIOD_TICKS,
   FREIGHT_DISPATCH_INTERVAL,
   LUMBER_IMPORT_YEN,
   NEUTRAL_TAX_PCT,
@@ -34,7 +36,7 @@ import type { AlertKind } from '@sim/core/events';
 import { hashArrays } from '@sim/core/hash';
 import { Rng } from '@sim/core/rng';
 import { TimeWheel } from '@sim/core/timeWheel';
-import { Budget, type MonthlyReport } from '@sim/economy/budget';
+import { Budget, emptyAccrual, type Accrual, type MonthlyReport } from '@sim/economy/budget';
 import { FreightSystem } from '@sim/economy/freight';
 import { newProductionStats, runProduction, updateStockouts } from '@sim/economy/production';
 import { Graph } from '@sim/network/graph';
@@ -62,6 +64,11 @@ export interface SimStats {
   tripsFailed: number;
   shoppingFailed: number;
   cash: number;
+  /** 今の収支（月換算）。決算を待たずに見える run-rate。 */
+  finance: Accrual;
+  /** 今月ここまでの建設・撤去・輸入。 */
+  capexThisMonth: number;
+  deficitMonths: number;
   lastReport: MonthlyReport | null;
   cacheHitRate: number;
   routeQueueDepth: number;
@@ -101,6 +108,8 @@ export class Simulation {
   private readonly production = newProductionStats();
   private demand: DemandState = { residential: 0, commercial: 0, industrial: 0, agriculture: 0 };
   private lastReport: MonthlyReport | null = null;
+  /** 今の収支（月換算）。経済期ごとに取り直す。 */
+  private finance: Accrual = emptyAccrual();
   /**
    * 駅タイル。建物ストアから毎回導出する。
    * 並行配列として持つと「建物はあるのに交通ノードが無い駅」という
@@ -126,6 +135,17 @@ export class Simulation {
   /** コマンドを積む。適用は次の tick 境界。 */
   enqueue(cmd: Command): void {
     this.pendingCommands.push(cmd);
+  }
+
+  /**
+   * 溜まっているコマンドを今すぐ適用する。
+   *
+   * 一時停止中は tick が回らないので、道路を引いても何も起きず、課金もされず、
+   * 警告も出なかった。停止して街を作るのは普通の遊び方なので、
+   * 停止中はアプリ側から毎フレームこれを呼ぶ。
+   */
+  flushCommands(): void {
+    this.applyCommands();
   }
 
   private applyCommands(): void {
@@ -233,16 +253,18 @@ export class Simulation {
           this.onNetworkChanged();
           updateTransitAccess(this.world, this.stationTiles);
         }
-        updateServiceCoverage(this.world, this.buildings);
+        this.refreshFields();
         this.destinations.markDirty();
         this.growth.markDirty();
         break;
       }
       case 'bulldoze': {
         let networkChanged = false;
+        let removedBuilding = false;
         for (const tile of cmd.tiles) {
           if (this.clearBuildingAt(tile)) {
             this.destinations.markDirty();
+            removedBuilding = true;
           }
           if (this.world.road[tile] !== RoadClass.None) {
             this.world.setRoad(tile, RoadClass.None);
@@ -257,6 +279,7 @@ export class Simulation {
             this.growth.markDirty();
           }
         }
+        if (removedBuilding) this.refreshFields();
         if (networkChanged) this.onNetworkChanged();
         break;
       }
@@ -269,6 +292,18 @@ export class Simulation {
       default:
         break;
     }
+  }
+
+  /**
+   * 地価とサービス圏を取り直す。
+   *
+   * どちらも全タイル走査＋ぼかしなので、経済期ごとに回すと 1 tick の処理時間が
+   * 倍になる（実測 0.12ms → 0.23ms）。普段は日次のままにして、プレイヤが
+   * 建てた・壊した瞬間だけここで取り直す。駅や公園を置いた効果は即座に出る。
+   */
+  private refreshFields(): void {
+    updateServiceCoverage(this.world, this.buildings);
+    updateLandValue(this.world, this.buildings);
   }
 
   /** 操作が通らなかった理由をプレイヤに伝える。 */
@@ -337,6 +372,15 @@ export class Simulation {
 
   private rebuildNetwork(): void {
     this.refreshStations();
+    // グラフを作り直したら必ずバージョンを進める。
+    //
+    // networkVersion を増やすのは World.setRoad / setRail だけで、駅は「建物」なので
+    // 設置・撤去してもバージョンが動かなかった。その結果、駅を壊しても
+    //   - 描画側の線路キャッシュ（agentLayer.drawTrains）
+    //   - 経路キャッシュに残った、消えた駅を通る経路
+    //   - 走行中の再ルート判定
+    // が全部そのまま生き残り、駅の無い線路を電車が延々と往復していた。
+    this.world.networkVersion++;
     this.graph.build(this.world, this.stationTiles);
     this.taz.refreshRepresentatives(this.world, this.graph);
     // 建物の接道点を取り直す（ハンドルではなくスロットで保持しているので安全）
@@ -401,6 +445,9 @@ export class Simulation {
       this.lumberPool = this.production.stock[Good.Lumber]!;
     }
 
+    // --- 経済期（2 シミュレーション時間） ---
+    if (tick > 0 && tick % ECONOMY_PERIOD_TICKS === 0) this.economyPass();
+
     // --- 毎日 ---
     if (tick > 0 && tick % TICKS_PER_DAY === 0) this.daily();
 
@@ -410,6 +457,34 @@ export class Simulation {
     }
 
     this.clock.tick++;
+  }
+
+  /**
+   * 経済期の処理。プレイヤの操作が街に返ってくる速さを決めているのはここ。
+   *
+   * 地価・サービス圏・労働市場・転入は元は日次だった。1 日が 32 実分になった今、
+   * 日次のままだと「駅を建てても 30 分何も起きない」「商店を建てても就業者が
+   * 0 のまま」になる。1 日の長さは変えずに、経済の時間だけデフォルメする。
+   */
+  private economyPass(): void {
+    const lctx = this.lifecycleContext();
+    this.lifecycle.updateLabourMarket(lctx);
+    this.cachedPopulation = this.citizens.count();
+    this.immigration(lctx, this.cachedPopulation);
+    this.finance = this.budget.accrue(this.world, this.buildings, this.citizens);
+  }
+
+  private lifecycleContext(): Parameters<LifecycleSystem['daily']>[0] {
+    return {
+      world: this.world,
+      buildings: this.buildings,
+      citizens: this.citizens,
+      taz: this.taz,
+      clock: this.clock,
+      rng: this.rng,
+      wheel: this.wheel,
+      activity: this.activity,
+    };
   }
 
   private daily(): void {
@@ -472,16 +547,7 @@ export class Simulation {
     this.growth.dailyReview(this.world, this.buildings);
 
     // ライフサイクル
-    const lctx = {
-      world: this.world,
-      buildings: this.buildings,
-      citizens: this.citizens,
-      taz: this.taz,
-      clock: this.clock,
-      rng: this.rng,
-      wheel: this.wheel,
-      activity: this.activity,
-    };
+    const lctx = this.lifecycleContext();
     this.lifecycle.daily(lctx);
 
     // 需要の再計算
@@ -509,7 +575,7 @@ export class Simulation {
       taxPct: this.budget.taxPct,
     });
 
-    this.immigration(lctx, pop);
+    // 転入は経済期ごとに回す（economyPass）
 
     // 日次統計を確定させてリセット
     this.dailyStats = { ...stats, modeCounts: [...stats.modeCounts] as [number, number, number, number] };
@@ -559,7 +625,10 @@ export class Simulation {
 
     // 小さいうちは流入を厚くする。人口比だけで決めると、街を作り始めた直後は
     // 1 日数人しか来ず、家だけが並んで誰も住んでいない状態が延々と続く。
-    const base = pop < 400 ? 70 : Math.max(12, pop * 0.03);
+    //
+    // 1 日分の枠を経済期の数で割って少しずつ入れる。日の境界でまとめて入れると、
+    // 人口が 32 実分に 1 回だけ跳ねる階段になり「家を建てても誰も来ない」に見える。
+    const base = (pop < 400 ? 70 : Math.max(12, pop * 0.03)) / ECONOMY_PERIODS_PER_DAY;
     const wanted = Math.ceil(appeal * Math.min(base, vacant));
     if (wanted > 0) this.lifecycle.immigrate(lctx, Math.min(120, wanted));
   }
@@ -607,6 +676,10 @@ export class Simulation {
   bootstrap(): void {
     updateServiceCoverage(this.world, this.buildings);
     updateLandValue(this.world, this.buildings);
+    // TAZ 行列を先に全部埋める。ローリング更新は 1 周 200 tick かかるので、
+    // これが無いと最初の数分は行列が Infinity のままで、求職も行き先選びも
+    // 概算にすら乗らない（シナリオ側は buildScenario で既にこれをやっている）。
+    this.taz.computeAll(this.graph);
     // 初期需要。ここが 0 だと最初の 1 軒が永久に建たない。
     this.demand = { residential: 70, commercial: 25, industrial: 40, agriculture: 55 };
   }
@@ -687,6 +760,9 @@ export class Simulation {
       tripsFailed: s.tripsFailed,
       shoppingFailed: s.shoppingFailed,
       cash: this.budget.cash,
+      finance: this.finance,
+      capexThisMonth: this.budget.capexMonth,
+      deficitMonths: this.budget.deficitMonths,
       lastReport: this.lastReport,
       cacheHitRate: this.router.cache.hitRate,
       routeQueueDepth: this.activity.waitingCount,

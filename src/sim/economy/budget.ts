@@ -17,8 +17,8 @@ import type { World } from '@sim/world/world';
  * 「なぜか金が減る」タイプの追いにくいバグになる）。
  */
 
-export interface MonthlyReport {
-  month: number;
+/** 収入と維持費の内訳。現金を動かさずに今の run-rate を覗くのに使う。 */
+export interface Accrual {
   incomeResidential: number;
   incomeCommercial: number;
   incomeIndustrial: number;
@@ -29,7 +29,28 @@ export interface MonthlyReport {
   income: number;
   expense: number;
   net: number;
+}
+
+export interface MonthlyReport extends Accrual {
+  month: number;
+  /** その月の建設・撤去・木材輸入（現金は支出時点で動いている）。 */
+  capex: number;
   cashAfter: number;
+}
+
+export function emptyAccrual(): Accrual {
+  return {
+    incomeResidential: 0,
+    incomeCommercial: 0,
+    incomeIndustrial: 0,
+    incomeAgriculture: 0,
+    upkeepRoads: 0,
+    upkeepRail: 0,
+    upkeepServices: 0,
+    income: 0,
+    expense: 0,
+    net: 0,
+  };
 }
 
 export class Budget {
@@ -51,24 +72,37 @@ export class Budget {
   history: MonthlyReport[] = [];
   /** 赤字が続いている月数。 */
   deficitMonths = 0;
+  /** 今月の建設・撤去・輸入の支出。月次報告に載せて現金の増減と帳尻を合わせる。 */
+  capexMonth = 0;
+
+  /** インフラ維持費のキャッシュ。全タイル走査なので networkVersion 単位で使い回す。 */
+  private upkeepCache = { version: -1, roads: 0, rail: 0 };
 
   /** 支出できるか判定して引き落とす。 */
   spend(amount: number): boolean {
     if (amount > this.cash) return false;
     this.cash -= amount;
+    this.capexMonth += amount;
     return true;
   }
 
   refund(amount: number): void {
     this.cash += amount;
+    this.capexMonth -= amount;
   }
 
   setTax(zone: Zone, pct: number): void {
     this.taxPct[zone] = Math.max(0, Math.min(20, Math.round(pct)));
   }
 
-  /** 住民税・固定資産税・法人税と維持費を集計して現金を更新する。 */
-  closeMonth(world: World, buildings: BuildingStore, citizens: CitizenStore, month: number): MonthlyReport {
+  /**
+   * 住民税・固定資産税・法人税と維持費を集計する。現金も売上台帳も動かさない。
+   *
+   * 決算と切り離してあるのは、プレイヤに「今の収支」を常時見せるため。
+   * 集計しながら revenueYen をゼロにしていた頃は、月末にならないと収支が分からなかった。
+   */
+  accrue(world: World, buildings: BuildingStore, citizens: CitizenStore): Accrual {
+    const a = emptyAccrual();
     let incomeResidential = 0;
     let incomeCommercial = 0;
     let incomeIndustrial = 0;
@@ -84,13 +118,12 @@ export class Budget {
 
     // 事業税（売上ベース）と固定資産税
     for (const s of buildings.each()) {
-      const a = archetype(buildings.archetypeId[s]!);
-      upkeepServices += a.upkeep;
+      const arch = archetype(buildings.archetypeId[s]!);
+      upkeepServices += arch.upkeep;
       const revenue = buildings.revenueYen[s]!;
-      buildings.revenueYen[s] = 0;
       const level = buildings.level[s]!;
       const propertyTax = Math.round(level * 9_000 * (1 + world.landValue[buildings.originTile[s]!]! / 255));
-      switch (a.zone) {
+      switch (arch.zone) {
         case Zone.CommercialLocal:
         case Zone.CommercialCentral:
           incomeCommercial += Math.round(revenue * (this.taxPct[Zone.CommercialLocal]! / 100)) + propertyTax;
@@ -115,37 +148,47 @@ export class Budget {
       }
     }
 
-    // インフラ維持費
-    let upkeepRoads = 0;
-    let upkeepRail = 0;
-    for (let i = 0; i < TILE_COUNT; i++) {
-      const rc = world.road[i]!;
-      if (rc !== RoadClass.None) upkeepRoads += ROAD_UPKEEP[rc]!;
-      if (world.rail[i] !== 0) upkeepRail += RAIL_UPKEEP;
+    // インフラ維持費。全タイル走査なので道路・線路が変わったときだけ数え直す。
+    if (this.upkeepCache.version !== world.networkVersion) {
+      let roads = 0;
+      let rail = 0;
+      for (let i = 0; i < TILE_COUNT; i++) {
+        const rc = world.road[i]!;
+        if (rc !== RoadClass.None) roads += ROAD_UPKEEP[rc]!;
+        if (world.rail[i] !== 0) rail += RAIL_UPKEEP;
+      }
+      this.upkeepCache = { version: world.networkVersion, roads, rail };
     }
 
-    const income = incomeResidential + incomeCommercial + incomeIndustrial + incomeAgriculture;
-    const expense = upkeepRoads + upkeepRail + upkeepServices;
-    const net = income - expense;
-    this.cash += net;
+    a.incomeResidential = incomeResidential;
+    a.incomeCommercial = incomeCommercial;
+    a.incomeIndustrial = incomeIndustrial;
+    a.incomeAgriculture = incomeAgriculture;
+    a.upkeepRoads = this.upkeepCache.roads;
+    a.upkeepRail = this.upkeepCache.rail;
+    a.upkeepServices = upkeepServices;
+    a.income = incomeResidential + incomeCommercial + incomeIndustrial + incomeAgriculture;
+    a.expense = a.upkeepRoads + a.upkeepRail + a.upkeepServices;
+    a.net = a.income - a.expense;
+    return a;
+  }
 
-    if (net < 0) this.deficitMonths++;
+  /** 月次決算。集計をコミットして売上台帳をリセットする。 */
+  closeMonth(world: World, buildings: BuildingStore, citizens: CitizenStore, month: number): MonthlyReport {
+    const a = this.accrue(world, buildings, citizens);
+    for (const s of buildings.each()) buildings.revenueYen[s] = 0;
+
+    this.cash += a.net;
+    if (a.net < 0) this.deficitMonths++;
     else this.deficitMonths = 0;
 
     const report: MonthlyReport = {
+      ...a,
       month,
-      incomeResidential,
-      incomeCommercial,
-      incomeIndustrial,
-      incomeAgriculture,
-      upkeepRoads,
-      upkeepRail,
-      upkeepServices,
-      income,
-      expense,
-      net,
+      capex: this.capexMonth,
       cashAfter: this.cash,
     };
+    this.capexMonth = 0;
     this.history.push(report);
     if (this.history.length > 120) this.history.shift();
     return report;

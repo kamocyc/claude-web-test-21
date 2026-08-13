@@ -23,7 +23,7 @@ import { pathPosition, type PathPose } from '@sim/network/pathfinder';
 import type { Router } from '@sim/network/router';
 import type { TazMatrix } from '@sim/network/tazMatrix';
 import { MODE_NAMES_JA } from '@shared/enums';
-import { tileCenterX, tileCenterZ } from '@sim/world/tiles';
+import { tileDistanceM } from '@sim/world/tiles';
 import type { World } from '@sim/world/world';
 import { CitizenFlag, type CitizenStore } from './citizens';
 import { SCHEDULES } from './schedules';
@@ -166,8 +166,12 @@ export class ActivitySystem {
 
     const dest = skip ? 0 : this.destinationFor(ctx, id, st.activity);
     if (dest === 0 || skip) {
-      // 行き先が無い / 寄り道しない → 在宅に落として次のステップへ
-      this.settleAt(ctx, id, Activity.AtHome, c.homeBuilding[id]!);
+      // 寄り道しない / 行き先が無い → その場に留めて次のステップへ。
+      //
+      // ここで在宅に落とすと、勤務先にいる市民が自宅へ瞬間移動してしまう。
+      // 会社員は買い物 40%・レジャー 25% で寄り道するので、両方外した
+      // 4 割強が「夕方に職場から消えて家に湧く」状態になり、帰宅トリップが
+      // 発生していなかった（夕ラッシュがほぼ半分になっていた）。
       this.advanceStep(ctx, id);
       return;
     }
@@ -270,10 +274,9 @@ export class ActivitySystem {
       const mode = m as Mode;
       // TAZ 行列で概算（配列参照 1 回）。同一 TAZ 内は行列が 0 になるので直線距離で補う。
       let sec = ctx.taz.costBetweenTiles(originTile, destTile, mode);
-      const straight = Math.hypot(
-        tileCenterX(originTile) - tileCenterX(destTile),
-        tileCenterZ(originTile) - tileCenterZ(destTile),
-      );
+      // シミュレーション上の実距離を使う。tileCenterX/Z は描画単位なので、
+      // ここに使うと 1/15 の距離で所要時間と運賃を見積もることになる。
+      const straight = tileDistanceM(originTile, destTile);
       if (!Number.isFinite(sec) || sec <= 0) {
         // 行列がまだ埋まっていない / 同一ゾーン → 直線距離ベースの概算
         const speedMs = mode === Mode.Walk ? 1.33 : mode === Mode.Bike ? 4.2 : mode === Mode.Car ? 8.3 : 12;
@@ -409,6 +412,8 @@ export class ActivitySystem {
         return ctx.destinations.pickSchool(ctx, c.currentTile[id]!);
       case Activity.Shopping:
         return ctx.destinations.pickShop(ctx, c.currentTile[id]!);
+      case Activity.Business:
+        return ctx.destinations.pickBusiness(ctx, c.currentTile[id]!);
       case Activity.Leisure:
         return ctx.destinations.pickLeisure(ctx, c.currentTile[id]!);
       case Activity.AtHome:

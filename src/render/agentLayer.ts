@@ -215,19 +215,18 @@ export class AgentLayer {
       }
     }
 
-    // --- 滞在中の市民 ---
-    // 移動中の人だけを描くと、街が空っぽに見える。トリップは数分で終わるので、
-    // どの瞬間を切り取っても移動中の人はごく一部しかいないため。
-    // 勤務中・買い物中・在宅の市民も、その建物の敷地に立たせて描く。
+    // --- 立ち寄り中の市民 ---
+    // 屋外に出すのは買い物中とレジャー中だけ。
+    //
+    // 以前は在宅・勤務中・通学中まで建物の玄関前に立たせていたが、位置が ID の
+    // ハッシュで固定なので、同じ人が同じ場所に一日じゅう立ち尽くす街になっていた。
+    // 買い物とレジャーは滞在が 2 時間程度で終わるので、時間とともに入れ替わる。
     if (drawPedestrians && ped < MAX_VISIBLE_AGENTS) {
       const b = sim.buildings;
       for (let id = 0; id < c.high && ped < MAX_VISIBLE_AGENTS; id++) {
         if (!c.isAlive(id)) continue;
         const st = c.state[id]!;
-        // 就寝中と経路待ちは屋内にいる扱い
-        if (st === Activity.Sleeping || st === Activity.Traveling || st === Activity.WaitingForRoute) continue;
-        // 在宅の人は一部だけ外に出す（全員が庭に立っていると不自然）
-        if (st === Activity.AtHome && id % 4 !== 0) continue;
+        if (st !== Activity.Shopping && st !== Activity.Leisure) continue;
 
         const tile = c.currentTile[id]!;
         // 建物のタイル中心に置くと、人が家の中に埋まって見えない。
