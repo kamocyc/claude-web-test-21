@@ -123,6 +123,26 @@ export class FreightSystem {
     return this.lastSupplier.get(consumerSlot * 2 + inputIndex) ?? -1;
   }
 
+  /**
+   * 走行中のトラックを全部降ろして、供給元インデックスも捨てる。
+   *
+   * セーブデータの読み込み時に呼ぶ。トラックは経路オブジェクトを抱えていて、
+   * 読み込み後のグラフでは節点番号が変わっているので、そのまま走らせると
+   * 存在しないエッジの上を走る。積荷は次の発注でやり直せば足りる。
+   */
+  reset(): void {
+    for (let i = 0; i < this.trucks.high; i++) {
+      if (this.trucks.alive[i] === 1) this.trucks.free(i);
+    }
+    this.activeTrucks = 0;
+    this.suppliers.clear();
+    this.consumers.length = 0;
+    this.cursor = 0;
+    this.rebuildCountdown = 0;
+    this.lastSupplier.clear();
+    this.stats.active = 0;
+  }
+
   resetPeriodStats(): void {
     this.stats.dispatched = 0;
     this.stats.delivered = 0;

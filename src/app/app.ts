@@ -4,10 +4,12 @@ import { Renderer } from '@render/renderer';
 import { citizenPosition } from '@sim/agents/activity';
 import { archetype } from '@sim/buildings/archetypes';
 import { Simulation } from '@sim/simulation';
+import { decodeSave, encodeSave, type SaveMeta } from '@sim/persistence';
 import { buildScenario, findCityCenter } from '@sim/scenario';
 import { idx, tileX, tileY } from '@sim/world/tiles';
 import { Ui } from '@ui/ui';
 import { ToolKind, commandFor, costOf, initialToolState, previewTiles } from '@ui/tools';
+import { AUTO_SLOT, defaultFileName, downloadSave, pickSaveFile, putSave } from '@ui/storage';
 
 /**
  * アプリケーションの統括。
@@ -17,7 +19,8 @@ import { ToolKind, commandFor, costOf, initialToolState, previewTiles } from '@u
  * 「遅れを取り戻そうとしてさらに重くなる」死のスパイラルを避けるため。
  */
 export class App {
-  readonly sim: Simulation;
+  /** セーブデータの読み込みで丸ごと差し替わる（シードが違えば地形から作り直すため）。 */
+  sim: Simulation;
   readonly renderer: Renderer;
   readonly ui: Ui;
   private readonly canvas: HTMLCanvasElement;
@@ -57,6 +60,8 @@ export class App {
       onFollowCitizen: () => {
         this.followCitizen = this.ui.selectedCitizen;
       },
+      onSave: () => void this.saveToBrowserAndFile(),
+      onLoad: () => void this.loadFromFile(),
     });
     this.ui.currentSpeed = this.speed;
     this.ui.setSpeed(this.speed);
@@ -89,14 +94,102 @@ export class App {
     this.ui.tutorial.close();
   }
 
+  // ---------------- セーブ / ロード ----------------
+
+  /** 今の街をバイト列にする。 */
+  saveData(): { data: ArrayBuffer; meta: SaveMeta } {
+    const meta: SaveMeta = {
+      cityName: this.ui.cityName,
+      savedAt: Date.now(),
+      population: this.sim.citizens.count(),
+      dateJa: `${this.sim.clock.year}年${this.sim.clock.month}月${this.sim.clock.day}日`,
+    };
+    return { data: encodeSave(this.sim.snapshot(), meta), meta };
+  }
+
+  /**
+   * セーブデータを読み込む。
+   *
+   * シードが違えば地形そのものが違うので、`Simulation` を作り直して差し替える。
+   * 描画側は毎フレーム `sim` を引数で受け取る作りなので、差し替えても
+   * キャッシュを捨てさせるだけで済む。
+   */
+  loadData(buf: ArrayBuffer): SaveMeta {
+    const { snapshot, meta } = decodeSave(buf);
+    if (snapshot.seed !== this.sim.seed) this.sim = new Simulation(snapshot.seed);
+    this.sim.restoreSnapshot(snapshot);
+
+    this.ui.cityName = meta.cityName;
+    this.ui.selectedCitizen = -1;
+    this.ui.selectedBuilding = -1;
+    this.followCitizen = -1;
+    this.probeFrom = -1;
+    this.dragStart = -1;
+    this.accumulator = 0;
+    this.renderer.showRoute(null, this.sim);
+    this.renderer.invalidateAll();
+    this.renderer.setPreviewTiles([], null);
+    this.focusOnCity();
+    this.ui.tutorial.close();
+    this.ui.pushAlert(`${meta.cityName}（${meta.dateJa}・人口 ${meta.population.toLocaleString('ja-JP')}）を読み込みました`, 'info');
+    return meta;
+  }
+
+  /** 建物の重心へカメラを寄せる。読み込み直後に街を画面に入れるため。 */
+  private focusOnCity(): void {
+    const b = this.sim.buildings;
+    let sx = 0;
+    let sz = 0;
+    let n = 0;
+    for (const s of b.each()) {
+      const t = b.originTile[s]!;
+      sx += tileX(t);
+      sz += tileY(t);
+      n++;
+    }
+    const center = n > 0 ? { x: sx / n, y: sz / n } : { x: MAP_W / 2, y: MAP_H / 2 };
+    this.renderer.focusOn((center.x + 0.5) * TILE_M, (center.y + 0.5) * TILE_M);
+  }
+
+  /**
+   * 保存。ブラウザ内（IndexedDB）とファイルの両方に書き出す。
+   *
+   * ブラウザ内は「続きから」用、ファイルは持ち運び用。片方だけだと、
+   * 履歴を消した瞬間に街が消えるか、毎回ファイルを選ばされるかのどちらかになる。
+   */
+  private async saveToBrowserAndFile(): Promise<void> {
+    try {
+      const { data, meta } = this.saveData();
+      downloadSave(data, defaultFileName(meta.cityName, meta.dateJa));
+      await putSave(AUTO_SLOT, { meta, data });
+      this.ui.pushAlert(`${meta.dateJa} の街を保存しました（${(data.byteLength / 1024 / 1024).toFixed(1)}MB）`, 'info');
+    } catch (e) {
+      this.ui.pushAlert(`保存に失敗しました: ${(e as Error).message}`, 'budgetDeficit');
+    }
+  }
+
+  private async loadFromFile(): Promise<void> {
+    try {
+      const buf = await pickSaveFile();
+      if (!buf) return;
+      this.loadData(buf);
+    } catch (e) {
+      this.ui.pushAlert(`読み込みに失敗しました: ${(e as Error).message}`, 'budgetDeficit');
+    }
+  }
+
   // ---------------- 入力 ----------------
 
   private attachInput(): void {
     const canvas = this.canvas;
 
+    // 右ドラッグはカメラの回転に使うので、ブラウザのコンテキストメニューは全面的に止める。
+    // canvas だけに付けていたため、UI パネルの上で右ボタンを離すとメニューが出ていた。
+    window.addEventListener('contextmenu', (e) => e.preventDefault());
+
     canvas.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.shiftKey || e.altKey) return;
-      const tile = this.renderer.pickTile(e.clientX, e.clientY, canvas);
+      const tile = this.renderer.pickTile(e.clientX, e.clientY, canvas, this.sim.world);
       if (tile < 0) return;
       this.dragStart = tile;
     });
@@ -104,15 +197,17 @@ export class App {
     canvas.addEventListener('pointermove', (e) => {
       this.pointerX = e.clientX;
       this.pointerY = e.clientY;
-      const tile = this.renderer.pickTile(e.clientX, e.clientY, canvas);
+      const tile = this.renderer.pickTile(e.clientX, e.clientY, canvas, this.sim.world);
       this.hoverTile = tile;
       this.renderer.setCursorTile(tile, this.sim.world);
+      this.updatePreview();
       this.updateCursorTip();
     });
 
     canvas.addEventListener('pointerleave', () => {
       this.hoverTile = -1;
       this.renderer.setCursorTile(-1, null);
+      this.renderer.setPreviewTiles([], null);
       this.ui.showCursorTip(0, 0, null);
     });
 
@@ -120,7 +215,8 @@ export class App {
       if (this.dragStart < 0) return;
       const from = this.dragStart;
       this.dragStart = -1;
-      const to = this.renderer.pickTile(e.clientX, e.clientY, canvas);
+      const to = this.renderer.pickTile(e.clientX, e.clientY, canvas, this.sim.world);
+      this.updatePreview();
       if (to < 0) return;
       this.handleToolAction(from, to);
       this.updateCursorTip();
@@ -128,6 +224,7 @@ export class App {
     canvas.addEventListener('pointerup', finish);
     canvas.addEventListener('pointercancel', () => {
       this.dragStart = -1;
+      this.updatePreview();
     });
 
     window.addEventListener('keydown', (e) => {
@@ -154,6 +251,56 @@ export class App {
     this.speed = s;
     this.ui.currentSpeed = s;
     this.ui.setSpeed(s);
+  }
+
+  /**
+   * これから何がどこに敷かれるかを地面に光らせる。
+   *
+   * ドラッグ中に終点のタイルだけを光らせていたので、道路を引いている最中は
+   * 「どこからどこまで敷かれるのか」が確定するまで分からなかった。
+   * 敷ける／敷けないもタイルごとに色で返す（斜面や水面は赤くなる）。
+   */
+  private updatePreview(): void {
+    const t = this.hoverTile;
+    if (t < 0) {
+      this.renderer.setPreviewTiles([], null);
+      return;
+    }
+    const tool = this.ui.tool;
+    const w = this.sim.world;
+
+    if (tool.kind === ToolKind.Place) {
+      // 建物はフットプリント全体を出す（1×1 とは限らない）
+      const a = archetype(tool.archetypeId);
+      const ok = this.sim.canPlace(tool.archetypeId, t);
+      const tiles: number[] = [];
+      const flags: boolean[] = [];
+      const x0 = tileX(t);
+      const y0 = tileY(t);
+      for (let dy = 0; dy < a.h; dy++) {
+        for (let dx = 0; dx < a.w; dx++) {
+          if (x0 + dx >= MAP_W || y0 + dy >= MAP_H) continue;
+          tiles.push(idx(x0 + dx, y0 + dy));
+          flags.push(ok);
+        }
+      }
+      this.renderer.setPreviewTiles(tiles, w, flags);
+      return;
+    }
+
+    // 範囲を持つ道具はドラッグ中だけ出す（ホバー中は黄色いカーソルで足りる）
+    if (this.dragStart < 0) {
+      this.renderer.setPreviewTiles([], null);
+      return;
+    }
+    const tiles = previewTiles(tool, this.dragStart, t);
+    const flags = tiles.map((i) => {
+      if (tool.kind === ToolKind.Road) return w.canBuildRoad(i);
+      if (tool.kind === ToolKind.Rail) return w.canBuildRail(i);
+      if (tool.kind === ToolKind.Zone) return tool.zone === Zone.None || w.canZone(i, tool.zone);
+      return true;
+    });
+    this.renderer.setPreviewTiles(tiles, w, flags);
   }
 
   /** カーソル横に費用や地形を出す（Cities: Skylines と同じ感覚で操作できるように）。 */
@@ -312,10 +459,8 @@ export class App {
         }
       }
 
-      if (this.dragStart >= 0 && this.hoverTile >= 0) {
-        const tiles = previewTiles(this.ui.tool, this.dragStart, this.hoverTile);
-        this.renderer.setCursorTile(tiles.length > 0 ? tiles[tiles.length - 1]! : this.hoverTile, this.sim.world);
-      }
+      // 道具を切り替えた直後にも反映されるよう、プレビューは毎フレーム取り直す
+      this.updatePreview();
 
       if (this.ui.selectedCitizen >= 0) {
         this.renderer.showRoute(this.sim.citizens.tripPath[this.ui.selectedCitizen] ?? null, this.sim);

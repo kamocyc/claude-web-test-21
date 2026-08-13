@@ -83,6 +83,10 @@ export const CARGO_COLORS: Record<number, number> = {
 export const TRAIN_BODY_COLOR = 0xd8dde4;
 export const TRAIN_HEAD_COLOR = 0x3f6fa8;
 
+/** ドラッグ中のプレビュー。敷ける／敷けないを色で分ける。 */
+export const PREVIEW_OK_COLOR = 0x6fe08a;
+export const PREVIEW_BAD_COLOR = 0xff5555;
+
 /** 建物の形状キーごとの色と高さ（レベル 1 のとき、m）。 */
 export interface MeshStyle {
   color: number;

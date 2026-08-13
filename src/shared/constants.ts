@@ -238,6 +238,10 @@ export const FREIGHT_DISPATCH_INTERVAL = 10;
 export const STOCKOUT_ABANDON_DAYS = 20;
 
 // ---------- 描画 ----------
+/** 標高 (heightDm) → ワールド座標の Y。地形メッシュ・建物・人・カーソルで共通。 */
+export const TERRAIN_HEIGHT_SCALE = 0.02;
+/** ドラッグ中のプレビューで同時に光らせるタイル数の上限。 */
+export const MAX_PREVIEW_TILES = 4096;
 /** 同時に描画する市民インスタンスの上限。 */
 export const MAX_VISIBLE_AGENTS = 4000;
 export const MAX_VISIBLE_VEHICLES = 3000;

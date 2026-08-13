@@ -30,6 +30,37 @@ export function handleGen(h: number): number {
   return (h >>> 20) & 0xfff;
 }
 
+/**
+ * セーブ対象の SoA 配列名。フィールドを足したらここにも足すこと
+ * （足し忘れると「読み込むと在庫だけ消えている」類の不具合になる）。
+ * `accessNode` はグラフ再構築で取り直すので入れない。
+ */
+export const BUILDING_FIELDS = [
+  'alive',
+  'generation',
+  'archetypeId',
+  'level',
+  'originTile',
+  'accessTile',
+  'residents',
+  'capacityResidents',
+  'jobsFilled',
+  'jobsTotal',
+  'inGoodA',
+  'inAmtA',
+  'inGoodB',
+  'inAmtB',
+  'outGood',
+  'outAmt',
+  'constructionNeed',
+  'stockoutDays',
+  'goodDays',
+  'badDays',
+  'desirability',
+  'revenueYen',
+] as const;
+export type BuildingField = (typeof BUILDING_FIELDS)[number];
+
 export class BuildingStore {
   capacity = 0;
   /** 使用中スロットの上限（走査範囲）。 */
@@ -120,6 +151,23 @@ export class BuildingStore {
 
   handleOf(slot: number): number {
     return makeHandle(slot, this.generation[slot]! & 0xfff);
+  }
+
+  /** セーブデータを流し込む前に容量を確保する。 */
+  ensureCapacity(n: number): void {
+    if (n <= this.capacity) return;
+    let cap = Math.max(1, this.capacity);
+    while (cap < n) cap *= 2;
+    this.grow(cap);
+  }
+
+  /** 読み込み後に使用中スロットと空きスロットを作り直す。 */
+  rebuildFreeList(high: number): void {
+    this.high = high;
+    this.freeList.length = 0;
+    for (let i = high - 1; i >= 0; i--) {
+      if (this.alive[i] !== 1) this.freeList.push(i);
+    }
   }
 
   /** 建物を生成する。失敗したら 0。 */

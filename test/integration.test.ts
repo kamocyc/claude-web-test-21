@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { TICKS_PER_SECOND_AT_1X } from '@shared/constants';
+import { TICKS_PER_DAY, TICKS_PER_SECOND_AT_1X } from '@shared/constants';
 import { Activity, Good, Mode, RoadClass, Zone } from '@shared/enums';
 import { runHeadless } from '@sim/harness';
+import { decodeSave, encodeSave } from '@sim/persistence';
+import { buildScenario } from '@sim/scenario';
+import { hashArrays } from '@sim/core/hash';
 import { Simulation } from '@sim/simulation';
 import { idx } from '@sim/world/tiles';
 import { CitizenFlag } from '@sim/agents/citizens';
@@ -165,6 +168,12 @@ describe('街の 90 日運転', () => {
   });
 });
 
+function countEmployed(sim: Simulation): number {
+  let n = 0;
+  for (const id of sim.citizens.each()) if (sim.citizens.has(id, CitizenFlag.Employed)) n++;
+  return n;
+}
+
 describe('プレイヤ操作への応答', () => {
   /**
    * 「プレイヤが道路を敷けばつながり、壊せば切れる」という、
@@ -321,6 +330,72 @@ describe('プレイヤ操作への応答', () => {
     // 以前はここで自宅に瞬間移動していた。帰宅トリップが発生しなくなる原因。
     expect(c.currentTile[id]).toBe(workTile);
     expect(c.state[id]).toBe(Activity.AtWork);
+  });
+
+  it('保存して読み込むと同じ街に戻る', () => {
+    const sim = new Simulation(31);
+    buildScenario(sim, { size: 48, seedPopulation: 200 });
+    for (let k = 0; k < 2000; k++) sim.tick();
+
+    const before = {
+      tick: sim.clock.tick,
+      population: sim.citizens.count(),
+      buildings: sim.buildings.count(),
+      cash: sim.budget.cash,
+      // stats() の就業者数は経済期ごとの集計なので最大 120 tick 古い。
+      // 保存されているかを見たいのはフラグそのものなので、ここで数え直す。
+      employed: countEmployed(sim),
+      // 地面（用途地域・道路・線路・建物の配置）は 1 ビットも変わってはいけない
+      land: hashArrays([sim.world.zone, sim.world.road, sim.world.rail, sim.world.buildingRef]),
+    };
+
+    const saved = encodeSave(sim.snapshot(), {
+      cityName: 'テストの街',
+      savedAt: 0,
+      population: before.population,
+      dateJa: '1985年1月1日',
+    });
+
+    const { snapshot, meta } = decodeSave(saved);
+    expect(meta.cityName).toBe('テストの街');
+    const loaded = new Simulation(snapshot.seed);
+    loaded.restoreSnapshot(snapshot);
+
+    expect(loaded.clock.tick).toBe(before.tick);
+    expect(loaded.citizens.count()).toBe(before.population);
+    expect(loaded.buildings.count()).toBe(before.buildings);
+    expect(loaded.budget.cash).toBe(before.cash);
+    expect(countEmployed(loaded)).toBe(before.employed);
+    expect(hashArrays([loaded.world.zone, loaded.world.road, loaded.world.rail, loaded.world.buildingRef])).toBe(
+      before.land,
+    );
+  });
+
+  it('読み込んだ街がそのまま動き続ける', () => {
+    const sim = new Simulation(32);
+    buildScenario(sim, { size: 48, seedPopulation: 200 });
+    for (let k = 0; k < 2000; k++) sim.tick();
+    const saved = encodeSave(sim.snapshot(), { cityName: 'x', savedAt: 0, population: 0, dateJa: 'x' });
+
+    const { snapshot } = decodeSave(saved);
+    const loaded = new Simulation(snapshot.seed);
+    loaded.restoreSnapshot(snapshot);
+    const popAtLoad = loaded.citizens.count();
+
+    // 読み込み時に走行中のトリップは打ち切るので、元の街と 1 人単位まで一致は
+    // しない。ここで見たいのは「止まらずに動き続ける」こと。
+    for (let k = 0; k < TICKS_PER_DAY; k++) loaded.tick();
+    const s = loaded.stats();
+    expect(loaded.citizens.count()).toBeGreaterThan(popAtLoad * 0.9);
+    expect(s.tripsCompleted).toBeGreaterThan(popAtLoad * 0.5);
+    expect(s.tripsFailed).toBeLessThan(Math.max(20, s.tripsCompleted * 0.02));
+    expect(Number.isFinite(s.cash)).toBe(true);
+  });
+
+  it('別のゲームのファイルは読み込まずにエラーにする', () => {
+    const junk = new Uint8Array(64);
+    junk.set(new TextEncoder().encode('NOT A SAVE'));
+    expect(() => decodeSave(junk.buffer)).toThrow();
   });
 
   it('税率を上げると住宅需要が下がる', () => {

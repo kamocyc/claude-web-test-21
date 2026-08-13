@@ -11,6 +11,7 @@ import {
   PARKED_CARS_PER_TILE,
   PARKED_CAR_LOD_DISTANCE_M,
   PEDESTRIAN_LOD_DISTANCE_M,
+  TERRAIN_HEIGHT_SCALE,
   TILE_M,
   TRAIN_CARS,
   TRAIN_CAR_LENGTH_M,
@@ -87,7 +88,7 @@ export class AgentLayer {
   private groundAt(sim: Simulation, x: number, z: number): number {
     const tx = Math.max(0, Math.min(MAP_W - 1, Math.floor(x / TILE_M)));
     const tz = Math.max(0, Math.min(MAP_H - 1, Math.floor(z / TILE_M)));
-    return sim.world.heightDm[idx(tx, tz)]! * 0.02;
+    return sim.world.heightDm[idx(tx, tz)]! * TERRAIN_HEIGHT_SCALE;
   }
 
   constructor() {

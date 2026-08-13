@@ -124,6 +124,28 @@ export class ActivitySystem {
     this.scheduleNextStep(ctx, id);
   }
 
+  /**
+   * セーブデータの読み込み後に、全市民をタイミングホイールへ載せ直す。
+   *
+   * ホイールの中身は保存しない。保存すべき情報は市民が `wakeTick` として
+   * 既に持っているので、そこから作り直すほうが形式が単純で壊れにくい。
+   *
+   * 移動中・出発準備中の市民は、その場で打ち切って自宅に戻す。経路オブジェクトは
+   * 節点番号への参照であり、読み込み後のグラフでは別の場所を指すため。
+   * スケジュールの進行位置は保つので、生活のリズムは崩れない。
+   */
+  rehydrate(ctx: ActivityContext): void {
+    const c = ctx.citizens;
+    this.waiting.length = 0;
+    for (const id of c.each()) {
+      c.tripPath[id] = null;
+      if (c.state[id] === Activity.Traveling || c.state[id] === Activity.WaitingForRoute) {
+        this.settleAt(ctx, id, Activity.AtHome, c.homeBuilding[id]!);
+      }
+      this.scheduleNextStep(ctx, id);
+    }
+  }
+
   /** この tick に起床する市民を処理する。 */
   tick(ctx: ActivityContext): void {
     const due = ctx.wheel.drain(ctx.clock.tick);

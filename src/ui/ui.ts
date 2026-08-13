@@ -45,6 +45,8 @@ export interface UiCallbacks {
   onOverlay(o: Overlay): void;
   onTax(zone: Zone, pct: number): void;
   onFollowCitizen(): void;
+  onSave(): void;
+  onLoad(): void;
 }
 
 export class Ui {
@@ -382,6 +384,13 @@ export class Ui {
       sc.appendChild(b);
     }
     clock.appendChild(sc);
+
+    // セーブ / ロード。時計の下に置くのは、時間を止めてから保存する動線が自然なため。
+    const io = el('div');
+    io.id = 'saveio';
+    io.appendChild(btn('保存', () => this.cb.onSave()));
+    io.appendChild(btn('読込', () => this.cb.onLoad()));
+    clock.appendChild(io);
     this.cityInfo.appendChild(clock);
     this.setSpeed(this.currentSpeed);
   }

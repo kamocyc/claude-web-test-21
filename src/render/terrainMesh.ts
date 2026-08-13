@@ -1,5 +1,5 @@
 import { BufferAttribute, BufferGeometry, Mesh, MeshLambertMaterial, Object3D } from 'three';
-import { CHUNK, CHUNKS_X, CHUNK_COUNT, TILE_M } from '@shared/constants';
+import { CHUNK, CHUNKS_X, CHUNK_COUNT, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
 import { Overlay, RoadClass, Terrain, Zone } from '@shared/enums';
 import type { Simulation } from '@sim/simulation';
 import { idx, inBounds } from '@sim/world/tiles';
@@ -225,7 +225,7 @@ function cornerHeight(world: { terrain: Uint8Array; heightDm: Uint16Array }, cx:
       const y = cy + dy;
       if (!inBounds(x, y)) continue;
       const t = idx(x, y);
-      sum += world.terrain[t] === Terrain.Sea ? -1.5 : world.heightDm[t]! * 0.02;
+      sum += world.terrain[t] === Terrain.Sea ? -1.5 : world.heightDm[t]! * TERRAIN_HEIGHT_SCALE;
       n++;
     }
   }

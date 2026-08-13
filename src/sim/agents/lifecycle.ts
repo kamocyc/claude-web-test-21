@@ -126,6 +126,14 @@ export function resetHouseholdIds(): void {
   nextHouseholdId = 1;
 }
 
+/** セーブ／ロード用。復元しないと、読み込み後の世帯 ID が既存と衝突する。 */
+export function householdIdCounter(): number {
+  return nextHouseholdId;
+}
+export function setHouseholdIdCounter(n: number): void {
+  nextHouseholdId = Math.max(1, Math.floor(n));
+}
+
 /**
  * 日次のライフサイクル処理。全市民を毎日見るのではなく 1/7 ずつ処理して
  * 1 週間で一巡させる（人口 1 万人でも 1 日あたり 1400 人分の軽い処理で済む）。
@@ -161,7 +169,40 @@ export class LifecycleSystem {
     const c = ctx.citizens;
     const b = ctx.buildings;
     const rng = ctx.rng;
+    const jobIndex = this.refreshCounts(ctx);
 
+    const n = this.seekers.length;
+    if (n === 0) {
+      this.jobCursor = 0;
+      return;
+    }
+    const attempts = Math.min(n, JOB_SEEKERS_PER_PERIOD);
+    for (let k = 0; k < attempts; k++) {
+      const id = this.seekers[(this.jobCursor + k) % n]!;
+      if (!seekJob(c, b, ctx.taz, jobIndex, rng, id)) continue;
+      c.scheduleId[id] = pickSchedule(
+        c.age[id]!,
+        true,
+        false,
+        rng.chance(NIGHT_SHIFT_SHARE),
+        rng.chance(SHIFT_WORK_SHARE),
+      );
+      // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
+      const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
+      c.set(id, CitizenFlag.TransitPass, homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15);
+      ctx.activity.initCitizen(ctx as never, id);
+    }
+    this.jobCursor = (this.jobCursor + attempts) % n;
+  }
+
+  /**
+   * 求人・住宅の在庫と、就業／失業／住居なしの人数を数え直す。
+   * 求職者の一覧も作る。セーブデータの読み込み直後にも単独で呼ぶ
+   * （統計だけが古いまま表示されるのを防ぐ）。
+   */
+  refreshCounts(ctx: LifecycleContext): JobIndex {
+    const c = ctx.citizens;
+    const b = ctx.buildings;
     const jobIndex = buildJobIndex(b);
     this.stats.jobIndex = jobIndex;
     this.stats.housingIndex = buildHousingIndex(b);
@@ -186,29 +227,7 @@ export class LifecycleSystem {
     this.stats.employed = employed;
     this.stats.unemployed = unemployed;
     this.stats.homeless = homeless;
-
-    const n = this.seekers.length;
-    if (n === 0) {
-      this.jobCursor = 0;
-      return;
-    }
-    const attempts = Math.min(n, JOB_SEEKERS_PER_PERIOD);
-    for (let k = 0; k < attempts; k++) {
-      const id = this.seekers[(this.jobCursor + k) % n]!;
-      if (!seekJob(c, b, ctx.taz, jobIndex, rng, id)) continue;
-      c.scheduleId[id] = pickSchedule(
-        c.age[id]!,
-        true,
-        false,
-        rng.chance(NIGHT_SHIFT_SHARE),
-        rng.chance(SHIFT_WORK_SHARE),
-      );
-      // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
-      const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
-      c.set(id, CitizenFlag.TransitPass, homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15);
-      ctx.activity.initCitizen(ctx as never, id);
-    }
-    this.jobCursor = (this.jobCursor + attempts) % n;
+    return jobIndex;
   }
 
   daily(ctx: LifecycleContext): void {

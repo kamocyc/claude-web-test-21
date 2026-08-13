@@ -155,6 +155,15 @@ button:disabled {
   font-size: 11px;
   min-width: 26px;
 }
+#saveio {
+  display: flex;
+  gap: 3px;
+  margin-left: auto;
+}
+#saveio button {
+  padding: 3px 8px;
+  font-size: 11px;
+}
 
 /* ============ 右上: マイルストーン ============ */
 #milestone {

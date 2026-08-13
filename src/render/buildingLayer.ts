@@ -9,7 +9,7 @@ import {
   Quaternion,
   Vector3,
 } from 'three';
-import { TILE_M } from '@shared/constants';
+import { TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
 import { archetype } from '@sim/buildings/archetypes';
 import type { Simulation } from '@sim/simulation';
 import { tileX, tileY } from '@sim/world/tiles';
@@ -75,6 +75,14 @@ export class BuildingLayer {
     return { body, roof: this.roofs.get(key) ?? null };
   }
 
+  /**
+   * 次の update で必ず作り直させる。
+   * セーブデータを読み込んだときのように、エポックが「進まずに変わる」場合に使う。
+   */
+  invalidate(): void {
+    this.lastEpoch = -1;
+  }
+
   /** 建物の増減があったときだけインスタンスを作り直す。 */
   update(sim: Simulation): void {
     if (sim.world.epochs.buildings === this.lastEpoch) return;
@@ -111,7 +119,7 @@ export class BuildingLayer {
       const w = a.w * TILE_M * style.inset;
       const d = a.h * TILE_M * style.inset;
       const height = style.baseHeight + style.perLevel * (level - 1);
-      const groundY = sim.world.heightDm[origin]! * 0.02;
+      const groundY = sim.world.heightDm[origin]! * TERRAIN_HEIGHT_SCALE;
 
       const cxw = (ox + a.w / 2) * TILE_M;
       const czw = (oy + a.h / 2) * TILE_M;

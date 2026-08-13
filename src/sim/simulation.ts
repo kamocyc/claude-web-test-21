@@ -24,11 +24,19 @@ import {
   Zone,
 } from '@shared/enums';
 import { ActivitySystem, newActivityStats } from '@sim/agents/activity';
-import { CitizenFlag, CitizenStore } from '@sim/agents/citizens';
+import { arrayMap, type SimSnapshot } from '@sim/persistence';
+import { CITIZEN_FIELDS, CitizenFlag, CitizenStore } from '@sim/agents/citizens';
 import { Destinations } from '@sim/agents/destinations';
-import { LifecycleSystem, createCitizen, newHouseholdId, resetHouseholdIds } from '@sim/agents/lifecycle';
+import {
+  LifecycleSystem,
+  createCitizen,
+  householdIdCounter,
+  newHouseholdId,
+  resetHouseholdIds,
+  setHouseholdIdCounter,
+} from '@sim/agents/lifecycle';
 import { Arch, archetype, isShop } from '@sim/buildings/archetypes';
-import { BuildingStore, handleSlot } from '@sim/buildings/buildings';
+import { BUILDING_FIELDS, BuildingStore, handleSlot } from '@sim/buildings/buildings';
 import { computeDemand, taxPenalty, type DemandState } from '@sim/buildings/demand';
 import { GrowthSystem } from '@sim/buildings/growth';
 import { Clock } from '@sim/core/clock';
@@ -396,18 +404,7 @@ export class Simulation {
     const tick = this.clock.tick;
 
     // --- 市民の行動 ---
-    this.activity.tick({
-      world: this.world,
-      buildings: this.buildings,
-      citizens: this.citizens,
-      graph: this.graph,
-      router: this.router,
-      taz: this.taz,
-      wheel: this.wheel,
-      clock: this.clock,
-      rng: this.rng,
-      destinations: this.destinations,
-    });
+    this.activity.tick(this.activityContext());
 
     // --- 建物の成長 ---
     // 地元の木材に、資金で買える輸入分を上乗せしたものが建設可能量になる。
@@ -471,7 +468,26 @@ export class Simulation {
     this.lifecycle.updateLabourMarket(lctx);
     this.cachedPopulation = this.citizens.count();
     this.immigration(lctx, this.cachedPopulation);
+    // 転入した人を数に入れてから統計を確定させる。
+    // 先に数えて後から入れると、着いたばかりの失業者が 1 期ぶん表に出ず、
+    // 失業率が実際より低く見える（人口 1343 で失業 113 人を 4 人と表示していた）。
+    this.lifecycle.refreshCounts(lctx);
     this.finance = this.budget.accrue(this.world, this.buildings, this.citizens);
+  }
+
+  private activityContext(): Parameters<ActivitySystem['tick']>[0] {
+    return {
+      world: this.world,
+      buildings: this.buildings,
+      citizens: this.citizens,
+      graph: this.graph,
+      router: this.router,
+      taz: this.taz,
+      wheel: this.wheel,
+      clock: this.clock,
+      rng: this.rng,
+      destinations: this.destinations,
+    };
   }
 
   private lifecycleContext(): Parameters<LifecycleSystem['daily']>[0] {
@@ -684,19 +700,133 @@ export class Simulation {
     this.demand = { residential: 70, commercial: 25, industrial: 40, agriculture: 55 };
   }
 
-  /** テスト・ヘッドレス用: 指定した数の市民を空き住戸に流し込む。 */
-  seedPopulation(count: number): number {
-    const lctx = {
-      world: this.world,
-      buildings: this.buildings,
-      citizens: this.citizens,
-      taz: this.taz,
-      clock: this.clock,
-      rng: this.rng,
-      wheel: this.wheel,
-      activity: this.activity,
+  // ---------------- セーブ / ロード ----------------
+
+  /**
+   * 保存すべき状態を取り出す。バイト列への変換は `sim/persistence.ts` の仕事。
+   *
+   * 地形はシードから再生成するので保存しない。交通グラフ・TAZ 行列・経路キャッシュ・
+   * タイミングホイールも、ここにある状態から作り直せるので保存しない。
+   */
+  snapshot(): SimSnapshot {
+    const c = this.citizens;
+    const b = this.buildings;
+    return {
+      seed: this.seed,
+      head: {
+        tick: this.clock.tick,
+        startYear: this.clock.startYear,
+        citizenHigh: c.high,
+        buildingHigh: b.high,
+        householdIdCounter: householdIdCounter(),
+        rng: this.rng.getState(),
+        cash: this.budget.cash,
+        taxPct: { ...this.budget.taxPct },
+        capexMonth: this.budget.capexMonth,
+        deficitMonths: this.budget.deficitMonths,
+        budgetHistory: this.budget.history,
+        demand: this.demand,
+        lastReport: this.lastReport,
+        lumberPool: this.lumberPool,
+        importedLumber: this.importedLumber,
+        stockoutCount: this.stockoutCount,
+        foodShortfall: this.foodShortfall,
+        cachedPopulation: this.cachedPopulation,
+        totalDispatched: this.freight.totalDispatched,
+        totalDelivered: this.freight.totalDelivered,
+        dailyStats: { ...this.dailyStats, modeCounts: [...this.dailyStats.modeCounts] },
+      },
+      arrays: [
+        { name: 'world.zone', data: this.world.zone },
+        { name: 'world.road', data: this.world.road },
+        { name: 'world.rail', data: this.world.rail },
+        { name: 'world.buildingRef', data: this.world.buildingRef },
+        { name: 'world.landValue', data: this.world.landValue },
+        { name: 'world.pollution', data: this.world.pollution },
+        { name: 'world.noise', data: this.world.noise },
+        { name: 'world.svcMask', data: this.world.svcMask },
+        { name: 'world.transitAccess', data: this.world.transitAccess },
+        ...BUILDING_FIELDS.map((f) => ({ name: `b.${f}`, data: b[f].subarray(0, b.high) })),
+        ...CITIZEN_FIELDS.map((f) => ({ name: `c.${f}`, data: c[f].subarray(0, c.high) })),
+      ],
     };
-    return this.lifecycle.immigrate(lctx, count);
+  }
+
+  /**
+   * セーブデータを流し込む。**シードが同じシミュレーションに対してのみ**呼ぶこと
+   * （地形はシードから再生成されるので、違うシードだと海の上に街が乗る）。
+   */
+  restoreSnapshot(snap: SimSnapshot): void {
+    if (snap.seed !== this.seed) throw new Error('シードが違うシミュレーションには読み込めません');
+    const head = snap.head as Record<string, number & Record<string, number>>;
+    const src = arrayMap(snap.arrays);
+    const c = this.citizens;
+    const b = this.buildings;
+    const citizenHigh = Number(head.citizenHigh ?? 0);
+    const buildingHigh = Number(head.buildingHigh ?? 0);
+    c.ensureCapacity(citizenHigh);
+    b.ensureCapacity(buildingHigh);
+
+    const copy = (name: string, dst: { set(a: never, o: number): void }): void => {
+      const v = src.get(name);
+      if (v) dst.set(v as never, 0);
+    };
+    for (const name of ['zone', 'road', 'rail', 'buildingRef', 'landValue', 'pollution', 'noise', 'svcMask', 'transitAccess'] as const) {
+      copy(`world.${name}`, this.world[name]);
+    }
+    for (const f of BUILDING_FIELDS) copy(`b.${f}`, b[f]);
+    for (const f of CITIZEN_FIELDS) copy(`c.${f}`, c[f]);
+    b.rebuildFreeList(buildingHigh);
+    c.rebuildFreeList(citizenHigh);
+    for (let i = 0; i < c.capacity; i++) c.tripPath[i] = null;
+
+    this.clock.tick = Number(head.tick ?? 0);
+    setHouseholdIdCounter(Number(head.householdIdCounter ?? 1));
+    this.rng.setState((head.rng as unknown as number[]) ?? [1, 2, 3, 4]);
+    this.budget.cash = Number(head.cash ?? 0);
+    for (const [k, v] of Object.entries(head.taxPct ?? {})) this.budget.taxPct[Number(k)] = Number(v);
+    this.budget.capexMonth = Number(head.capexMonth ?? 0);
+    this.budget.deficitMonths = Number(head.deficitMonths ?? 0);
+    this.budget.history = (head.budgetHistory as unknown as MonthlyReport[]) ?? [];
+    this.demand = (head.demand as unknown as DemandState) ?? this.demand;
+    this.lastReport = (head.lastReport as unknown as MonthlyReport | null) ?? null;
+    this.lumberPool = Number(head.lumberPool ?? 0);
+    this.importedLumber = Number(head.importedLumber ?? 0);
+    this.stockoutCount = Number(head.stockoutCount ?? 0);
+    this.foodShortfall = Number(head.foodShortfall ?? 0);
+    this.cachedPopulation = Number(head.cachedPopulation ?? 0);
+    this.freight.totalDispatched = Number(head.totalDispatched ?? 0);
+    this.freight.totalDelivered = Number(head.totalDelivered ?? 0);
+    if (head.dailyStats) this.dailyStats = { ...(head.dailyStats as unknown as typeof this.dailyStats) };
+
+    // --- 保存していないものを作り直す ---
+    this.pendingCommands.length = 0;
+    this.freight.reset();
+    this.rebuildNetwork();
+    updateTransitAccess(this.world, this.stationTiles);
+    this.taz.computeAll(this.graph);
+    this.router.cache.clear();
+    this.growth.markDirty();
+    this.destinations.markDirty();
+    this.destinations.rebuild(this.buildings);
+    this.activity.rehydrate(this.activityContext());
+    this.lifecycle.refreshCounts(this.lifecycleContext());
+    this.finance = this.budget.accrue(this.world, this.buildings, this.citizens);
+  }
+
+  /**
+   * テスト・ヘッドレス用: 指定した数の市民を空き住戸に流し込む。
+   *
+   * 通常の転入と違って経済期の外から入れるので、最後に統計を数え直す。
+   * これをしないと、シナリオ生成の直後は「着いたばかりの失業者」が
+   * 次の経済期まで表に出ず、失業率が実際よりずっと低く表示される。
+   */
+  seedPopulation(count: number): number {
+    const lctx = this.lifecycleContext();
+    const placed = this.lifecycle.immigrate(lctx, count);
+    this.cachedPopulation = this.citizens.count();
+    this.lifecycle.refreshCounts(lctx);
+    return placed;
   }
 
   /** 世帯を 1 つ手動で作る（テスト用）。 */

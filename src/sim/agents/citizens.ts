@@ -23,6 +23,43 @@ export const CitizenFlag = {
  * ここをオブジェクト配列にすると 1 万人で数十 MB になり、
  * 日次のライフサイクル処理が GC ヒッチとして目に見えるようになる。
  */
+/**
+ * セーブ対象の SoA 配列名。フィールドを足したらここにも足すこと。
+ * `tripPath` は節点番号への参照なので保存できない（読み込み時に打ち切る）。
+ */
+export const CITIZEN_FIELDS = [
+  'flags',
+  'age',
+  'birthDay',
+  'education',
+  'skill',
+  'happiness',
+  'incomeYenMo',
+  'homeBuilding',
+  'workBuilding',
+  'householdId',
+  'prefWalk',
+  'prefBike',
+  'prefCar',
+  'prefRail',
+  'leisureTaste',
+  'state',
+  'scheduleId',
+  'scheduleStep',
+  'wakeTick',
+  'destBuilding',
+  'currentTile',
+  'purpose',
+  'mode',
+  'tripDepartTick',
+  'tripArriveTick',
+  'waitingSince',
+  'unhappyDays',
+  'lastCommuteMin',
+  'tripsCompleted',
+] as const;
+export type CitizenField = (typeof CITIZEN_FIELDS)[number];
+
 export class CitizenStore {
   capacity = 0;
   /** 使用中スロットの上限。 */
@@ -127,6 +164,26 @@ export class CitizenStore {
     this.tripsCompleted = g(this.tripsCompleted, (n) => new Uint32Array(n));
     while (this.tripPath.length < capacity) this.tripPath.push(null);
     this.capacity = capacity;
+  }
+
+  /** セーブデータを流し込む前に容量を確保する。 */
+  ensureCapacity(n: number): void {
+    if (n <= this.capacity) return;
+    let cap = Math.max(1, this.capacity);
+    while (cap < n) cap *= 2;
+    this.grow(cap);
+  }
+
+  /**
+   * 読み込み後に使用中スロットと空きスロットを作り直す。
+   * freeList を復元しないと、次に生成した市民が生きている市民を上書きする。
+   */
+  rebuildFreeList(high: number): void {
+    this.high = high;
+    this.freeList.length = 0;
+    for (let i = high - 1; i >= 0; i--) {
+      if ((this.flags[i]! & CitizenFlag.Alive) === 0) this.freeList.push(i);
+    }
   }
 
   /** 新しい市民スロットを確保する。 */
