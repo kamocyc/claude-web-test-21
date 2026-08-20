@@ -225,3 +225,24 @@ export function pathPosition(graph: Graph, path: Path, f: number, out: PathPose)
   }
   return false;
 }
+
+/**
+ * 経路を逆向きにする。トラックの帰路に使う。
+ *
+ * 道路エッジは必ず双方向に張られているので、逆向きのエッジを引き直すだけでよい。
+ * 経路探索をもう 1 回走らせるより桁で安く、往路と同じ道を戻るのも自然。
+ * 逆向きが見つからなければ null（歩道や乗降エッジを含む経路）。
+ */
+export function reversePath(graph: Graph, path: Path): Path | null {
+  const n = path.nodes.length;
+  const m = path.edges.length;
+  const nodes = new Int32Array(n);
+  const edges = new Int32Array(m);
+  for (let i = 0; i < n; i++) nodes[i] = path.nodes[n - 1 - i]!;
+  for (let i = 0; i < m; i++) {
+    const rev = graph.reverseEdge(path.edges[m - 1 - i]!);
+    if (rev < 0) return null;
+    edges[i] = rev;
+  }
+  return { nodes, edges, costSec: path.costSec, lengthM: path.lengthM, mode: path.mode, version: path.version };
+}

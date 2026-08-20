@@ -10,7 +10,9 @@ import {
   STOCKOUT_ABANDON_DAYS,
   TICKS_PER_DAY,
   TICKS_PER_HOUR,
-  VOLUME_DECAY,
+  CONGESTION_ALERT_COOLDOWN_TICKS,
+  CONGESTION_ALERT_SHARE,
+  LINK_TIME_RELAX_TICKS,
   MAP_H,
   MAP_W,
 } from '@shared/constants';
@@ -48,6 +50,21 @@ import { Budget, emptyAccrual, type Accrual, type MonthlyReport } from '@sim/eco
 import { FreightSystem } from '@sim/economy/freight';
 import { newProductionStats, runProduction, updateStockouts } from '@sim/economy/production';
 import { Graph } from '@sim/network/graph';
+import { TrafficSystem, VehicleKind } from '@sim/network/traffic';
+
+/** 交通流の集計値。 */
+export interface TrafficStats {
+  /** 走行中の車両数（自家用車＋トラック）。 */
+  running: number;
+  /** 信号待ち・渋滞で止まっている車両数。 */
+  waiting: number;
+  /** 収容いっぱいの道路リンク数と、その割合。 */
+  fullLinks: number;
+  congestedShare: number;
+  /** 自由流に対する所要時間の倍率（車両で重み付け）と、最悪値。 */
+  avgDelay: number;
+  worstDelay: number;
+}
 import { Router } from '@sim/network/router';
 import { TazMatrix } from '@sim/network/tazMatrix';
 import { updateLandValue, updatePollution, updateServiceCoverage, updateTransitAccess } from '@sim/world/fields';
@@ -82,6 +99,8 @@ export interface SimStats {
   routeQueueDepth: number;
   searchesThisTick: number;
   trucksActive: number;
+  /** 交通流の様子。渋滞はここに出る。 */
+  traffic: TrafficStats;
   stockouts: number;
   goodsStock: Float64Array;
   goodsProduced: Float64Array;
@@ -102,6 +121,7 @@ export class Simulation {
   readonly graph = new Graph();
   readonly router = new Router();
   readonly taz = new TazMatrix();
+  readonly traffic = new TrafficSystem();
   readonly wheel = new TimeWheel();
   readonly clock = new Clock();
   readonly budget = new Budget();
@@ -118,6 +138,8 @@ export class Simulation {
   private lastReport: MonthlyReport | null = null;
   /** 今の収支（月換算）。経済期ごとに取り直す。 */
   private finance: Accrual = emptyAccrual();
+  /** 次に渋滞を通知してよい tick。 */
+  private congestionAlertAt = 0;
   /**
    * 駅タイル。建物ストアから毎回導出する。
    * 並行配列として持つと「建物はあるのに交通ノードが無い駅」という
@@ -314,6 +336,24 @@ export class Simulation {
     updateLandValue(this.world, this.buildings);
   }
 
+  /**
+   * 渋滞をプレイヤに知らせる。
+   *
+   * 交通量オーバーレイを開いていないと渋滞に気づけないので、
+   * ひどくなったときだけ場所つきで通知する。何度も出すと邪魔なのでクールダウンを置く。
+   */
+  private checkCongestion(tick: number): void {
+    if (tick < this.congestionAlertAt) return;
+    const t = this.traffic;
+    if (t.roadLinks === 0) return;
+    if (t.stats.fullLinks / t.roadLinks < CONGESTION_ALERT_SHARE) return;
+    const link = t.stats.worstLink;
+    if (link < 0) return;
+    const tile = this.graph.nodeTile[this.graph.edgeTo[link]!]!;
+    this.congestionAlertAt = tick + CONGESTION_ALERT_COOLDOWN_TICKS;
+    this.notify('congestion', tile, `${tileX(tile)},${tileY(tile)} 付近が渋滞しています`);
+  }
+
   /** 操作が通らなかった理由をプレイヤに伝える。 */
   private notify(kind: AlertKind, tile: number, message: string): void {
     this.world.events.push({ t: 'alert', kind, tile, message });
@@ -390,6 +430,9 @@ export class Simulation {
     // が全部そのまま生き残り、駅の無い線路を電車が延々と往復していた。
     this.world.networkVersion++;
     this.graph.build(this.world, this.stationTiles);
+    // 走行中の車両は経路（節点 index の列）ごと無効になるので全部降ろす。
+    this.traffic.rebuild(this.graph);
+    this.drainTrafficEvents();
     this.taz.refreshRepresentatives(this.world, this.graph);
     // 建物の接道点を取り直す（ハンドルではなくスロットで保持しているので安全）
     for (const s of this.buildings.each()) this.buildings.refreshAccess(this.world, s);
@@ -425,12 +468,17 @@ export class Simulation {
     // --- 物流 ---
     this.freight.update(this.buildings, tick);
     if (tick % FREIGHT_DISPATCH_INTERVAL === 0) {
-      this.freight.dispatch(this.buildings, this.graph, this.router, this.taz, this.rng, tick);
+      this.freight.dispatch(this.buildings, this.graph, this.router, this.taz, this.traffic, this.rng, tick);
     }
 
-    // --- 渋滞（10 分ごと。EMA 平滑化が発振を抑える） ---
-    if (tick % 10 === 0) {
-      this.graph.updateCongestion(COST_SMOOTHING_LAMBDA * 10, VOLUME_DECAY * 10);
+    // --- 交通流（車両の追従・信号・spillback） ---
+    this.traffic.tick(this.graph, tick);
+    this.drainTrafficEvents();
+
+    // --- 実測のリンク所要時間を経路コストへ（EMA 平滑化が発振を抑える） ---
+    if (tick % LINK_TIME_RELAX_TICKS === 0) {
+      this.graph.relaxLinkTimes(tick, COST_SMOOTHING_LAMBDA * LINK_TIME_RELAX_TICKS);
+      this.checkCongestion(tick);
     }
 
     // --- TAZ コスト行列のローリング更新 ---
@@ -475,7 +523,25 @@ export class Simulation {
     this.finance = this.budget.accrue(this.world, this.buildings, this.citizens);
   }
 
-  private activityContext(): Parameters<ActivitySystem['tick']>[0] {
+  /**
+   * 交通流から上がってきた到着・打ち切りを、市民と物流に配る。
+   *
+   * 車の到着時刻は予測しない。着いたときが到着時刻になるので、
+   * 通知はここを通って初めて街に反映される。
+   */
+  private drainTrafficEvents(): void {
+    const ev = this.traffic.events;
+    if (ev.length === 0) return;
+    const actx = this.activityContext();
+    for (const e of ev) {
+      if (e.kind === VehicleKind.Car) this.activity.onCarEvent(actx, e.owner, e.aborted);
+      else this.freight.onTruckEvent(this.buildings, this.graph, this.traffic, e.owner, e.aborted, this.clock.tick);
+    }
+    ev.length = 0;
+  }
+
+  /** 市民システムに渡す文脈。テストからも使う。 */
+  activityContext(): Parameters<ActivitySystem['tick']>[0] {
     return {
       world: this.world,
       buildings: this.buildings,
@@ -487,6 +553,7 @@ export class Simulation {
       clock: this.clock,
       rng: this.rng,
       destinations: this.destinations,
+      traffic: this.traffic,
     };
   }
 
@@ -802,6 +869,7 @@ export class Simulation {
     // --- 保存していないものを作り直す ---
     this.pendingCommands.length = 0;
     this.freight.reset();
+    this.traffic.reset();
     this.rebuildNetwork();
     updateTransitAccess(this.world, this.stationTiles);
     this.taz.computeAll(this.graph);
@@ -842,21 +910,7 @@ export class Simulation {
       activity: this.activity,
     };
     const id = createCitizen(lctx, age, homeHandle, newHouseholdId());
-    this.activity.initCitizen(
-      {
-        world: this.world,
-        buildings: this.buildings,
-        citizens: this.citizens,
-        graph: this.graph,
-        router: this.router,
-        taz: this.taz,
-        wheel: this.wheel,
-        clock: this.clock,
-        rng: this.rng,
-        destinations: this.destinations,
-      },
-      id,
-    );
+    this.activity.initCitizen(this.activityContext(), id);
     return id;
   }
 
@@ -898,6 +952,14 @@ export class Simulation {
       routeQueueDepth: this.activity.waitingCount,
       searchesThisTick: this.router.searchesThisTick,
       trucksActive: this.freight.stats.active,
+      traffic: {
+        running: this.traffic.stats.running,
+        waiting: this.traffic.stats.waiting,
+        fullLinks: this.traffic.stats.fullLinks,
+        congestedShare: this.traffic.roadLinks > 0 ? this.traffic.stats.fullLinks / this.traffic.roadLinks : 0,
+        avgDelay: this.traffic.stats.avgDelay,
+        worstDelay: this.traffic.stats.worstDelay,
+      },
       stockouts: this.stockoutCount,
       goodsStock: this.production.stock,
       goodsProduced: this.production.produced,

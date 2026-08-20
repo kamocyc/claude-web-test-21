@@ -649,6 +649,21 @@ export class Ui {
     head('交通分担率');
     for (let m = 0; m < 4; m++) row(MODE_NAMES_JA[m]!, `${Math.round((s.modeShare[m] ?? 0) * 100)}%`);
 
+    head('道路の混雑');
+    const tf = s.traffic;
+    row('走行中の車両', tf.running.toLocaleString('ja-JP'));
+    row(
+      '信号待ち・渋滞',
+      `${tf.waiting.toLocaleString('ja-JP')} 台`,
+      tf.running > 0 && tf.waiting > tf.running * 0.5 ? 'bad' : tf.waiting > 0 ? 'warn' : undefined,
+    );
+    row(
+      '詰まっている道路',
+      `${(tf.congestedShare * 100).toFixed(1)}%`,
+      tf.congestedShare > 0.05 ? 'bad' : tf.congestedShare > 0.01 ? 'warn' : undefined,
+    );
+    row('所要時間の倍率', `×${tf.avgDelay.toFixed(2)}`, tf.avgDelay > 1.5 ? 'bad' : tf.avgDelay > 1.2 ? 'warn' : undefined);
+
     head('産業・物流');
     for (let g = 1; g < 7; g++) {
       row(GOOD_NAMES_JA[g]!, `${Math.round(s.goodsStock[g] ?? 0).toLocaleString('ja-JP')} (時 +${(s.goodsProduced[g] ?? 0).toFixed(0)})`);

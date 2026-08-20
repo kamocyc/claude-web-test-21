@@ -1,4 +1,12 @@
-import { MAP_H, MAP_W, MAX_TICKS_PER_FRAME, TICKS_PER_SECOND_AT_1X, TILE_M } from '@shared/constants';
+import {
+  MAP_H,
+  MAP_W,
+  MAX_TICKS_PER_FRAME,
+  OVERLAY_REFRESH_TICKS,
+  TICKS_PER_DAY,
+  TICKS_PER_SECOND_AT_1X,
+  TILE_M,
+} from '@shared/constants';
 import { Activity, Mode, Overlay, RoadClass, TERRAIN_NAMES_JA, ZONE_NAMES_JA, Zone } from '@shared/enums';
 import { Renderer } from '@render/renderer';
 import { citizenPosition } from '@sim/agents/activity';
@@ -491,7 +499,11 @@ export class App {
     for (const e of events) {
       if (e.t === 'alert') this.ui.pushAlert(e.message, e.kind);
     }
-    if (this.sim.clock.tick % 1440 === 0 && this.renderer.overlay !== Overlay.None) {
+    // オーバーレイの色の更新間隔。地価や公害は日次で十分だが、交通量は
+    // 分単位で動くので、1 日 1 回だと画面の色が実態から 30 分ずれる
+    // （×1 速度で 1 日 = 32 実分）。渋滞が育つ様子が見えないと意味がない。
+    const every = this.renderer.overlay === Overlay.Traffic ? OVERLAY_REFRESH_TICKS : TICKS_PER_DAY;
+    if (this.sim.clock.tick % every === 0 && this.renderer.overlay !== Overlay.None) {
       this.renderer.invalidateOverlay();
     }
   }

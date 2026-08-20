@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { COST_SMOOTHING_LAMBDA, VOLUME_DECAY } from '@shared/constants';
+import { COST_SMOOTHING_LAMBDA, MAX_CONGESTION_FACTOR } from '@shared/constants';
 import { Mode, ModeBit, RoadClass } from '@shared/enums';
 import { Pathfinder } from '@sim/network/pathfinder';
 import { PathCache } from '@sim/network/pathCache';
@@ -83,50 +83,59 @@ describe('マルチモーダルグラフ', () => {
 });
 
 describe('渋滞のフィードバック', () => {
-  it('BPR は交通量に対して単調非減少で、上限で頭打ちになる', () => {
+  it('実測したリンク所要時間が経路コストに反映され、平滑化で発振しない', () => {
     const world = makeTestWorld();
     layRoadLine(world, 20, 20, 40, 20);
     const graph = buildGraph(world);
     const edge = 0;
-    let prev = 0;
-    for (const volume of [0, 300, 600, 1200, 2400, 100000]) {
-      graph.edgeVolume[edge] = volume;
-      // 平滑化を無効にして目標値へ一気に寄せる
-      for (let k = 0; k < 400; k++) {
-        graph.edgeVolume[edge] = volume;
-        graph.updateCongestion(0.5, 0);
-      }
-      const t = graph.edgeCarSec[edge]!;
-      expect(t).toBeGreaterThanOrEqual(prev - 1e-9);
-      prev = t;
-    }
-    // 上限倍率で頭打ち（無限大コストで A* のヒープを壊さない）
-    expect(prev).toBeLessThanOrEqual(graph.edgeCarFreeSec[edge]! * 8 + 1e-6);
-    expect(Number.isFinite(prev)).toBe(true);
-  });
+    const free = graph.edgeCarFreeSec[edge]!;
 
-  it('平滑化により、交通量の急変でもコストが発振しない', () => {
-    const world = makeTestWorld();
-    layRoadLine(world, 20, 20, 40, 20);
-    const graph = buildGraph(world);
-    const edge = 0;
+    // 自由流の 5 倍で走っているリンクを観測し続ける
     const samples: number[] = [];
-    // 交通量を毎回激しく振らせても、読み出されるコストは滑らかに追従するはず
-    for (let step = 0; step < 200; step++) {
-      graph.edgeVolume[edge] = step % 2 === 0 ? 3000 : 0;
-      graph.updateCongestion(COST_SMOOTHING_LAMBDA, VOLUME_DECAY);
-      if (step > 100) samples.push(graph.edgeCarSec[edge]!);
+    for (let tick = 0; tick < 400; tick++) {
+      graph.observeTraversal(edge, free * 5, tick);
+      graph.relaxLinkTimes(tick, COST_SMOOTHING_LAMBDA * 10);
+      if (tick > 200) samples.push(graph.edgeCarSec[edge]!);
     }
-    // 後半 100 ステップでの隣接差分が、値そのものに比べて十分小さいこと
+    expect(graph.edgeCarSec[edge]!).toBeGreaterThan(free * 3);
+    // 平滑化されているので、隣り合うステップの差は値そのものに比べて十分小さい
     let maxJump = 0;
-    for (let i = 1; i < samples.length; i++) {
-      maxJump = Math.max(maxJump, Math.abs(samples[i]! - samples[i - 1]!));
-    }
+    for (let i = 1; i < samples.length; i++) maxJump = Math.max(maxJump, Math.abs(samples[i]! - samples[i - 1]!));
     const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
-    expect(maxJump).toBeLessThan(mean * 0.25);
+    expect(maxJump).toBeLessThan(mean * 0.1);
   });
 
-  it('混雑したエッジは自動車の経路コストを実際に押し上げる', () => {
+  it('上限倍率で頭打ちになる（無限大コストで A* のヒープを壊さない）', () => {
+    const world = makeTestWorld();
+    layRoadLine(world, 20, 20, 40, 20);
+    const graph = buildGraph(world);
+    const edge = 0;
+    const free = graph.edgeCarFreeSec[edge]!;
+    for (let tick = 0; tick < 2000; tick++) {
+      graph.observeTraversal(edge, free * 1e6, tick);
+      graph.relaxLinkTimes(tick, 0.5);
+    }
+    expect(graph.edgeCarSec[edge]!).toBeLessThanOrEqual(free * MAX_CONGESTION_FACTOR + 1e-6);
+    expect(Number.isFinite(graph.edgeCarSec[edge]!)).toBe(true);
+  });
+
+  it('車が通らなくなったリンクは自由流に戻る', () => {
+    const world = makeTestWorld();
+    layRoadLine(world, 20, 20, 40, 20);
+    const graph = buildGraph(world);
+    const edge = 0;
+    const free = graph.edgeCarFreeSec[edge]!;
+    for (let tick = 0; tick < 300; tick++) {
+      graph.observeTraversal(edge, free * 5, tick);
+      graph.relaxLinkTimes(tick, 0.3);
+    }
+    expect(graph.edgeCarSec[edge]!).toBeGreaterThan(free * 2);
+    // 観測が途絶えたら、混んでいた記録が残り続けてはいけない
+    for (let tick = 300; tick < 1200; tick++) graph.relaxLinkTimes(tick, 0.3);
+    expect(graph.edgeCarSec[edge]!).toBeCloseTo(free, 3);
+  });
+
+  it('混雑したリンクは自動車の経路コストを実際に押し上げる', () => {
     const world = makeTestWorld();
     layRoadGrid(world, 20, 20, 24, 24, 4);
     const graph = buildGraph(world);
@@ -136,10 +145,9 @@ describe('渋滞のフィードバック', () => {
     const before = finder.search(graph, a, b, Mode.Car)!;
     expect(before).not.toBeNull();
 
-    // 経路上の全エッジを詰まらせる
-    for (let k = 0; k < 300; k++) {
-      for (const e of before.edges) graph.edgeVolume[e] = 5000;
-      graph.updateCongestion(0.3, 0);
+    for (let tick = 0; tick < 300; tick++) {
+      for (const e of before.edges) graph.observeTraversal(e, graph.edgeCarFreeSec[e]! * 6, tick);
+      graph.relaxLinkTimes(tick, 0.3);
     }
     const after = finder.search(graph, a, b, Mode.Car)!;
     expect(after.costSec).toBeGreaterThan(before.costSec);

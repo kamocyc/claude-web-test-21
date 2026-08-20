@@ -13,6 +13,7 @@ export type AlertKind =
   | 'abandoned' // 廃墟化
   | 'budgetDeficit' // 赤字
   | 'noPath' // 経路なし
+  | 'congestion' // 渋滞
   | 'info'; // 操作の結果の通知（保存・読み込みなど）
 
 export type SimEvent =

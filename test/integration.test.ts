@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TICKS_PER_DAY, TICKS_PER_SECOND_AT_1X } from '@shared/constants';
+import { TICKS_PER_DAY, TICKS_PER_SECOND_AT_1X, TILE_COUNT } from '@shared/constants';
 import { Activity, Good, Mode, RoadClass, Zone } from '@shared/enums';
 import { runHeadless } from '@sim/harness';
 import { decodeSave, encodeSave } from '@sim/persistence';
@@ -407,5 +407,129 @@ describe('プレイヤ操作への応答', () => {
     // 需要は日次で再計算されるので 1 日回す
     for (let k = 0; k < 1441; k++) sim.tick();
     expect(sim.stats().demand.residential).toBeLessThanOrEqual(before);
+  });
+});
+
+/**
+ * 生活のリズム。
+ *
+ * 就職・転居のたびに予約を取り直していたため、市民がタイミングホイールに
+ * 予約を二重に持ち、1 日のステップを 2 倍速で消化して時計と位相がずれていた。
+ * 一度ずれると戻らないので、会社員の 9 割が深夜に出勤する街になっていた。
+ * 朝夕ラッシュはこの上に成り立つので、ここが崩れると渋滞の話が全部無意味になる。
+ */
+describe('生活のリズム', () => {
+  const { sim } = runHeadless({ seed: 5, days: 20, size: 48, population: 400 });
+
+  it('市民がタイミングホイールに予約を二重に持たない', () => {
+    // 1 人 1 件が上限。移動中の車はホイールに載らないので下回ることはある。
+    expect(sim.wheel.pending()).toBeLessThanOrEqual(sim.citizens.count());
+    expect(sim.wheel.pending()).toBeGreaterThan(sim.citizens.count() * 0.8);
+  });
+
+  it('移動が朝夕に山を作り、深夜はほとんど動かない', () => {
+    while (sim.clock.tick % TICKS_PER_DAY !== 0) sim.tick();
+    const travelingAt = (hour: number): number => {
+      while (sim.clock.tick % TICKS_PER_DAY !== hour * 60) sim.tick();
+      const c = sim.citizens;
+      let n = 0;
+      for (let i = 0; i < c.high; i++) {
+        if (!c.isAlive(i)) continue;
+        if (c.state[i] === Activity.Traveling || c.state[i] === Activity.WaitingForRoute) n++;
+      }
+      return n;
+    };
+    const night = travelingAt(3);
+    const morning = travelingAt(8);
+    const evening = travelingAt(20);
+    expect(morning).toBeGreaterThan(0);
+    expect(evening).toBeGreaterThan(0);
+    expect(night).toBeLessThan(morning * 0.2);
+    expect(night).toBeLessThan(evening * 0.2);
+  });
+
+  it('就職しても市民が自宅にワープしない', () => {
+    const s = new Simulation(11);
+    const w = s.world;
+    const roads: number[] = [];
+    for (let x = 58; x <= 68; x++) roads.push(idx(x, 60));
+    for (const t of roads) {
+      w.terrain[t] = 0;
+      w.slope[t] = 0;
+    }
+    s.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles: roads });
+    s.tick();
+
+    const home = s.buildings.create(w, Arch.House, idx(59, 61), 1);
+    const id = s.addCitizen(35, home);
+    const c = s.citizens;
+    const elsewhere = idx(66, 61);
+    c.currentTile[id] = elsewhere;
+    c.state[id] = Activity.AtWork;
+
+    s.activity.rescheduleCitizen(s.activityContext(), id);
+
+    expect(c.currentTile[id]).toBe(elsewhere);
+    expect(c.state[id]).toBe(Activity.AtWork);
+  });
+});
+
+/**
+ * 「中密度を適当に密集させるとラッシュ時に渋滞する」という要求そのものを検査する。
+ *
+ * 同じ街を 2 通り作る。片方は 4 街区おきに大通りを通した街、
+ * もう片方はその大通りを全部 生活道路に落とした街。
+ * 人口も建物も交通需要も同じなので、差は道路の階層があるかどうかだけになる。
+ */
+describe('道路の設計が渋滞を決める', () => {
+  const measure = (downgrade: boolean) => {
+    const sim = new Simulation(9);
+    buildScenario(sim, { size: 40, seedPopulation: 600, withRail: false });
+    if (downgrade) {
+      const tiles: number[] = [];
+      for (let t = 0; t < TILE_COUNT; t++) if (sim.world.road[t] === RoadClass.Boulevard) tiles.push(t);
+      expect(tiles.length).toBeGreaterThan(100);
+      sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles });
+      sim.tick();
+    }
+    const days = 16;
+    let worstShare = 0;
+    let peakWaiting = 0;
+    for (let day = 0; day < days; day++) {
+      for (let k = 0; k < TICKS_PER_DAY; k++) {
+        sim.tick();
+        const min = sim.clock.tick % TICKS_PER_DAY;
+        // 最後の 3 日の朝ラッシュ（7〜9 時）だけ見る
+        if (day < days - 3 || min < 7 * 60 || min > 9 * 60) continue;
+        const t = sim.traffic;
+        const share = t.roadLinks > 0 ? t.stats.fullLinks / t.roadLinks : 0;
+        if (share > worstShare) worstShare = share;
+        if (t.stats.waiting > peakWaiting) peakWaiting = t.stats.waiting;
+      }
+    }
+    const s = sim.stats();
+    return { population: s.population, commute: s.avgCommuteMin, worstShare, peakWaiting };
+  };
+
+  const planned = measure(false);
+  const packed = measure(true);
+
+  it('同じ人口・同じ需要で比べている（差が出るのは道路だけ）', () => {
+    expect(planned.population).toBe(packed.population);
+    expect(planned.population).toBeGreaterThan(1000);
+  });
+
+  it('生活道路だけで固めるとラッシュ時に道が詰まる', () => {
+    // 大通りを通した街では、収容いっぱいになる道路はごく一部で収まる
+    expect(planned.worstShare).toBeLessThan(0.02);
+    // 生活道路だけの街では桁違いに詰まる
+    expect(packed.worstShare).toBeGreaterThan(planned.worstShare * 3);
+    expect(packed.peakWaiting).toBeGreaterThan(planned.peakWaiting);
+  });
+
+  it('渋滞が通勤時間に返ってくる', () => {
+    // 瞬間値の遅延倍率は「たまたま数台が信号待ちしている」だけで跳ねるので、
+    // 1 日を通した平均通勤時間で見る。
+    expect(packed.commute).toBeGreaterThan(planned.commute * 1.2);
   });
 });

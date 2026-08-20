@@ -2,8 +2,9 @@ import { RAIL_SPEED_KMH, SIM_PER_RENDER, TILE_COUNT, TILE_SPAN_M } from '@shared
 import {
   BOARD_PENALTY_MIN,
   DEFAULT_HEADWAY_MIN,
+  LINK_TIME_FORGET_TICKS,
+  LINK_TIME_LAMBDA,
   MAX_CONGESTION_FACTOR,
-  BPR_BETA,
   WAIT_WEIGHT,
   WALK_WEIGHT,
 } from '@shared/constants';
@@ -11,8 +12,6 @@ import {
   Mode,
   ModeBit,
   MODE_MAX_SPEED_KMH,
-  ROAD_BPR_ALPHA,
-  ROAD_CAPACITY_VPH,
   ROAD_SPEED_KMH,
   RoadClass,
 } from '@shared/enums';
@@ -51,6 +50,8 @@ export class Graph {
   /** CSR: node i の出辺は [edgeStart[i], edgeStart[i+1]) */
   edgeStart = new Uint32Array(1);
   edgeTo = new Uint32Array(0);
+  /** エッジの始点ノード。交通流が交差点を引くのに使う。 */
+  edgeFrom = new Uint32Array(0);
   edgeLenM = new Float32Array(0);
   edgeMask = new Uint8Array(0);
   edgeRoadClass = new Uint8Array(0);
@@ -60,10 +61,10 @@ export class Graph {
   edgeCarFreeSec = new Float32Array(0);
   /** 混雑を反映し EMA 平滑化した自動車所要時間（秒）。経路探索が読むのはこれだけ。 */
   edgeCarSec = new Float32Array(0);
-  /** 直近の交通量（台/時 相当、指数減衰）。 */
-  edgeVolume = new Float32Array(0);
-  /** 逆向きエッジの index。交通量を双方向で見るために使う。-1 = なし。 */
-  edgeReverse = new Int32Array(0);
+  /** 交通流シミュレーションが実測したリンク通過時間の EMA（秒）。 */
+  edgeObsSec = new Float32Array(0);
+  /** 最後に観測した tick。古くなったリンクは自由流へ戻していく。 */
+  edgeObsTick = new Int32Array(0);
 
   /** タイル → 道路ノード。-1 = なし。 */
   roadNodeAt = new Int32Array(TILE_COUNT).fill(-1);
@@ -234,11 +235,9 @@ export class Graph {
     this.edgeFixedSec = new Float32Array(m);
     this.edgeCarFreeSec = new Float32Array(m);
     this.edgeCarSec = new Float32Array(m);
-    this.edgeVolume = new Float32Array(m);
-    this.edgeReverse = new Int32Array(m).fill(-1);
-
-    /** CSR 上のエッジ index を (from,to) から引くための一時マップ。 */
-    const edgeLookup = new Map<number, number>();
+    this.edgeObsSec = new Float32Array(m);
+    this.edgeObsTick = new Int32Array(m).fill(-1 << 20);
+    this.edgeFrom = new Uint32Array(m);
 
     for (let e = 0; e < m; e++) {
       const a = from[e]!;
@@ -255,15 +254,8 @@ export class Graph {
       const carSec = speed > 0 ? lenM[e]! / speed : 0;
       this.edgeCarFreeSec[slot] = carSec;
       this.edgeCarSec[slot] = carSec;
-      edgeLookup.set(a * n + b, slot);
-    }
-
-    for (let e = 0; e < m; e++) {
-      const a = from[e]!;
-      const b = to[e]!;
-      const slot = edgeLookup.get(a * n + b);
-      const rev = edgeLookup.get(b * n + a);
-      if (slot !== undefined && rev !== undefined) this.edgeReverse[slot] = rev;
+      this.edgeObsSec[slot] = carSec;
+      this.edgeFrom[slot] = a;
     }
 
     this.version = world.networkVersion;
@@ -315,43 +307,55 @@ export class Graph {
   }
 
   /**
-   * BPR による混雑コストの更新（EMA 平滑化つき）。
+   * 交通流シミュレーションが観測したリンク通過時間を取り込む。
    *
-   *   t = t0 * (1 + α (V/C)^β)          … 標準的な道路交通の遅延関数
-   *   cost ← cost + λ (t - cost)        … MSA/day-to-day 配分に相当する平滑化
-   *
-   * 平滑化なしだと「混む→全員迂回→迂回路が混む」の発振が確実に起きる。
+   * 混雑を「交通量 → BPR の式」で推定するのをやめ、実際に走った車の
+   * 所要時間そのものを使う。信号待ちも spillback も、この 1 つの数字に入る。
    */
-  updateCongestion(lambda: number, volumeDecay: number): void {
+  observeTraversal(edge: number, sec: number, tick: number): void {
+    const t0 = this.edgeCarFreeSec[edge]!;
+    if (t0 <= 0) return;
+    const capped = Math.min(sec, t0 * MAX_CONGESTION_FACTOR);
+    const prev = this.edgeObsSec[edge]!;
+    this.edgeObsSec[edge] = prev + LINK_TIME_LAMBDA * (capped - prev);
+    this.edgeObsTick[edge] = tick;
+  }
+
+  /**
+   * 実測を経路探索用のコストへ流し込む（EMA 平滑化つき）。
+   *
+   * 平滑化なしだと「混む → 全員迂回 → 迂回路が混む」の発振が確実に起きる。
+   * しばらく車が通っていないリンクは自由流へ戻す。そうしないと、
+   * 一度混んだ道が誰も通らなくなったまま「混んでいる」と記録され続ける。
+   */
+  relaxLinkTimes(tick: number, lambda: number): void {
     const m = this.edgeCount;
     for (let e = 0; e < m; e++) {
       const rc = this.edgeRoadClass[e]!;
       if (rc === RoadClass.None) continue;
-      // 交通量の指数減衰（直近 1 時間の移動平均に相当）
-      const v = this.edgeVolume[e]! * (1 - volumeDecay);
-      this.edgeVolume[e] = v;
-      const cap = ROAD_CAPACITY_VPH[rc]!;
-      const alpha = ROAD_BPR_ALPHA[rc]!;
       const t0 = this.edgeCarFreeSec[e]!;
-      const ratio = cap > 0 ? v / cap : 0;
-      let factor = 1 + alpha * Math.pow(ratio, BPR_BETA);
-      if (factor > MAX_CONGESTION_FACTOR) factor = MAX_CONGESTION_FACTOR; // 無限大コストで A* のヒープを壊さない
-      const target = t0 * factor;
-      this.edgeCarSec[e] = this.edgeCarSec[e]! + lambda * (target - this.edgeCarSec[e]!);
+      const stale = tick - this.edgeObsTick[e]! > LINK_TIME_FORGET_TICKS;
+      const target = stale ? t0 : this.edgeObsSec[e]!;
+      const cur = this.edgeCarSec[e]!;
+      this.edgeCarSec[e] = cur + lambda * (target - cur);
     }
   }
 
-  /** 車両 1 台がエッジを通過したことを記録する。 */
-  recordTraversal(edge: number, weight = 1): void {
-    // volumeDecay = 1/60 で減衰させているので、1 台 = 60 台/時 相当の寄与になる。
-    this.edgeVolume[edge] = this.edgeVolume[edge]! + weight * 60;
+  /** 逆向きのエッジ。道路は必ず双方向なので、往路から復路を作るのに使える。-1 = なし。 */
+  reverseEdge(edge: number): number {
+    const a = this.edgeFrom[edge]!;
+    const b = this.edgeTo[edge]!;
+    const s0 = this.edgeStart[b]!;
+    const s1 = this.edgeStart[b + 1]!;
+    for (let k = s0; k < s1; k++) {
+      if (this.edgeTo[k] === a) return k;
+    }
+    return -1;
   }
 
-  /** 混雑度 0..1（描画オーバーレイ用）。 */
-  congestionRatio(edge: number): number {
-    const rc = this.edgeRoadClass[edge]!;
-    if (rc === RoadClass.None) return 0;
-    const cap = ROAD_CAPACITY_VPH[rc]!;
-    return cap > 0 ? Math.min(1, this.edgeVolume[edge]! / cap) : 0;
+  /** 自由流に対する遅延倍率。1 = 空いている。 */
+  delayFactor(edge: number): number {
+    const t0 = this.edgeCarFreeSec[edge]!;
+    return t0 > 0 ? this.edgeCarSec[edge]! / t0 : 1;
   }
 }

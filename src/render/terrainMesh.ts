@@ -170,14 +170,20 @@ export class TerrainMesh {
         if (world.zone[t] !== Zone.None) return zoneColor(world.zone[t]!);
         break;
       case Overlay.Traffic: {
-        // 道路タイルの混雑度。道路以外は暗く落とす。
-        if (world.road[t] === RoadClass.None) return heatColor(0);
+        // 道路タイルの混雑度。車がどれだけリンクを埋めているかをそのまま出す。
+        // 道路以外は暗く落とす（heatColor(0) は青なので、そのまま使うと
+        // 街じゅうが水色に染まって道路の色が読めない）。
+        if (world.road[t] === RoadClass.None) return zoneColor(-1).setHex(0x1b2026);
         const node = sim.graph.roadNodeAt[t]!;
         if (node < 0) return heatColor(0);
         let worst = 0;
         const e1 = sim.graph.edgeStart[node + 1] ?? 0;
         for (let e = sim.graph.edgeStart[node] ?? 0; e < e1; e++) {
-          worst = Math.max(worst, sim.graph.congestionRatio(e));
+          // 流出リンクの占有率と、そこへ入ってくるリンクの占有率の両方を見る。
+          // 交差点で止まっている車列は流入側に溜まるので、片方だけでは赤くならない。
+          worst = Math.max(worst, sim.traffic.occupancy(e));
+          const rev = sim.graph.reverseEdge(e);
+          if (rev >= 0) worst = Math.max(worst, sim.traffic.occupancy(rev));
         }
         return heatColor(worst);
       }

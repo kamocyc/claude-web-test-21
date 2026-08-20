@@ -58,6 +58,11 @@ export interface DayRecord {
   demandC: number;
   demandI: number;
   demandA: number;
+  /** 朝ラッシュ（8 時ちょうど）の交通の様子。渋滞はここに出る。 */
+  rushRunning: number;
+  rushWaiting: number;
+  rushCongestedShare: number;
+  rushAvgDelay: number;
 }
 
 /** シナリオを組んで N 日回し、日次記録を返す。 */
@@ -76,9 +81,20 @@ export function runHeadless(opts: {
   let ticks = 0;
 
   for (let day = 0; day < opts.days; day++) {
+    // 朝ラッシュの様子は 8 時ちょうどに拾う。日の終わり（深夜）に見ても道は空っぽ。
+    let rush = { running: 0, waiting: 0, congested: 0, delay: 1 };
     for (let k = 0; k < TICKS_PER_DAY; k++) {
       sim.tick();
       ticks++;
+      if (sim.clock.tick % TICKS_PER_DAY === 8 * 60) {
+        const t = sim.traffic;
+        rush = {
+          running: t.stats.running,
+          waiting: t.stats.waiting,
+          congested: t.roadLinks > 0 ? t.stats.fullLinks / t.roadLinks : 0,
+          delay: t.stats.avgDelay,
+        };
+      }
     }
     const s = sim.stats();
     const rec: DayRecord = {
@@ -101,6 +117,10 @@ export function runHeadless(opts: {
       demandC: s.demand.commercial,
       demandI: s.demand.industrial,
       demandA: s.demand.agriculture,
+      rushRunning: rush.running,
+      rushWaiting: rush.waiting,
+      rushCongestedShare: rush.congested,
+      rushAvgDelay: rush.delay,
     };
     records.push(rec);
     opts.onDay?.(rec, sim);
@@ -128,7 +148,7 @@ function main(): void {
       if (o.quiet || rec.day % o.every !== 0) return;
       if (rec.day === 0) {
         console.log(
-          '\n  日  人口  建物  就業  失業  幸福  完了移動 失敗 通勤分  徒歩 自転 自動 鉄道  ｷｬｯｼｭ  欠品 ﾄﾗｯｸ    資金(万円)',
+          '\n  日  人口  建物  就業  失業  幸福  完了移動 失敗 通勤分  徒歩 自転 自動 鉄道  ｷｬｯｼｭ  欠品 ﾄﾗｯｸ  朝8時:走行 待ち 渋滞% 遅延    資金(万円)',
         );
       }
       const ms = rec.modeShare;
@@ -145,7 +165,10 @@ function main(): void {
         )}${pad((ms[3]! * 100).toFixed(0) + '%', 5)}${pad((rec.cacheHitRate * 100).toFixed(0) + '%', 8)}${pad(
           rec.stockouts,
           6,
-        )}${pad(rec.trucks, 6)}${pad(Math.round(rec.cash / 10000).toLocaleString('ja-JP'), 14)}`,
+        )}${pad(rec.trucks, 6)}${pad(rec.rushRunning, 11)}${pad(rec.rushWaiting, 5)}${pad(
+          (rec.rushCongestedShare * 100).toFixed(1),
+          6,
+        )}${pad('x' + rec.rushAvgDelay.toFixed(2), 6)}${pad(Math.round(rec.cash / 10000).toLocaleString('ja-JP'), 14)}`,
       );
     },
   });
@@ -170,6 +193,16 @@ function main(): void {
   console.log(`経路探索の総数    : ${sim.router.totalSearches}（失敗 ${sim.router.totalFailures}）`);
   console.log(`稼働トラック      : ${last.trucks}`);
   console.log(`欠品中の商店      : ${last.stockouts}`);
+  const peak = records.reduce((a, b) => (b.rushCongestedShare > a.rushCongestedShare ? b : a), last);
+  console.log(
+    `朝 8 時の交通     : 走行 ${last.rushRunning} 台 / 信号待ち ${last.rushWaiting} 台 / 詰まった道路 ${(
+      last.rushCongestedShare * 100
+    ).toFixed(1)}% / 所要時間 ×${last.rushAvgDelay.toFixed(2)}`,
+  );
+  console.log(
+    `  最も混んだ日    : ${peak.day} 日目 詰まった道路 ${(peak.rushCongestedShare * 100).toFixed(1)}% / ×${peak.rushAvgDelay.toFixed(2)}`,
+  );
+  console.log(`交通流の打ち切り  : ${sim.traffic.stats.aborted}`);
   console.log(`資金              : ${Math.round(s.cash).toLocaleString('ja-JP')} 円`);
   console.log(
     `需要 R/C/I/A      : ${last.demandR.toFixed(0)} / ${last.demandC.toFixed(0)} / ${last.demandI.toFixed(0)} / ${last.demandA.toFixed(0)}`,

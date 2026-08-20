@@ -80,25 +80,23 @@ export const ROAD_NAMES_JA: Record<number, string> = {
   [RoadClass.Boulevard]: '大通り',
 };
 
-/** 自由流速度 (km/h) と容量 (台/時)。BPR 関数の t0 と C。 */
+/** 自由流速度 (km/h)。混雑していないリンクの通過時間はこれで決まる。 */
 export const ROAD_SPEED_KMH: Record<number, number> = {
   [RoadClass.None]: 0,
   [RoadClass.Street]: 30,
   [RoadClass.Avenue]: 45,
   [RoadClass.Boulevard]: 60,
 };
-export const ROAD_CAPACITY_VPH: Record<number, number> = {
+/**
+ * 片方向の車線数。交差点で捌ける台数（飽和交通流率 × 車線数）と、
+ * リンクに溜められる台数（長さ × 車線数）の両方を決める。
+ * 生活道路を大通りに広げると行列が捌けるのは、この 2 つが同時に増えるため。
+ */
+export const ROAD_LANES: Record<number, number> = {
   [RoadClass.None]: 0,
-  [RoadClass.Street]: 600,
-  [RoadClass.Avenue]: 1400,
-  [RoadClass.Boulevard]: 2600,
-};
-/** BPR の α。生活道路ほど混雑で急激に遅くなる。 */
-export const ROAD_BPR_ALPHA: Record<number, number> = {
-  [RoadClass.None]: 0,
-  [RoadClass.Street]: 0.9,
-  [RoadClass.Avenue]: 0.6,
-  [RoadClass.Boulevard]: 0.35,
+  [RoadClass.Street]: 1,
+  [RoadClass.Avenue]: 2,
+  [RoadClass.Boulevard]: 3,
 };
 /** 建設費 (円/タイル) と月次維持費 (円/タイル)。 */
 export const ROAD_BUILD_COST: Record<number, number> = {

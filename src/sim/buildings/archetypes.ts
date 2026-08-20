@@ -114,6 +114,10 @@ export const Arch = {
   Park: 22,
   Shrine: 23,
   CityHall: 24,
+  // --- 住宅（追加分）---
+  // Arch の値はセーブデータに入るので、途中に挿入せず末尾に足す。
+  MidRiseApartment: 25,
+  SmallMansion: 26,
 } as const;
 
 export const ARCHETYPES: Archetype[] = [
@@ -485,6 +489,37 @@ export const ARCHETYPES: Archetype[] = [
     buildCost: 20_000_000,
     landValueEffect: 10,
     playerPlaced: true,
+  }),
+
+  // ---------------- 住宅（中密度の隙間を埋める） ----------------
+  // 中高層住居ゾーンには 2×2 の建物しか無かったので、6×6 の街区の内側 5×5 に
+  // マンションが 4 棟しか入らず、L 字の 9 タイルが永久に空いていた。
+  // 「中密度を密集させた」のに実際には密にならない、という食い違いを直す。
+  def({
+    id: Arch.MidRiseApartment,
+    nameJa: '中層アパート',
+    zone: Zone.ResidentialMid,
+    mesh: 'apartment',
+    w: 1,
+    h: 2,
+    minLevel: 2,
+    maxLevel: 4,
+    households: 14,
+    noise: 10,
+    landValueEffect: 2,
+    minCityPopulation: 400,
+  }),
+  def({
+    id: Arch.SmallMansion,
+    nameJa: '小規模マンション',
+    zone: Zone.ResidentialMid,
+    mesh: 'mansion',
+    minLevel: 2,
+    maxLevel: 4,
+    households: 8,
+    noise: 9,
+    landValueEffect: 2,
+    minCityPopulation: 600,
   }),
 ];
 

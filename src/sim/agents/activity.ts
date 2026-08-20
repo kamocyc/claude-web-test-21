@@ -1,6 +1,4 @@
 import {
-  REROUTE_ETA_RATIO,
-  REROUTE_PROBABILITY,
   TICKS_PER_DAY,
 } from '@shared/constants';
 import { Activity, Good, Mode, Purpose, Zone } from '@shared/enums';
@@ -22,6 +20,7 @@ import {
 import { pathPosition, type PathPose } from '@sim/network/pathfinder';
 import type { Router } from '@sim/network/router';
 import type { TazMatrix } from '@sim/network/tazMatrix';
+import { VehicleKind, type TrafficSystem } from '@sim/network/traffic';
 import { MODE_NAMES_JA } from '@shared/enums';
 import { tileDistanceM } from '@sim/world/tiles';
 import type { World } from '@sim/world/world';
@@ -40,7 +39,14 @@ export interface ActivityContext {
   clock: Clock;
   rng: Rng;
   destinations: Destinations;
+  traffic: TrafficSystem;
 }
+
+/**
+ * 「ホイールから起こされる予定は無い」を表す wakeTick。
+ * 自動車で移動中の市民は、到着時刻が交通流の結果として決まるのでホイールに載らない。
+ */
+export const NEVER_WAKE = 0xffffffff;
 
 export interface ActivityStats {
   tripsStarted: number;
@@ -112,7 +118,7 @@ export class ActivitySystem {
     return this.waiting.length;
   }
 
-  /** 市民を明日の最初のステップに乗せる（生成時・転入時に呼ぶ）。 */
+  /** 市民を生活パターンの先頭に乗せる（新規生成・転入で呼ぶ）。 */
   initCitizen(ctx: ActivityContext, id: number): void {
     const c = ctx.citizens;
     c.state[id] = Activity.AtHome;
@@ -121,6 +127,17 @@ export class ActivitySystem {
     if (ctx.buildings.valid(home)) {
       c.currentTile[id] = ctx.buildings.originTile[handleSlot(home)]!;
     }
+    this.scheduleNextStep(ctx, id);
+  }
+
+  /**
+   * 既に街にいる市民の予約を取り直す（就職・転居で呼ぶ）。
+   *
+   * initCitizen と違って現在地と状態には触らない。就職や転居は日中に起きるので、
+   * 勤務中・買い物中の市民を自宅に引き戻すと瞬間移動して見える。
+   * スケジュールの進行位置もそのままにして、生活のリズムを崩さない。
+   */
+  rescheduleCitizen(ctx: ActivityContext, id: number): void {
     this.scheduleNextStep(ctx, id);
   }
 
@@ -153,6 +170,12 @@ export class ActivitySystem {
     for (let k = 0; k < n; k++) {
       const id = due[k]!;
       if (!ctx.citizens.isAlive(id)) continue;
+      // 遅延削除。ホイールから個別に消す仕組みは持たず、予約が古ければここで捨てる。
+      //
+      // 就職や転居で予約を取り直すと、市民はホイールに 2 つ以上の予約を持つ。
+      // 放っておくと 1 日のステップを 2 倍速で消化して時計と位相がずれ、
+      // 一度ずれると戻らない（実測で 2030 人中 1466 人がずれ、会社員の 9 割が深夜に出勤していた）。
+      if (ctx.citizens.wakeTick[id] !== ctx.clock.tick) continue;
       this.onWake(ctx, id);
     }
     this.processWaiting(ctx);
@@ -271,18 +294,27 @@ export class ActivitySystem {
 
     // --- 出発 ---
     const travelMin = Math.max(1, Math.round(path.costSec / 60));
-    c.state[id] = Activity.Traveling;
     c.mode[id] = mode;
     c.tripPath[id] = path;
     c.tripDepartTick[id] = ctx.clock.tick;
-    c.tripArriveTick[id] = ctx.clock.tick + travelMin;
-    ctx.wheel.schedule(id, ctx.clock.tick + travelMin, ctx.clock.tick);
-    this.stats.tripsStarted++;
 
-    // 自動車・トラックはエッジの交通量に寄与する = 渋滞を作る
-    if (mode === Mode.Car) {
-      for (let e = 0; e < path.edges.length; e++) ctx.graph.recordTraversal(path.edges[e]!);
+    if (mode === Mode.Car && path.edges.length > 0) {
+      // 自動車は交通流に投入する。到着時刻は予測しない（着いたときが到着時刻）。
+      // 出口のリンクが満杯なら出発そのものを見送って次の tick に出直す。
+      const vehicle = ctx.traffic.enter(path, VehicleKind.Car, id, ctx.clock.tick);
+      if (vehicle < 0) return 'deferred';
+      c.state[id] = Activity.Traveling;
+      c.tripArriveTick[id] = ctx.clock.tick + travelMin; // 見込み。インスペクタ用
+      c.wakeTick[id] = NEVER_WAKE;
+    } else {
+      // 徒歩・自転車・鉄道は互いに干渉しないので、経路長から到着時刻を決めてよい。
+      c.state[id] = Activity.Traveling;
+      c.tripArriveTick[id] = ctx.clock.tick + travelMin;
+      // wakeTick は「次にホイールから起こされるべき tick」。到着もここに含める（遅延削除の判定に使う）。
+      c.wakeTick[id] = ctx.clock.tick + travelMin;
+      ctx.wheel.schedule(id, ctx.clock.tick + travelMin, ctx.clock.tick);
     }
+    this.stats.tripsStarted++;
 
     if (id === this.inspectedCitizen) {
       this.lastChoiceExplanation = this.options.map((o) => ({ ...o }));
@@ -322,6 +354,23 @@ export class ActivitySystem {
     if (originNode < 0 || destNode < 0) {
       for (let m = 0; m < 4; m++) this.times.sec[m] = Infinity;
     }
+  }
+
+  /**
+   * 交通流からの通知。自動車のトリップはここで終わる。
+   *
+   * aborted は、グリッドロックの打ち切りか、走行中に道路が作り直されたとき。
+   */
+  onCarEvent(ctx: ActivityContext, id: number, aborted: boolean): void {
+    const c = ctx.citizens;
+    if (!c.isAlive(id)) return;
+    if (c.state[id] !== Activity.Traveling) return;
+    if (aborted) {
+      this.failTrip(ctx, id);
+      return;
+    }
+    c.tripArriveTick[id] = ctx.clock.tick;
+    this.onArrive(ctx, id);
   }
 
   /** 目的地に到着。 */
@@ -448,29 +497,6 @@ export class ActivitySystem {
   private adjustHappiness(ctx: ActivityContext, id: number, delta: number): void {
     const c = ctx.citizens;
     c.happiness[id] = Math.max(0, Math.min(255, c.happiness[id]! + delta));
-  }
-
-  /**
-   * 走行中の再ルーティング。ETA を大幅に超過していて、かつ確率ゲートを通った
-   * 市民だけが対象。全員が一斉に経路を変えると交通が発振するため、
-   * ここを確率的にしておくことが安定性の要。
-   */
-  reroutePass(ctx: ActivityContext, sample: readonly number[]): void {
-    const c = ctx.citizens;
-    for (const id of sample) {
-      if (!c.isAlive(id) || c.state[id] !== Activity.Traveling) continue;
-      if (c.mode[id] !== Mode.Car) continue;
-      if (!ctx.rng.chance(REROUTE_PROBABILITY)) continue;
-      const path = c.tripPath[id];
-      if (!path) continue;
-      if (path.version !== ctx.graph.version) continue;
-      const elapsed = ctx.clock.tick - c.tripDepartTick[id]!;
-      const planned = c.tripArriveTick[id]! - c.tripDepartTick[id]!;
-      if (elapsed < planned * REROUTE_ETA_RATIO) continue;
-      // 遅れている → 到着時刻を伸ばす（実質的な渋滞の体感）
-      c.tripArriveTick[id] = ctx.clock.tick + Math.max(1, Math.round(planned * 0.25));
-      ctx.wheel.schedule(id, c.tripArriveTick[id]!, ctx.clock.tick);
-    }
   }
 
   /** インスペクタ用: 交通手段の選択理由を人が読める形にする。 */

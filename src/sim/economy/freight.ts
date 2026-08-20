@@ -4,7 +4,8 @@ import { archetype } from '@sim/buildings/archetypes';
 import type { BuildingStore } from '@sim/buildings/buildings';
 import type { Rng } from '@sim/core/rng';
 import type { Graph } from '@sim/network/graph';
-import type { Path } from '@sim/network/pathfinder';
+import { reversePath, type Path } from '@sim/network/pathfinder';
+import { VehicleKind, type TrafficSystem } from '@sim/network/traffic';
 import type { Router } from '@sim/network/router';
 import type { TazMatrix } from '@sim/network/tazMatrix';
 import { tazOf } from '@sim/world/tiles';
@@ -12,9 +13,9 @@ import { tazOf } from '@sim/world/tiles';
 /**
  * 物流。消費側の在庫が減ったら発注し、供給側からトラックが出る。
  *
- * 重要なのは、トラックが市民と同じ道路グラフを A* で走り、
- * **同じエッジの交通量に加算される**こと。つまり工場を市街地の反対側に置けば、
- * その物流が実際に通勤路を混雑させる。悪い都市計画が渋滞として返る仕組み。
+ * 重要なのは、トラックが市民と同じ道路グラフを A* で走り、**同じ交通流に載る**こと。
+ * トラックも交差点で信号待ちし、乗用車 2.5 台ぶんの枠を食う。つまり工場を市街地の
+ * 反対側に置けば、その物流が実際に通勤路を詰まらせる。悪い都市計画が渋滞として返る。
  */
 
 export const TruckState = {
@@ -48,6 +49,8 @@ export class TruckStore {
   good: Uint8Array;
   amount: Float32Array;
   state: Uint8Array;
+  /** 消費建物の何番目の入力か。輸送中の数量を戻すのに使う。 */
+  inputIndex: Uint8Array;
   departTick: Uint32Array;
   arriveTick: Uint32Array;
   path: (Path | null)[] = [];
@@ -60,6 +63,7 @@ export class TruckStore {
     this.good = new Uint8Array(capacity);
     this.amount = new Float32Array(capacity);
     this.state = new Uint8Array(capacity);
+    this.inputIndex = new Uint8Array(capacity);
     this.departTick = new Uint32Array(capacity);
     this.arriveTick = new Uint32Array(capacity);
     for (let i = 0; i < capacity; i++) this.path.push(null);
@@ -117,6 +121,15 @@ export class FreightSystem {
    * インスペクタで「どこから仕入れているか」を出すためにも使う。
    */
   private lastSupplier = new Map<number, number>();
+  /**
+   * (消費建物スロット * 2 + 入力番号) -> 輸送中の数量。
+   *
+   * これが無いと、配送に時間がかかる間じゅう同じ店に何度も発注し続ける。
+   * 移動が一瞬だった頃は害が出なかったが、交通流を入れて配送が実時間を食うようになった
+   * 途端、同じ 1 軒に何十台も向かってトラック上限を食い潰し、資源地への道が
+   * 空車と実車で恒久的に詰まった（走行中 626 台、うち 571 台がトラック）。
+   */
+  private inTransit = new Map<number, number>();
 
   /** 消費建物がどこから仕入れているか（建物インスペクタ用）。 */
   supplierOf(consumerSlot: number, inputIndex: number): number {
@@ -140,6 +153,7 @@ export class FreightSystem {
     this.cursor = 0;
     this.rebuildCountdown = 0;
     this.lastSupplier.clear();
+    this.inTransit.clear();
     this.stats.active = 0;
   }
 
@@ -179,6 +193,7 @@ export class FreightSystem {
     graph: Graph,
     router: Router,
     taz: TazMatrix,
+    traffic: TrafficSystem,
     rng: Rng,
     tick: number,
   ): void {
@@ -212,8 +227,12 @@ export class FreightSystem {
 
       for (let k = 0; k < a.inputs.length; k++) {
         const need = a.inputs[k]!;
-        const have = k === 0 ? buildings.inAmtA[consumer]! : buildings.inAmtB[consumer]!;
+        const stock = k === 0 ? buildings.inAmtA[consumer]! : buildings.inAmtB[consumer]!;
         const cap = a.storage;
+        // 「今ある在庫 + 向かっている荷物」で判定する。輸送中を数えないと、
+        // 到着するまで同じ発注を繰り返してトラックが際限なく増える。
+        const coming = this.inTransit.get(consumer * 2 + k) ?? 0;
+        const have = stock + coming;
         if (have >= cap * REORDER_FRACTION) {
           this.stats.skippedStocked++;
           continue;
@@ -277,15 +296,23 @@ export class FreightSystem {
         const truck = this.trucks.alloc();
         if (truck < 0) break;
 
-
         const amount = Math.min(TRUCK_CAPACITY, buildings.outAmt[best]!, cap - have);
+        const transitKey = consumer * 2 + k;
         if (amount <= 0) {
           this.trucks.free(truck);
           continue;
         }
-        buildings.outAmt[best] = buildings.outAmt[best]! - amount;
 
-        const travelMin = Math.max(1, Math.round(path.costSec / 60));
+        // 交通流へ投入する。出口のリンクが埋まっていたら積み込まずに次回へ回す。
+        if (traffic.enter(path, VehicleKind.Truck, truck, tick) < 0) {
+          this.trucks.free(truck);
+          this.stats.deferredBudget++;
+          continue;
+        }
+        buildings.outAmt[best] = buildings.outAmt[best]! - amount;
+        this.inTransit.set(transitKey, coming + amount);
+        this.trucks.inputIndex[truck] = k;
+
         this.trucks.alive[truck] = 1;
         this.trucks.fromSlot[truck] = best;
         this.trucks.toSlot[truck] = consumer;
@@ -293,11 +320,9 @@ export class FreightSystem {
         this.trucks.amount[truck] = amount;
         this.trucks.state[truck] = TruckState.Outbound;
         this.trucks.departTick[truck] = tick;
-        this.trucks.arriveTick[truck] = tick + travelMin;
+        this.trucks.arriveTick[truck] = tick + Math.max(1, Math.round(path.costSec / 60)); // 見込み
         this.trucks.path[truck] = path;
         this.activeTrucks++;
-        // トラックは乗用車より道路を占有する
-        for (let e = 0; e < path.edges.length; e++) graph.recordTraversal(path.edges[e]!, 2.5);
         this.stats.dispatched++;
         this.totalDispatched++;
         dispatchedNow++;
@@ -305,35 +330,75 @@ export class FreightSystem {
     }
   }
 
-  /** 到着したトラックを処理する。毎 tick。 */
-  update(buildings: BuildingStore, tick: number): void {
-    for (const i of this.trucks.each()) {
-      if (tick < this.trucks.arriveTick[i]!) continue;
-      const to = this.trucks.toSlot[i]!;
-      if (this.trucks.state[i] === TruckState.Outbound) {
-        if (buildings.alive[to] === 1) {
-          const a = archetype(buildings.archetypeId[to]!);
-          const good = this.trucks.good[i]! as Good;
-          const amount = this.trucks.amount[i]!;
-          if (buildings.inGoodA[to] === good) {
-            buildings.inAmtA[to] = Math.min(a.storage, buildings.inAmtA[to]! + amount);
-          } else if (buildings.inGoodB[to] === good) {
-            buildings.inAmtB[to] = Math.min(a.storage, buildings.inAmtB[to]! + amount);
-          }
-          this.stats.delivered++;
-          this.totalDelivered++;
+  /** 輸送中の数量から、このトラックのぶんを取り除く。 */
+  private clearTransit(truck: number): void {
+    const key = this.trucks.toSlot[truck]! * 2 + this.trucks.inputIndex[truck]!;
+    const left = (this.inTransit.get(key) ?? 0) - this.trucks.amount[truck]!;
+    if (left > 0.001) this.inTransit.set(key, left);
+    else this.inTransit.delete(key);
+  }
+
+  /** 統計の更新だけ。到着は交通流からの通知（onTruckEvent）で処理する。 */
+  update(_buildings: BuildingStore, _tick: number): void {
+    this.stats.active = this.activeTrucks;
+  }
+
+  /**
+   * 交通流からの通知。トラックの往路・帰路はここで切り替わる。
+   *
+   * aborted は、グリッドロックの打ち切りか、走行中に道路が作り直されたとき。
+   * 積荷は供給元に戻す。落とすとサプライチェーンが道路工事のたびに痩せていく。
+   */
+  onTruckEvent(
+    buildings: BuildingStore,
+    graph: Graph,
+    traffic: TrafficSystem,
+    truck: number,
+    aborted: boolean,
+    tick: number,
+  ): void {
+    if (this.trucks.alive[truck] !== 1) return;
+    const from = this.trucks.fromSlot[truck]!;
+    const to = this.trucks.toSlot[truck]!;
+
+    if (aborted) {
+      if (this.trucks.state[truck] === TruckState.Outbound && buildings.alive[from] === 1) {
+        buildings.outAmt[from] = buildings.outAmt[from]! + this.trucks.amount[truck]!;
+        this.clearTransit(truck);
+      }
+      this.trucks.free(truck);
+      this.activeTrucks--;
+      return;
+    }
+
+    if (this.trucks.state[truck] === TruckState.Outbound) {
+      this.clearTransit(truck);
+      if (buildings.alive[to] === 1) {
+        const a = archetype(buildings.archetypeId[to]!);
+        const good = this.trucks.good[truck]! as Good;
+        const amount = this.trucks.amount[truck]!;
+        if (buildings.inGoodA[to] === good) {
+          buildings.inAmtA[to] = Math.min(a.storage, buildings.inAmtA[to]! + amount);
+        } else if (buildings.inGoodB[to] === good) {
+          buildings.inAmtB[to] = Math.min(a.storage, buildings.inAmtB[to]! + amount);
         }
-        // 帰路（空車も交通量に寄与する）
-        this.trucks.state[i] = TruckState.Returning;
-        const dur = Math.max(1, this.trucks.arriveTick[i]! - this.trucks.departTick[i]!);
-        this.trucks.departTick[i] = tick;
-        this.trucks.arriveTick[i] = tick + dur;
-      } else {
-        this.trucks.free(i);
-        this.activeTrucks--;
+        this.stats.delivered++;
+        this.totalDelivered++;
+      }
+      // 帰路。空車も道路を占有するので、同じ交通流に載せて往路を逆にたどる。
+      const outbound = this.trucks.path[truck];
+      const back = outbound ? reversePath(graph, outbound) : null;
+      if (back && traffic.enter(back, VehicleKind.Truck, truck, tick) >= 0) {
+        this.trucks.state[truck] = TruckState.Returning;
+        this.trucks.path[truck] = back;
+        this.trucks.departTick[truck] = tick;
+        this.trucks.arriveTick[truck] = tick + Math.max(1, Math.round(back.costSec / 60));
+        return;
       }
     }
-    this.stats.active = this.activeTrucks;
+
+    this.trucks.free(truck);
+    this.activeTrucks--;
   }
 }
 

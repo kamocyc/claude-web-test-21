@@ -190,7 +190,7 @@ export class LifecycleSystem {
       // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
       const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
       c.set(id, CitizenFlag.TransitPass, homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15);
-      ctx.activity.initCitizen(ctx as never, id);
+      ctx.activity.rescheduleCitizen(ctx as never, id);
     }
     this.jobCursor = (this.jobCursor + attempts) % n;
   }
@@ -289,7 +289,7 @@ export class LifecycleSystem {
       if (c.homeBuilding[id] === 0) {
         if (seekHome(c, b, ctx.taz, housingIndex, rng, id, ctx.world.landValue)) {
           c.unhappyDays[id] = 0;
-          ctx.activity.initCitizen(ctx as never, id);
+          ctx.activity.rescheduleCitizen(ctx as never, id);
         } else {
           // 住むところが無い状態が続いたら転出
           c.unhappyDays[id] = c.unhappyDays[id]! + 7;
@@ -306,7 +306,7 @@ export class LifecycleSystem {
           if (seekHome(c, b, ctx.taz, housingIndex, rng, id, ctx.world.landValue)) {
             c.unhappyDays[id] = 0;
             c.happiness[id] = 130;
-            ctx.activity.initCitizen(ctx as never, id);
+            ctx.activity.rescheduleCitizen(ctx as never, id);
           } else if (c.unhappyDays[id]! > RELOCATE_PATIENCE_DAYS * 3) {
             this.emigrate(ctx, id);
             this.stats.emigrants++;

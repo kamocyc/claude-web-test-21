@@ -24,7 +24,8 @@ import { CitizenFlag } from '@sim/agents/citizens';
 import { handleSlot } from '@sim/buildings/buildings';
 import type { Simulation } from '@sim/simulation';
 import { TruckState } from '@sim/economy/freight';
-import { pathPosition, type PathPose } from '@sim/network/pathfinder';
+import { type PathPose } from '@sim/network/pathfinder';
+import { VehicleKind } from '@sim/network/traffic';
 import {
   TRAIN_CAR_PITCH_M,
   railPoseAt,
@@ -155,6 +156,9 @@ export class AgentLayer {
       if (!c.isAlive(id)) continue;
       if (c.state[id] !== Activity.Traveling) continue;
       const mode = c.mode[id]! as Mode;
+      // 自動車は交通流が位置を持っているので、下の drawVehicles で描く。
+      // ここで経路長から補間すると、信号待ちで止まっている車が走り続けてしまう。
+      if (mode === Mode.Car) continue;
       if (!citizenPosition(c, sim.graph, id, tick, this.tmp)) continue;
 
       // 今どのエッジの上にいるかで見た目を決める。
@@ -164,56 +168,35 @@ export class AgentLayer {
       const bits = this.tmp.edge >= 0 ? sim.graph.edgeMask[this.tmp.edge]! : 0;
       // 線路上の鉄道利用者は電車の中にいるので描かない（電車の方を描く）
       if (mode === Mode.Rail && bits & ModeBit.Rail) continue;
-      const onRoadway = mode === Mode.Car && (bits & ModeBit.Car) !== 0;
-
-      if (onRoadway) {
-        if (car >= MAX_VISIBLE_VEHICLES) continue;
-      } else {
-        if (!drawPedestrians || ped >= MAX_VISIBLE_AGENTS) continue;
-      }
+      if (!drawPedestrians || ped >= MAX_VISIBLE_AGENTS) continue;
 
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
-      const d2 = dx * dx + dz * dz;
-      if (d2 > (onRoadway ? vehDist2 : pedDist2)) continue;
+      if (dx * dx + dz * dz > pedDist2) continue;
 
       const groundY = this.groundAt(sim, this.tmp.x, this.tmp.z) + 0.05;
       this.quat.setFromAxisAngle(this.axisY, this.tmp.heading);
 
-      if (onRoadway) {
-        // 左側通行。対向車が別の車線を流れる
-        this.pos.set(
-          this.tmp.x + this.laneOffsetX(this.tmp.heading, LANE_OFFSET_M),
-          groundY,
-          this.tmp.z + this.laneOffsetZ(this.tmp.heading, LANE_OFFSET_M),
-        );
-        this.mat.compose(this.pos, this.quat, this.scl);
-        this.cars.setMatrixAt(car, this.mat);
-        this.color.setHex(carColor((id * 2654435761) >>> 0));
-        this.cars.setColorAt(car, this.color);
-        car++;
+      // 道路の中央ではなく端を歩かせる。全員が真ん中を一列で進むと、
+      // 近景で見たときに人の流れではなく点線に見える。
+      // 車道の外側になるよう、車線より外に置く。
+      const side = LANE_OFFSET_M + 1.2 + ((id >> 1) % 3) * 0.7;
+      this.pos.set(
+        this.tmp.x + this.laneOffsetX(this.tmp.heading, side),
+        groundY,
+        this.tmp.z + this.laneOffsetZ(this.tmp.heading, side),
+      );
+      this.mat.compose(this.pos, this.quat, this.scl);
+      this.pedestrians.setMatrixAt(ped, this.mat);
+      // 服の色を人ごとに散らす。自転車は目立つ色にして見分けられるようにする。
+      if (mode === Mode.Bike) {
+        this.color.setHex(0xe08a3a);
       } else {
-        // 道路の中央ではなく端を歩かせる。全員が真ん中を一列で進むと、
-        // 近景で見たときに人の流れではなく点線に見える。
-        // 車道の外側になるよう、車線より外に置く。
-        const side = LANE_OFFSET_M + 1.2 + ((id >> 1) % 3) * 0.7;
-        this.pos.set(
-          this.tmp.x + this.laneOffsetX(this.tmp.heading, side),
-          groundY,
-          this.tmp.z + this.laneOffsetZ(this.tmp.heading, side),
-        );
-        this.mat.compose(this.pos, this.quat, this.scl);
-        this.pedestrians.setMatrixAt(ped, this.mat);
-        // 服の色を人ごとに散らす。自転車は目立つ色にして見分けられるようにする。
-        if (mode === Mode.Bike) {
-          this.color.setHex(0xe08a3a);
-        } else {
-          const h = (id * 2654435761) >>> 0;
-          this.color.setHSL(((h >>> 8) % 360) / 360, 0.28, 0.52 + ((h >>> 20) % 24) / 100);
-        }
-        this.pedestrians.setColorAt(ped, this.color);
-        ped++;
+        const h = (id * 2654435761) >>> 0;
+        this.color.setHSL(((h >>> 8) % 360) / 360, 0.28, 0.52 + ((h >>> 20) % 24) / 100);
       }
+      this.pedestrians.setColorAt(ped, this.color);
+      ped++;
     }
 
     // --- 立ち寄り中の市民 ---
@@ -260,9 +243,11 @@ export class AgentLayer {
       }
     }
 
+    const drawn = this.drawVehicles(sim, camX, camZ, vehDist2, tick, car);
+    car = drawn.cars;
+    const truck = drawn.trucks;
     car = this.drawParkedCars(sim, camX, camZ, camDistance, pedDist2, car);
     const train = this.drawTrains(sim, camX, camZ, trainDist2, tick);
-    const truck = this.drawTrucks(sim, camX, camZ, vehDist2, tick);
 
     this.pedestrians.count = ped;
     this.cars.count = car;
@@ -406,40 +391,58 @@ export class AgentLayer {
     return n;
   }
 
-  /** トラック（物流）。積荷の色で塗り分ける。 */
-  private drawTrucks(sim: Simulation, camX: number, camZ: number, maxDist2: number, tick: number): number {
-    let n = 0;
+  /**
+   * 走行中の車両（自家用車とトラック）。
+   *
+   * 位置は交通流シミュレーションが持っている。信号待ちの車は停止線の手前に
+   * 車列 1 台ぶんずつ下がって並ぶので、そのまま描けば行列に見える。
+   * 経路長からの補間ではないので、詰まっている車は本当に止まって見える。
+   */
+  private drawVehicles(
+    sim: Simulation,
+    camX: number,
+    camZ: number,
+    maxDist2: number,
+    tick: number,
+    fromCar: number,
+  ): { cars: number; trucks: number } {
+    let car = fromCar;
+    let truck = 0;
+    const tr = sim.traffic;
+    const nowSec = tick * 60;
     const t = sim.freight.trucks;
-    for (let i = 0; i < t.high && n < MAX_VISIBLE_TRUCKS; i++) {
-      if (t.alive[i] !== 1) continue;
-      const path = t.path[i];
-      if (!path) continue;
-      const depart = t.departTick[i]!;
-      const arrive = t.arriveTick[i]!;
-      const total = Math.max(1, arrive - depart);
-      const returning = t.state[i] === TruckState.Returning;
-      let f = Math.max(0, Math.min(1, (tick - depart) / total));
-      // 帰路は経路を逆向きに進む
-      if (returning) f = 1 - f;
-      if (!pathPosition(sim.graph, path, f, this.tmp)) continue;
-      // 位置だけ反転して向きを反転しないと、トラックがバックで帰る
-      const heading = returning ? this.tmp.heading + Math.PI : this.tmp.heading;
-
+    tr.forEachVehicle((v) => {
+      const isTruck = tr.kind[v] === VehicleKind.Truck;
+      if (isTruck ? truck >= MAX_VISIBLE_TRUCKS : car >= MAX_VISIBLE_VEHICLES) return;
+      if (!tr.pose(sim.graph, v, nowSec, this.tmp)) return;
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
-      if (dx * dx + dz * dz > maxDist2) continue;
+      if (dx * dx + dz * dz > maxDist2) return;
+
+      const heading = this.tmp.heading;
       this.quat.setFromAxisAngle(this.axisY, heading);
+      // 左側通行。対向車が別の車線を流れる
       const ox = this.laneOffsetX(heading, LANE_OFFSET_M);
       const oz = this.laneOffsetZ(heading, LANE_OFFSET_M);
       this.pos.set(this.tmp.x + ox, this.groundAt(sim, this.tmp.x + ox, this.tmp.z + oz) + 0.05, this.tmp.z + oz);
       this.mat.compose(this.pos, this.quat, this.scl);
-      this.trucks.setMatrixAt(n, this.mat);
-      // 帰路は空車なので無地。往路は積荷の色。
-      this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[i]!] ?? CARGO_COLORS[0]!);
-      this.trucks.setColorAt(n, this.color);
-      n++;
-    }
-    return n;
+
+      const owner = tr.owner[v]!;
+      if (isTruck) {
+        this.trucks.setMatrixAt(truck, this.mat);
+        // 帰路は空車なので無地。往路は積荷の色。
+        const returning = t.alive[owner] === 1 && t.state[owner] === TruckState.Returning;
+        this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[owner]!] ?? CARGO_COLORS[0]!);
+        this.trucks.setColorAt(truck, this.color);
+        truck++;
+      } else {
+        this.cars.setMatrixAt(car, this.mat);
+        this.color.setHex(carColor((owner * 2654435761) >>> 0));
+        this.cars.setColorAt(car, this.color);
+        car++;
+      }
+    });
+    return { cars: car, trucks: truck };
   }
 
   dispose(): void {
