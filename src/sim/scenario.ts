@@ -35,6 +35,8 @@ export interface ScenarioOptions {
 export interface ScenarioResult {
   center: number;
   satellite: number;
+  /** 2 つの市街地を結ぶ幹線道路のタイル。テストと計測で「そこだけ広げる」ために返す。 */
+  trunk: number[];
   roadTiles: number;
   zonedTiles: number;
   stations: number[];
@@ -263,6 +265,7 @@ export function buildScenario(sim: Simulation, opts: ScenarioOptions = {}): Scen
   // 職場をほとんど置かない。住民は中心市街地へ通勤せざるを得ず、
   // そこで初めて「どの交通手段で行くか」が本当の選択になる。
   let satellite = -1;
+  let trunkTiles: number[] = [];
   const satSize = Math.round(size * 0.62);
   if (withSatellite) {
     satellite = findSatelliteCenter(world, cx, cy, size * 1.5, size * 2.4);
@@ -270,15 +273,28 @@ export function buildScenario(sim: Simulation, opts: ScenarioOptions = {}): Scen
       const sx = satellite % MAP_W;
       const sy = (satellite / MAP_W) | 0;
       layOutDistrict(sim, sx, sy, satSize, block, (ring, bx, by) => {
-        if (ring < 0.22) return Zone.CommercialLocal;
+        // 商業は駅前の商店街と、住宅地に散らした最低限の店だけ。
+        //
+        // ここを厚くすると住民が地元で就職してしまう。実際、以前は中心に
+        // 商業核を置いていたせいで雇用 1028 / 住民 1162 となり、
+        // **中心市街地へ通勤する人が 1 人もいなかった**。
+        // ベッドタウンとして書いたコメントに実装が追いついていなかった。
+        if (ring < 0.14) return Zone.CommercialLocal;
         if (ring < 0.45) return Zone.ResidentialMid;
-        if (ring < 0.85) return (bx * 5 + by * 3) % 11 === 0 ? Zone.CommercialLocal : Zone.ResidentialLow;
+        if (ring < 0.85) return (bx * 5 + by * 3) % 13 === 0 ? Zone.CommercialLocal : Zone.ResidentialLow;
         return Zone.AgriField;
       });
 
-      // 2 つの市街地を幹線道路で結ぶ（鉄道が無くても自動車で通えるように）
-      const trunk = lineTiles(center, satellite).filter((t) => world.canBuildRoad(t));
-      sim.enqueue({ t: 'buildRoad', cls: RoadClass.Boulevard, tiles: trunk });
+      // 2 つの市街地を幹線道路で結ぶ（鉄道が無くても自動車で通えるように）。
+      //
+      // **わざと細い道にしてある。** 片側 1 車線の都市間連絡路は日本の県道として
+      // 普通で、朝夕のラッシュに詰まる。実測では朝 7〜9 時に収容いっぱいになる
+      // リンクの 7 割がこの幹線沿いに出る。
+      // プレイヤが二車線・大通りに広げれば捌ける（青の配分と収容が同時に増えるため）。
+      // ここを最初から大通りにすると、街でいちばん交通量の多い道が容量の
+      // 4% で流れてしまい、交通シミュレーションが何も起こさない街になる。
+      trunkTiles = lineTiles(center, satellite).filter((t) => world.canBuildRoad(t));
+      sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles: trunkTiles });
       sim.tick();
     }
   }
@@ -377,7 +393,7 @@ export function buildScenario(sim: Simulation, opts: ScenarioOptions = {}): Scen
     if (world.road[i] !== RoadClass.None) roadCount++;
     if (world.zone[i] !== Zone.None) zonedCount++;
   }
-  return { center, satellite, roadTiles: roadCount, zonedTiles: zonedCount, stations };
+  return { center, satellite, trunk: trunkTiles, roadTiles: roadCount, zonedTiles: zonedCount, stations };
 }
 
 /**

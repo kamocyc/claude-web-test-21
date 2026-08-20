@@ -53,6 +53,11 @@ export interface VehicleEvent {
 }
 
 const INITIAL_VEHICLE_CAPACITY = 1024;
+/**
+ * 描画用に覚えておくリンク乗り換えの件数。
+ * 実測で 1 tick に進むのは最大 6 リンクなので、その前の 1 件ぶんを足しても 8 で足りる。
+ */
+const TRAJECTORY_HISTORY = 8;
 /** 道路ではない区間（駅前の歩行者エッジなど）の放出率。実質無制限。 */
 const FREE_SEGMENT_RELEASE = 1000;
 
@@ -84,6 +89,23 @@ export class TrafficSystem {
   private blocked = new Int32Array(0);
   /** 車両が占める大きさ（乗用車の車列 = 1）。場所と交通容量の両方に使う。 */
   private size = new Float32Array(0);
+
+  /**
+   * 直近の軌跡（どのリンクに、いつ入ったか）。**描画専用**で、判断には一切使わない。
+   *
+   * 車は 1 tick に平均 3.8 リンク（最大 6）＝ 560m 進む。今いるリンクしか持たないと、
+   * 描画側は毎 tick「4 マス瞬間移動 → 停止線でじっと待つ」しか描けない。
+   * tick の中の任意の時刻について、そのとき本当にいた場所を返せるように
+   * リンクの乗り換えを記録しておく。
+   *
+   * 1 tick を平均して滑らかにする手もあるが、信号の 1 周期が 60 秒 ＝ ちょうど 1 tick なので、
+   * それだと赤で止まっている様子が完全に消える。せっかくの挙動が見えなくなる。
+   */
+  private histEdgeIndex = new Int32Array(0);
+  private histEnterSec = new Float64Array(0);
+  /** リング内の最新の位置と、入っている件数。 */
+  private histHead = new Uint8Array(0);
+  private histCount = new Uint8Array(0);
 
   // ---- リンク ----
   private edgeCount = 0;
@@ -277,6 +299,15 @@ export class TrafficSystem {
     this.queueCap = grow(this.queueCap, (k) => new Float32Array(k));
     this.blocked = grow(this.blocked, (k) => new Int32Array(k));
     this.size = grow(this.size, (k) => new Float32Array(k));
+    this.histHead = grow(this.histHead, (k) => new Uint8Array(k));
+    this.histCount = grow(this.histCount, (k) => new Uint8Array(k));
+    // 履歴は車両ごとに HIST 件の連続領域。伸ばすときは要素ごとに詰め替える。
+    const hist = new Int32Array(cap * TRAJECTORY_HISTORY);
+    hist.set(this.histEdgeIndex);
+    this.histEdgeIndex = hist;
+    const secs = new Float64Array(cap * TRAJECTORY_HISTORY);
+    secs.set(this.histEnterSec);
+    this.histEnterSec = secs;
     this.capacity = cap;
   }
 
@@ -302,6 +333,10 @@ export class TrafficSystem {
     this.alive[slot] = 1;
     this.departTick[slot] = tick;
     this.blocked[slot] = 0;
+    this.histHead[slot] = 0;
+    this.histCount[slot] = 1;
+    this.histEdgeIndex[slot * TRAJECTORY_HISTORY] = 0;
+    this.histEnterSec[slot * TRAJECTORY_HISTORY] = tick * 60;
     this.pushLink(first, slot);
     return slot;
   }
@@ -332,6 +367,15 @@ export class TrafficSystem {
     this.count[edge] = Math.max(0, this.count[edge]! - this.size[v]!);
     this.next[v] = -1;
     return v;
+  }
+
+  /** 軌跡に「このリンクへ、この時刻に入った」を 1 件積む。 */
+  private pushTrajectory(v: number, edgeIndex: number, nowSec: number): void {
+    const head = (this.histHead[v]! + 1) % TRAJECTORY_HISTORY;
+    this.histHead[v] = head;
+    if (this.histCount[v]! < TRAJECTORY_HISTORY) this.histCount[v] = this.histCount[v]! + 1;
+    this.histEdgeIndex[v * TRAJECTORY_HISTORY + head] = edgeIndex;
+    this.histEnterSec[v * TRAJECTORY_HISTORY + head] = nowSec;
   }
 
   private release(v: number): void {
@@ -440,6 +484,7 @@ export class TrafficSystem {
           this.edgeIndex[v] = ni;
           this.enterSec[v] = nowSec;
           this.blocked[v] = 0;
+          this.pushTrajectory(v, ni, nowSec);
           this.pushLink(nx, v);
         }
       }
@@ -528,11 +573,31 @@ export class TrafficSystem {
     if (this.alive[v] === 0) return false;
     const p = this.path[v];
     if (!p) return false;
-    const i = this.edgeIndex[v]!;
+
+    // その時刻にいたリンクを軌跡から引く。新しい方から見て、
+    // 「もう入っていた」最初の 1 件がその瞬間の居場所。
+    const base = v * TRAJECTORY_HISTORY;
+    const head = this.histHead[v]!;
+    const n = this.histCount[v]!;
+    let slot = -1;
+    for (let k = 0; k < n; k++) {
+      const at = (head - k + TRAJECTORY_HISTORY) % TRAJECTORY_HISTORY;
+      if (this.histEnterSec[base + at]! <= nowSec) {
+        slot = at;
+        break;
+      }
+    }
+    // 履歴のどれよりも古い時刻を聞かれたら、いちばん古い記録で答える。
+    if (slot < 0) slot = (head - (n - 1) + TRAJECTORY_HISTORY) % TRAJECTORY_HISTORY;
+
+    const i = this.histEdgeIndex[base + slot]!;
+    if (i >= p.edges.length) return false;
     const edge = p.edges[i]!;
     const free = this.freeSec[edge]!;
-    const cruise = free > 0 ? (nowSec - this.enterSec[v]!) / free : 1;
-    const f = Math.max(0, Math.min(cruise, this.queueCap[v]!));
+    const cruise = free > 0 ? (nowSec - this.histEnterSec[base + slot]!) / free : 1;
+    // 前の車につかえるのは「今いるリンク」だけ。既に通り過ぎたリンクでは走り切っている。
+    const cap = slot === head ? this.queueCap[v]! : 1;
+    const f = Math.max(0, Math.min(cruise, cap));
 
     const a = p.nodes[i]!;
     const b = p.nodes[i + 1]!;

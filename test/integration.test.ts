@@ -6,7 +6,7 @@ import { decodeSave, encodeSave } from '@sim/persistence';
 import { buildScenario } from '@sim/scenario';
 import { hashArrays } from '@sim/core/hash';
 import { Simulation } from '@sim/simulation';
-import { idx } from '@sim/world/tiles';
+import { idx, tileDistanceM } from '@sim/world/tiles';
 import { CitizenFlag } from '@sim/agents/citizens';
 import { SCHEDULES, ScheduleKind } from '@sim/agents/schedules';
 import { handleSlot } from '@sim/buildings/buildings';
@@ -87,6 +87,29 @@ describe('街の 90 日運転', () => {
       }
     }
     expect(stuck).toBe(0);
+  });
+
+  it('ベッドタウンから中心市街地へ通勤する人がいる', () => {
+    // サンプルのシナリオは中心市街地とベッドタウンの 2 つでできている。
+    // ベッドタウンに商業核を置いていた頃は住民が全員そこで就職してしまい、
+    // 2 つを結ぶ幹線道路も鉄道もモード選択も、意図した役割を一度も果たしていなかった。
+    const c = sim.citizens;
+    const b = sim.buildings;
+    let employed = 0;
+    let longHaul = 0;
+    for (let i = 0; i < c.high; i++) {
+      if (!c.isAlive(i)) continue;
+      const h = c.homeBuilding[i]!;
+      const w = c.workBuilding[i]!;
+      if (!b.valid(h) || !b.valid(w)) continue;
+      employed++;
+      const home = b.originTile[handleSlot(h)]!;
+      const work = b.originTile[handleSlot(w)]!;
+      // 市街地 1 つの差し渡しを超える距離＝別の市街地へ通っている
+      if (tileDistanceM(home, work) > 12_000) longHaul++;
+    }
+    expect(employed).toBeGreaterThan(100);
+    expect(longHaul / employed).toBeGreaterThan(0.05);
   });
 
   it('市民の建物参照が健全（世代タグが破綻していない）', () => {
@@ -475,23 +498,30 @@ describe('生活のリズム', () => {
 });
 
 /**
- * 「中密度を適当に密集させるとラッシュ時に渋滞する」という要求そのものを検査する。
+ * 「密集させるとラッシュ時に渋滞し、道を広げれば捌ける」という要求そのものを検査する。
  *
- * 同じ街を 2 通り作る。片方は 4 街区おきに大通りを通した街、
- * もう片方はその大通りを全部 生活道路に落とした街。
- * 人口も建物も交通需要も同じなので、差は道路の階層があるかどうかだけになる。
+ * 同じ街を 2 通り作る。片方は幹線まで含めて全部を大通りにした街、
+ * もう片方は大通りを 1 本も持たない生活道路だけの街。
+ * 人口も建物も交通需要も同じなので、差は道路の太さだけになる。
  */
 describe('道路の設計が渋滞を決める', () => {
-  const measure = (downgrade: boolean) => {
+  const measure = (widen: boolean) => {
     const sim = new Simulation(9);
-    buildScenario(sim, { size: 40, seedPopulation: 600, withRail: false });
-    if (downgrade) {
-      const tiles: number[] = [];
+    const result = buildScenario(sim, { size: 40, seedPopulation: 600, withRail: false });
+    // 道路の付け替えで資金が尽きて途中で止まらないようにしておく
+    sim.budget.cash = 5e9;
+    const tiles: number[] = [];
+    if (widen) {
+      // 幹線まで含めて全部を大通りにした街
+      tiles.push(...result.trunk);
+      sim.enqueue({ t: 'buildRoad', cls: RoadClass.Boulevard, tiles });
+    } else {
+      // 大通りを 1 本も持たない、生活道路だけの街
       for (let t = 0; t < TILE_COUNT; t++) if (sim.world.road[t] === RoadClass.Boulevard) tiles.push(t);
-      expect(tiles.length).toBeGreaterThan(100);
       sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles });
-      sim.tick();
     }
+    expect(tiles.length).toBeGreaterThan(100);
+    sim.tick();
     const days = 16;
     let worstShare = 0;
     let peakWaiting = 0;
@@ -511,16 +541,18 @@ describe('道路の設計が渋滞を決める', () => {
     return { population: s.population, commute: s.avgCommuteMin, worstShare, peakWaiting };
   };
 
-  const planned = measure(false);
-  const packed = measure(true);
+  const planned = measure(true);
+  const packed = measure(false);
 
   it('同じ人口・同じ需要で比べている（差が出るのは道路だけ）', () => {
-    expect(planned.population).toBe(packed.population);
+    // 道路を付け替えると所要時間が変わり、そこから成長の乱数列がわずかにずれる。
+    // 「ほぼ同じ人口」であることが言えれば、差が交通の話であることの担保になる。
     expect(planned.population).toBeGreaterThan(1000);
+    expect(Math.abs(planned.population - packed.population) / planned.population).toBeLessThan(0.05);
   });
 
   it('生活道路だけで固めるとラッシュ時に道が詰まる', () => {
-    // 大通りを通した街では、収容いっぱいになる道路はごく一部で収まる
+    // 大通りにした街では、収容いっぱいになる道路はごく一部で収まる
     expect(planned.worstShare).toBeLessThan(0.02);
     // 生活道路だけの街では桁違いに詰まる
     expect(packed.worstShare).toBeGreaterThan(planned.worstShare * 3);

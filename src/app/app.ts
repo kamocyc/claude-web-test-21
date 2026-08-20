@@ -92,9 +92,17 @@ export class App {
     this.ui.tutorial.enabled = true;
   }
 
-  /** できあがった街を読み込む（チュートリアルを飛ばして仕組みを眺めたい人向け）。 */
+  /**
+   * できあがった街を読み込む（チュートリアルを飛ばして仕組みを眺めたい人向け）。
+   *
+   * 初期人口を多めにしてあるのは意図的。600 人で始めると開いた直後は人口 1300 の
+   * 集落で、道路がどこも容量の 1 割も使われず、交通シミュレーションが何も起こさない。
+   * ベッドタウンの雇用が埋まって中心市街地への通勤が始まるのは人口 3000 を超えてから
+   * （実測で 600 人開始なら域外通勤 0 人、2000 人開始なら 454 人）。
+   * ここを増やしてもシナリオ構築時間は 2 割ほどしか伸びない（大半は 8 日ぶんの tick）。
+   */
   startSample(): void {
-    const result = buildScenario(this.sim, { size: 72, seedPopulation: 600 });
+    const result = buildScenario(this.sim, { size: 72, seedPopulation: 2000 });
     this.renderer.focusOn((tileX(result.center) + 0.5) * TILE_M, (tileY(result.center) + 0.5) * TILE_M);
     this.renderer.rig.distance = 520;
     this.renderer.invalidateOverlay();
@@ -475,7 +483,8 @@ export class App {
       }
 
       // 端数 tick を渡して補間させる。これが無いと車も人も 12 段階/秒で飛ぶ。
-      this.renderer.render(this.sim, dt, this.speed > 0 ? this.accumulator : 0);
+      // 停止中は端数 1 ＝「最後に計算した tick の終わり」＝今の状態を出す。
+      this.renderer.render(this.sim, dt, this.speed > 0 ? this.accumulator : 1);
       this.ui.update(
         this.sim,
         now,

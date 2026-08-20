@@ -36,6 +36,9 @@ import {
   type TrainHead,
 } from '@sim/network/railLines';
 import { CARGO_COLORS, TRAIN_BODY_COLOR, TRAIN_HEAD_COLOR, carColor } from './theme';
+
+/** 1 フレームで進行方向をどれだけ目標へ寄せるか。1 = 即座（＝スナップ）。 */
+const HEADING_SMOOTHING = 0.15;
 import { idx, tileX, tileY } from '@sim/world/tiles';
 
 /**
@@ -123,6 +126,10 @@ export class AgentLayer {
    * 対向車が中心線上で重なって「流れ」に見えない。
    * 前方 = (sin h, cos h)、左 = 上 × 前方 = (cos h, -sin h)。
    */
+  /** 車両スロットごとの直前の向きと、そのときの出発 tick。 */
+  private headingOf = new Float32Array(0);
+  private headingTag = new Int32Array(0);
+
   private laneOffsetX(heading: number, side: number): number {
     return Math.cos(heading) * side;
   }
@@ -138,7 +145,15 @@ export class AgentLayer {
   update(sim: Simulation, camX: number, camZ: number, camDistance: number, tickFraction = 0): void {
     let ped = 0;
     let car = 0;
-    const tick = sim.clock.tick + Math.max(0, Math.min(1, tickFraction));
+    /**
+     * 描画する時刻。**直前に計算し終えた tick の中**をなぞる。
+     *
+     * `clock.tick` は tick の最後に加算されるので、`clock.tick + 端数` は
+     * まだ計算していない未来を指す。車は 1 tick に平均 4 リンク進むので、
+     * それだと端数 0 の瞬間から既に「最後のリンクの終端」に着いていて、
+     * 毎 tick「4 マス瞬間移動 → 停止線で待つ」に見える。
+     */
+    const tick = sim.clock.tick - 1 + Math.max(0, Math.min(1, tickFraction));
 
     // 歩行者は寄ったときだけ描く。引きの画では 1px 未満にしかならず、
     // 描画予算だけを食って何も見えない。
@@ -398,6 +413,37 @@ export class AgentLayer {
    * 車列 1 台ぶんずつ下がって並ぶので、そのまま描けば行列に見える。
    * 経路長からの補間ではないので、詰まっている車は本当に止まって見える。
    */
+  /**
+   * 曲がり角で向きがスナップするのを抑える。
+   *
+   * 進行方向はリンクの両端から出しているので、交差点を曲がると 90 度が 1 フレームで入れ替わる。
+   * 直前の向きから少しずつ寄せる。車両スロットは使い回されるので、
+   * 出発 tick が変わっていたら別の車とみなして即座に合わせる（古い向きを引き継がない）。
+   */
+  private smoothHeading(vehicle: number, departTick: number, target: number): number {
+    if (vehicle >= this.headingOf.length) {
+      const n = Math.max(vehicle + 1, this.headingOf.length * 2, 1024);
+      const h = new Float32Array(n);
+      h.set(this.headingOf);
+      this.headingOf = h;
+      const g = new Int32Array(n).fill(-1);
+      g.set(this.headingTag);
+      this.headingTag = g;
+    }
+    let next = target;
+    if (this.headingTag[vehicle] === departTick) {
+      const cur = this.headingOf[vehicle]!;
+      // -π..π に畳んでから寄せる。畳まないと 359 度回る。
+      let d = target - cur;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      next = cur + d * HEADING_SMOOTHING;
+    }
+    this.headingOf[vehicle] = next;
+    this.headingTag[vehicle] = departTick;
+    return next;
+  }
+
   private drawVehicles(
     sim: Simulation,
     camX: number,
@@ -419,7 +465,7 @@ export class AgentLayer {
       const dz = this.tmp.z - camZ;
       if (dx * dx + dz * dz > maxDist2) return;
 
-      const heading = this.tmp.heading;
+      const heading = this.smoothHeading(v, tr.departTick[v]!, this.tmp.heading);
       this.quat.setFromAxisAngle(this.axisY, heading);
       // 左側通行。対向車が別の車線を流れる
       const ox = this.laneOffsetX(heading, LANE_OFFSET_M);

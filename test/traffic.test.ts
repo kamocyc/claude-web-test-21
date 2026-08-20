@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   SIGNAL_CYCLE_STEPS,
+  TILE_M,
   TILE_SPAN_M,
   TRAFFIC_SUBSTEPS_PER_TICK,
   VEHICLE_LENGTH_M,
@@ -296,6 +297,38 @@ describe('交通流', () => {
     const a2 = at(queued[0]!, now + 40);
     expect(a2.x).toBeCloseTo(a.x, 5);
     expect(a2.z).toBeCloseTo(a.z, 5);
+  });
+
+
+  it('tick の途中でも位置が連続している（瞬間移動しない）', () => {
+    // 車は 1 tick に 3〜4 リンク進む。描画は tick の中を 12 分割してなぞるので、
+    // その各時点で「そのとき本当にいた場所」が返らないと 4 マス飛んで見える。
+    const fx = straightRoad(30, 46);
+    expect(fx.traffic.enter(fx.path, VehicleKind.Car, 0, 0)).toBe(0);
+    const pose = { x: 0, z: 0, heading: 0, edge: -1 };
+    const xs: number[] = [];
+    for (let t = 0; t < 12; t++) {
+      fx.traffic.tick(fx.graph, t);
+      const done = fx.traffic.events.length > 0;
+      fx.traffic.events.length = 0;
+      // 直前に計算し終えた tick の中をなぞる（描画と同じ時刻の取り方）
+      for (let k = 0; k < 12; k++) {
+        if (!fx.traffic.pose(fx.graph, 0, (t + k / 12) * 60, pose)) break;
+        xs.push(pose.x);
+      }
+      if (done) break;
+    }
+    expect(xs.length).toBeGreaterThan(40);
+    // 東へ一直線の道なので、x は後戻りせず、1 コマの移動はリンク 1 本ぶんを超えない
+    let maxStep = 0;
+    for (let i = 1; i < xs.length; i++) {
+      const d = xs[i]! - xs[i - 1]!;
+      expect(d).toBeGreaterThanOrEqual(-1e-6);
+      maxStep = Math.max(maxStep, d);
+    }
+    expect(maxStep).toBeLessThanOrEqual(TILE_M * 1.01);
+    // ちゃんと何リンクぶんも進んでいる（止まったまま滑らかなのでは意味がない）
+    expect(xs[xs.length - 1]! - xs[0]!).toBeGreaterThan(TILE_M * 8);
   });
 
 });

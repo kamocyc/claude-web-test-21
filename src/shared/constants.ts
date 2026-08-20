@@ -150,8 +150,14 @@ export const LINK_TIME_LAMBDA = 0.3;
 export const LINK_TIME_FORGET_TICKS = 60;
 /** 経路コストへ実測を反映する間隔（tick）。 */
 export const LINK_TIME_RELAX_TICKS = 10;
-/** これだけの割合の道路が収容いっぱいになったら、渋滞をプレイヤに通知する。 */
-export const CONGESTION_ALERT_SHARE = 0.02;
+/**
+ * これだけの本数の道路が収容いっぱいになったら、渋滞をプレイヤに通知する。
+ *
+ * 「全道路に対する割合」で見ていたが、地図の道路の大半は郊外の空いた道なので、
+ * 街なかが完全に詰まっていても割合は 0.2% にしかならず一度も鳴らなかった。
+ * 詰まっている本数そのもので見る。
+ */
+export const CONGESTION_ALERT_LINKS = 8;
 /** 渋滞通知のクールダウン（tick）。1 日に何度も出さない。 */
 export const CONGESTION_ALERT_COOLDOWN_TICKS = 480;
 

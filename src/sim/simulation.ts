@@ -11,7 +11,7 @@ import {
   TICKS_PER_DAY,
   TICKS_PER_HOUR,
   CONGESTION_ALERT_COOLDOWN_TICKS,
-  CONGESTION_ALERT_SHARE,
+  CONGESTION_ALERT_LINKS,
   LINK_TIME_RELAX_TICKS,
   MAP_H,
   MAP_W,
@@ -345,8 +345,7 @@ export class Simulation {
   private checkCongestion(tick: number): void {
     if (tick < this.congestionAlertAt) return;
     const t = this.traffic;
-    if (t.roadLinks === 0) return;
-    if (t.stats.fullLinks / t.roadLinks < CONGESTION_ALERT_SHARE) return;
+    if (t.stats.fullLinks < CONGESTION_ALERT_LINKS) return;
     const link = t.stats.worstLink;
     if (link < 0) return;
     const tile = this.graph.nodeTile[this.graph.edgeTo[link]!]!;
