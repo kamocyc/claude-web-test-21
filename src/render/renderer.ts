@@ -26,6 +26,8 @@ import { idx } from '@sim/world/tiles';
 import { AgentLayer } from './agentLayer';
 import { BuildingLayer } from './buildingLayer';
 import { CameraRig } from './cameraRig';
+import { NatureLayer } from './natureLayer';
+import { RailLayer } from './railLayer';
 import { RoadLayer } from './roadLayer';
 import { TerrainMesh } from './terrainMesh';
 import { PREVIEW_BAD_COLOR, PREVIEW_OK_COLOR, skyColor, sunIntensity } from './theme';
@@ -42,6 +44,8 @@ export class Renderer {
   private readonly renderer: WebGLRenderer;
   private readonly terrain = new TerrainMesh();
   private readonly roads = new RoadLayer();
+  private readonly rails = new RailLayer();
+  private readonly nature = new NatureLayer();
   private readonly buildings = new BuildingLayer();
   private readonly agents = new AgentLayer();
   private readonly sun: DirectionalLight;
@@ -80,7 +84,9 @@ export class Renderer {
     this.scene.add(this.sun);
 
     this.scene.add(this.terrain.group);
+    this.scene.add(this.nature.group);
     this.scene.add(this.roads.group);
+    this.scene.add(this.rails.group);
     this.scene.add(this.buildings.group);
     this.scene.add(this.agents.group);
 
@@ -124,6 +130,8 @@ export class Renderer {
     // 情報表示のときは道路の造形を隠す。車道の板がヒートマップを覆ってしまい、
     // 「どの道が混んでいるか」というオーバーレイ本来の役目が果たせなくなる。
     this.roads.setVisible(o === Overlay.None);
+    this.rails.setVisible(o === Overlay.None);
+    this.nature.setVisible(o === Overlay.None);
   }
 
   get overlay(): Overlay {
@@ -139,6 +147,8 @@ export class Renderer {
   invalidateAll(): void {
     this.terrain.invalidateAll();
     this.roads.invalidate();
+    this.rails.invalidate();
+    this.nature.invalidate();
     this.buildings.invalidate();
   }
 
@@ -261,9 +271,12 @@ export class Renderer {
     this.sun.target.updateMatrixWorld();
 
     this.terrain.update(sim);
+    this.nature.update(sim);
     this.roads.update(sim);
+    this.rails.update(sim);
     this.buildings.update(sim);
     this.buildings.setTimeOfDay(frac);
+    this.agents.setTimeOfDay(frac);
     this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance, tickFraction);
 
     this.renderer.render(this.scene, this.rig.camera);
@@ -291,7 +304,9 @@ export class Renderer {
 
   dispose(): void {
     this.terrain.dispose();
+    this.nature.dispose();
     this.roads.dispose();
+    this.rails.dispose();
     this.buildings.dispose();
     this.agents.dispose();
     // カーソル・プレビュー・経路ラインも自分で捨てる（誰も解放していなかった）。

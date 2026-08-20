@@ -1,4 +1,14 @@
-import { BoxGeometry, Color, InstancedMesh, Matrix4, MeshLambertMaterial, Object3D, Quaternion, Vector3 } from 'three';
+import {
+  BoxGeometry,
+  Color,
+  InstancedMesh,
+  Matrix4,
+  MeshBasicMaterial,
+  MeshLambertMaterial,
+  Object3D,
+  Quaternion,
+  Vector3,
+} from 'three';
 import {
   AGENT_DRAW_DISTANCE_M,
   LANE_OFFSET_M,
@@ -15,7 +25,6 @@ import {
   TERRAIN_HEIGHT_SCALE,
   TILE_M,
   TRAIN_CARS,
-  TRAIN_CAR_LENGTH_M,
   TRAIN_DRAW_DISTANCE_M,
   VEHICLE_DRAW_DISTANCE_M,
 } from '@shared/constants';
@@ -37,6 +46,28 @@ import {
   type TrainHead,
 } from '@sim/network/railLines';
 import { CARGO_COLORS, TRAIN_BODY_COLOR, TRAIN_HEAD_COLOR, carColor, lineColor } from './theme';
+import {
+  BUS_LAMPS,
+  BUS_PARTS,
+  CAR_LAMPS,
+  CAR_PARTS,
+  TRAIN_LAMPS,
+  TRAIN_PARTS,
+  TRUCK_LAMPS,
+  TRUCK_PARTS,
+  type Part,
+  partsGeometry,
+} from './vehicleParts';
+
+/** 夜とみなす時間帯（1 日 0..1）。建物の窓を灯すのと同じ境目にする。 */
+const NIGHT_FROM = 17.5 / 24;
+const NIGHT_TO = 5.5 / 24;
+
+/**
+ * レール面の高さ (m)。線路レイヤが敷くバラスト・枕木・レールの厚みの合計。
+ * 電車の台車をここに載せる。
+ */
+const RAIL_TOP_M = 0.55;
 
 /** 1 フレームで進行方向をどれだけ目標へ寄せるか。1 = 即座（＝スナップ）。 */
 const HEADING_SMOOTHING = 0.15;
@@ -63,7 +94,13 @@ export class AgentLayer {
   private readonly trains: InstancedMesh;
   private readonly trucks: InstancedMesh;
   private readonly buses: InstancedMesh;
-  private readonly materials: MeshLambertMaterial[] = [];
+  /** 夜の灯り（前照灯・尾灯・車内灯）。光源の影響を受けない材質で描く。 */
+  private readonly carLamps: InstancedMesh;
+  private readonly busLamps: InstancedMesh;
+  private readonly truckLamps: InstancedMesh;
+  private readonly trainLamps: InstancedMesh;
+  private night = false;
+  private readonly materials: (MeshLambertMaterial | MeshBasicMaterial)[] = [];
 
   private readonly mat = new Matrix4();
   private readonly pos = new Vector3();
@@ -117,14 +154,57 @@ export class AgentLayer {
 
     // 人は実寸（肩幅 0.55m・身長 1.75m）。近景で見たときに建物や車と
     // 縮尺が合っていないと、街の大きさが読み取れなくなる。
-    // 車両も同様に実寸。箱の長辺は必ず +Z 側（heading をそのまま Y 回転に使うため）。
     this.pedestrians = mk(0.55, 1.75, 0.35, MAX_VISIBLE_AGENTS);
-    this.cars = mk(1.7, 1.45, 4.2, MAX_VISIBLE_VEHICLES);
-    this.trains = mk(2.9, 3.6, TRAIN_CAR_LENGTH_M, MAX_VISIBLE_TRAIN_CARS);
-    this.trucks = mk(2.2, 2.6, 6.5, MAX_VISIBLE_TRUCKS);
+
+    // 車両は部品（車体・窓・屋根・車輪）を焼き込んだジオメトリ 1 つ。
+    // インスタンスは今までどおり 1 台 1 つなので、ドローコールは増えない。
+    // 長辺は必ず +Z 側（heading をそのまま Y 回転に使うため）。
+    this.cars = this.makeVehicle(CAR_PARTS, MAX_VISIBLE_VEHICLES);
+    this.trains = this.makeVehicle(TRAIN_PARTS, MAX_VISIBLE_TRAIN_CARS);
+    this.trucks = this.makeVehicle(TRUCK_PARTS, MAX_VISIBLE_TRUCKS);
     // 路線バス。実車 11m は車 1 台（画面上 4.2＝実車 9 台の車列）の 3 分の 1 ほどだが、
     // それだと近景で車と見分けが付かないので、少し長めに描く。
-    this.buses = mk(2.4, 3.0, 7.5, MAX_VISIBLE_BUSES);
+    this.buses = this.makeVehicle(BUS_PARTS, MAX_VISIBLE_BUSES);
+
+    this.carLamps = this.makeLamps(CAR_LAMPS, MAX_VISIBLE_VEHICLES);
+    this.busLamps = this.makeLamps(BUS_LAMPS, MAX_VISIBLE_BUSES);
+    this.truckLamps = this.makeLamps(TRUCK_LAMPS, MAX_VISIBLE_TRUCKS);
+    this.trainLamps = this.makeLamps(TRAIN_LAMPS, MAX_VISIBLE_TRAIN_CARS);
+  }
+
+  /**
+   * 車両 1 種類ぶんのインスタンス群。
+   *
+   * `vertexColors` を有効にしているが、色属性は**変調係数**として作ってある
+   * （`vehicleParts.ts` 参照）。three.js は `頂点色 × instanceColor` を掛けるので、
+   * 車体色を 1 つ入れるだけで窓もタイヤも一緒に付いてくる。
+   */
+  private makeVehicle(parts: readonly Part[], capacity: number): InstancedMesh {
+    const material = new MeshLambertMaterial({ vertexColors: true });
+    this.materials.push(material);
+    const mesh = new InstancedMesh(partsGeometry(parts), material, capacity);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+    this.meshes.push(mesh);
+    return mesh;
+  }
+
+  /** 夜の灯り。こちらは頂点色をそのまま出す（instanceColor は使わない）。 */
+  private makeLamps(parts: readonly Part[], capacity: number): InstancedMesh {
+    const material = new MeshBasicMaterial({ vertexColors: true });
+    this.materials.push(material);
+    const mesh = new InstancedMesh(partsGeometry(parts), material, capacity);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+    this.meshes.push(mesh);
+    return mesh;
+  }
+
+  /** 時刻を受け取り、夜なら灯りを点ける。 */
+  setTimeOfDay(dayFraction: number): void {
+    this.night = dayFraction >= NIGHT_FROM || dayFraction < NIGHT_TO;
   }
 
   /**
@@ -400,20 +480,23 @@ export class AgentLayer {
           const dz = this.railPose.z - camZ;
           if (dx * dx + dz * dz > maxDist2) continue;
           this.quat.setFromAxisAngle(this.axisY, this.railPose.heading);
-          // 線路は地面より一段高い扱い（軌道敷ぶん）
+          // 車両の原点は台車の上端（＝レール面）。線路レイヤのバラストと枕木の上に
+          // 台車が載るよう、その厚みぶんだけ持ち上げる。
           this.pos.set(
             this.railPose.x,
-            this.groundAt(sim, this.railPose.x, this.railPose.z) + 0.6,
+            this.groundAt(sim, this.railPose.x, this.railPose.z) + RAIL_TOP_M,
             this.railPose.z,
           );
           this.mat.compose(this.pos, this.quat, this.scl);
           this.trains.setMatrixAt(n, this.mat);
           this.color.setHex(carIdx === 0 ? TRAIN_HEAD_COLOR : TRAIN_BODY_COLOR);
           this.trains.setColorAt(n, this.color);
+          if (this.night) this.trainLamps.setMatrixAt(n, this.mat);
           n++;
         }
       }
     }
+    this.trainLamps.count = this.night ? n : 0;
     return n;
   }
 
@@ -496,6 +579,7 @@ export class AgentLayer {
         const returning = t.alive[owner] === 1 && t.state[owner] === TruckState.Returning;
         this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[owner]!] ?? CARGO_COLORS[0]!);
         this.trucks.setColorAt(truck, this.color);
+        if (this.night) this.truckLamps.setMatrixAt(truck, this.mat);
         truck++;
       } else if (isBus) {
         // 車体は路線の色。路線一覧の色と揃えてあるので、
@@ -503,15 +587,21 @@ export class AgentLayer {
         this.buses.setMatrixAt(bus, this.mat);
         this.color.setHex(lineColor(sim.transit.lineOfBus(owner)));
         this.buses.setColorAt(bus, this.color);
+        if (this.night) this.busLamps.setMatrixAt(bus, this.mat);
         bus++;
       } else {
         this.cars.setMatrixAt(car, this.mat);
         this.color.setHex(carColor((owner * 2654435761) >>> 0));
         this.cars.setColorAt(car, this.color);
+        if (this.night) this.carLamps.setMatrixAt(car, this.mat);
         car++;
       }
     });
     this.buses.count = bus;
+    // 灯りは走行中の車両にだけ点ける。この後ろに続く路上駐車は消灯したまま。
+    this.carLamps.count = this.night ? car : 0;
+    this.busLamps.count = this.night ? bus : 0;
+    this.truckLamps.count = this.night ? truck : 0;
     return { cars: car, trucks: truck };
   }
 

@@ -200,9 +200,13 @@ export class TerrainMesh {
         break;
     }
 
-    // 道路・線路
+    // 道路
     if (world.road[t] !== RoadClass.None) return zoneColor(-1).setHex(ROAD_COLORS[world.road[t]!]!);
-    if (world.rail[t] !== 0) return zoneColor(-1).setHex(0x5a5048);
+    // 線路タイルは塗らない。以前はここで軌道敷の色（濃い茶）に塗りつぶしていたが、
+    // 線路レイヤがバラストを実寸で敷くようになったので、そのままだと
+    // 幅 4.6m のバラストの両脇に、幅 2.7m ずつの濃い茶色が残って
+    // 「妙に広い土手」に見える。地面は地形の色のままにして、
+    // 軌道はレイヤの造形だけで表す。
 
     // 田んぼは季節で色が変わる。街の時間経過が一番わかりやすく伝わる要素。
     if (world.zone[t] === Zone.AgriPaddy) return zoneColor(-1).setHex(PADDY_SEASON_COLORS[season]!);
