@@ -1,4 +1,4 @@
-import { TICKS_PER_DAY } from '@shared/constants';
+import { TICKS_PER_DAY, TICKS_PER_SECOND_AT_1X } from '@shared/constants';
 import { GOOD_NAMES_JA, Good, MODE_NAMES_JA } from '@shared/enums';
 import { buildScenario } from './scenario';
 import { Simulation } from './simulation';
@@ -215,11 +215,24 @@ function main(): void {
     console.log(`${GOOD_NAMES_JA[g as Good]!.padEnd(6, '　')}: 在庫 ${stock.toFixed(0).padStart(8)}  時間生産 ${prod.toFixed(1).padStart(7)}`);
   }
 
+  console.log(`路線              : ${s.transit.lines} 系統 / 車両 ${s.transit.vehicles} 台（1 日の乗車 ${s.transit.boardingsToday.toLocaleString('ja-JP')}）`);
+  const u = s.utilities;
+  console.log(
+    `電気・水道        : 電力 ${Math.round(u.powerSupplyKw)}/${Math.round(u.powerDemandKw)} kW / ` +
+      `上水 ${Math.round(u.waterSupply)}/${Math.round(u.waterDemand)} m3 / ` +
+      `下水 ${Math.round(u.sewageCapacity)}/${Math.round(u.sewageDemand)} m3`,
+  );
+  console.log(`  停電/断水/停止  : ${u.unpowered} / ${u.unwatered} / ${u.shutdown} 棟`);
+
   console.log('\n----- 性能 -----');
   console.log(`1 tick の平均処理時間: ${tickMsAvg.toFixed(3)} ms`);
   console.log(`グラフ: ${sim.graph.nodeCount} ノード / ${sim.graph.edgeCount} エッジ`);
-  // ×10 速度は 12 tick/秒 × 10 = 120 tick/秒。60fps なら 1 フレームあたり 2 tick。
-  console.log(`（×10 速度 = 120 tick/秒。60fps なら 1 フレーム 2 tick で ${(tickMsAvg * 2).toFixed(2)} ms）`);
+  // ×1 は 0.75 tick/秒（TICKS_PER_SECOND_AT_1X）なので、×20 でも 15 tick/秒。
+  // 60fps なら 4 フレームに 1 tick で、1 フレームの予算 16.7ms に対して余裕がある。
+  const ticksPerSec = TICKS_PER_SECOND_AT_1X * 20;
+  console.log(
+    `（×20 速度 = ${ticksPerSec} tick/秒。1 秒あたり ${(tickMsAvg * ticksPerSec).toFixed(2)} ms を消費）`,
+  );
 
   const monthly = sim.budget.history[sim.budget.history.length - 1];
   if (monthly) {

@@ -7,6 +7,7 @@ import {
   TRAIN_CAR_LENGTH_M,
 } from '@shared/constants';
 import { ModeBit } from '@shared/enums';
+import { idx, inBounds, tileX, tileY } from '@sim/world/tiles';
 import { Graph, NodeKind } from './graph';
 
 /**
@@ -72,11 +73,24 @@ function railNeighbors(graph: Graph, u: number, out: Int32Array): number {
   return n;
 }
 
-/** ノードに駅への乗降エッジが生えているか。 */
+/**
+ * 線路ノードの周囲 2 タイルに駅があるか。
+ *
+ * 以前は「Board エッジが生えているか」で見ていた。駅から線路ノードへ直接
+ * 乗降エッジが張られていた頃はそれで正しかったが、乗車は路線のプラットフォームを
+ * 経由するようになり、線路ノードには乗降エッジが 1 本も生えなくなった。
+ * そのまま放置すると全線が served=false になり、電車が 1 本も描かれなくなる。
+ * 判定の中身（駅から 2 タイル以内）は graph.build の徒歩接続と同じ範囲に揃えてある。
+ */
 function hasStation(graph: Graph, u: number): boolean {
-  const e1 = graph.edgeStart[u + 1]!;
-  for (let e = graph.edgeStart[u]!; e < e1; e++) {
-    if (graph.edgeMask[e]! & ModeBit.Board) return true;
+  const t = graph.nodeTile[u]!;
+  const x = tileX(t);
+  const y = tileY(t);
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      if (!inBounds(x + dx, y + dy)) continue;
+      if (graph.stationNodeAt[idx(x + dx, y + dy)]! >= 0) return true;
+    }
   }
   return false;
 }

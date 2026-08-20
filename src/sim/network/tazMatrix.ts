@@ -24,6 +24,14 @@ export class TazMatrix {
   readonly repNode = new Int32Array(TAZ_COUNT).fill(-1);
 
   private cursor = 0;
+
+  /** 再計算の走査位置。セーブ／ロードで復元する。 */
+  get scanCursor(): number {
+    return this.cursor;
+  }
+  set scanCursor(v: number) {
+    this.cursor = Math.max(0, Math.floor(v));
+  }
   private dist = new Float64Array(0);
   private heap = new BinaryHeap(4096);
   /** 全 TAZ を一巡した回数。 */

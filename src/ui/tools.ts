@@ -1,4 +1,4 @@
-import { OVERLAY_NAMES_JA, Overlay, ROAD_NAMES_JA, RoadClass, ZONE_NAMES_JA, Zone } from '@shared/enums';
+import { OVERLAY_NAMES_JA, OneWay, Overlay, ROAD_NAMES_JA, RoadClass, TransitKind, ZONE_NAMES_JA, Zone } from '@shared/enums';
 import { Arch, PLACEABLE, archetype } from '@sim/buildings/archetypes';
 import type { Command } from '@sim/commands';
 import { forEachInRect, lineTiles, tileX, tileY } from '@sim/world/tiles';
@@ -20,6 +20,10 @@ export const ToolKind = {
   Place: 'place',
   Bulldoze: 'bulldoze',
   RouteProbe: 'route',
+  /** 一方通行。なぞった向きに設定する。 */
+  OneWay: 'oneway',
+  /** 路線を引く。停留所を順にクリックして確定する（1 ドラッグ 1 コマンドではない）。 */
+  TransitLine: 'line',
 } as const;
 export type ToolKind = (typeof ToolKind)[keyof typeof ToolKind];
 
@@ -28,6 +32,8 @@ export interface ToolState {
   roadClass: RoadClass;
   zone: Zone;
   archetypeId: number;
+  /** 路線ツールで引く路線の種別。 */
+  transitKind: TransitKind;
 }
 
 export function initialToolState(): ToolState {
@@ -36,6 +42,7 @@ export function initialToolState(): ToolState {
     roadClass: RoadClass.Street,
     zone: Zone.ResidentialLow,
     archetypeId: Arch.Park,
+    transitKind: TransitKind.Bus,
   };
 }
 
@@ -64,7 +71,7 @@ export interface ToolCategory {
 const yen = (v: number): string => (v >= 10000 ? `${Math.round(v / 10000).toLocaleString('ja-JP')}万円` : `${v}円`);
 
 import { ROAD_BUILD_COST } from '@shared/enums';
-import { RAIL_BUILD_COST } from '@shared/constants';
+import { BUS_STOP_COST, RAIL_BUILD_COST } from '@shared/constants';
 import { ZONE_COLORS } from '@render/theme';
 
 export const TOOL_CATEGORIES: ToolCategory[] = [
@@ -107,6 +114,32 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
         costJa: yen(archetype(Arch.Station).buildCost),
         unlock: `place:${Arch.Station}` as UnlockKey,
         apply: { kind: ToolKind.Place, archetypeId: Arch.Station },
+      },
+    ],
+  },
+  {
+    key: 'cat:transit',
+    labelJa: '路線',
+    icon: '🚌',
+    items: [
+      {
+        key: 'tool:line:bus',
+        labelJa: 'バス路線',
+        costJa: `${yen(BUS_STOP_COST)}/停留所`,
+        unlock: `road:${RoadClass.Street}` as UnlockKey,
+        apply: { kind: ToolKind.TransitLine, transitKind: TransitKind.Bus },
+      },
+      {
+        key: 'tool:line:train',
+        labelJa: '電車の路線',
+        unlock: 'rail',
+        apply: { kind: ToolKind.TransitLine, transitKind: TransitKind.Train },
+      },
+      {
+        key: 'tool:oneway',
+        labelJa: '一方通行',
+        unlock: `road:${RoadClass.Avenue}` as UnlockKey,
+        apply: { kind: ToolKind.OneWay },
       },
     ],
   },
@@ -163,6 +196,8 @@ export const OVERLAY_ITEMS: { key: string; labelJa: string; overlay: Overlay }[]
   Overlay.Traffic,
   Overlay.Pollution,
   Overlay.TransitAccess,
+  Overlay.Power,
+  Overlay.Water,
 ].map((o) => ({ key: `overlay:${o}`, labelJa: OVERLAY_NAMES_JA[o]!, overlay: o }));
 
 /** ドラッグ中のプレビュー対象タイル。 */
@@ -170,6 +205,7 @@ export function previewTiles(state: ToolState, from: number, to: number): number
   switch (state.kind) {
     case ToolKind.Road:
     case ToolKind.Rail:
+    case ToolKind.OneWay:
       // 道路と線路は L 字の直線で引く（斜めの道路は作らない）
       return lineTiles(from, to);
     case ToolKind.Zone:
@@ -186,6 +222,19 @@ export function previewTiles(state: ToolState, from: number, to: number): number
 }
 
 /** ドラッグ確定時に発行するコマンド。 */
+/**
+ * ドラッグの向き。一方通行はこの向きに通す。
+ * 斜めに引かれたら、長い方の成分を採る（L 字にタイルを並べるのと同じ考え方）。
+ * 始点と終点が同じなら 0 ＝ 解除。
+ */
+export function dragDirection(from: number, to: number): number {
+  const dx = tileX(to) - tileX(from);
+  const dy = tileY(to) - tileY(from);
+  if (dx === 0 && dy === 0) return OneWay.None;
+  if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? OneWay.East : OneWay.West;
+  return dy > 0 ? OneWay.South : OneWay.North;
+}
+
 export function commandFor(state: ToolState, from: number, to: number): Command | null {
   const tiles = previewTiles(state, from, to);
   if (tiles.length === 0) return null;
@@ -200,6 +249,8 @@ export function commandFor(state: ToolState, from: number, to: number): Command 
       return { t: 'bulldoze', tiles };
     case ToolKind.Place:
       return { t: 'placeBuilding', archetype: state.archetypeId, tile: tiles[0]! };
+    case ToolKind.OneWay:
+      return { t: 'setOneWay', dir: dragDirection(from, to), tiles };
     default:
       return null;
   }
@@ -222,6 +273,12 @@ export function hintFor(state: ToolState): string {
       return '撤去：ドラッグした範囲の建物・道路・線路・用途地域を消します';
     case ToolKind.RouteProbe:
       return '経路確認：2 点をクリックすると、その間の経路を地図に描きます';
+    case ToolKind.OneWay:
+      return '一方通行：通したい向きにドラッグ。同じ場所をクリックすると解除します（歩行者と自転車は逆向きにも通れます）';
+    case ToolKind.TransitLine:
+      return state.transitKind === TransitKind.Bus
+        ? 'バス路線：道路を順にクリックして停留所を置き、Enter（または最後の停留所をもう一度クリック）で確定します'
+        : '電車の路線：駅を順にクリックし、Enter（または最後の駅をもう一度クリック）で確定します';
     case ToolKind.Select:
     default:
       return '情報：移動中の市民や建物をクリックすると詳細が出ます';

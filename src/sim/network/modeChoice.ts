@@ -37,7 +37,7 @@ export interface TravelerProfile {
   prefWalk: number;
   prefBike: number;
   prefCar: number;
-  prefRail: number;
+  prefTransit: number;
   /** 月収（円）。時間価値に効く。 */
   incomeYenMo: number;
   age: number;
@@ -69,8 +69,8 @@ function preferenceOf(p: TravelerProfile, mode: Mode): number {
       return p.prefBike;
     case Mode.Car:
       return p.prefCar;
-    case Mode.Rail:
-      return p.prefRail;
+    case Mode.Transit:
+      return p.prefTransit;
     default:
       return 0;
   }
@@ -81,7 +81,7 @@ function fareYen(mode: Mode, meters: number, p: TravelerProfile, purpose: Purpos
   switch (mode) {
     case Mode.Car:
       return km * CAR_COST_PER_KM_YEN;
-    case Mode.Rail: {
+    case Mode.Transit: {
       // 定期券があれば通勤・通学の運賃は 0。
       if (p.hasTransitPass && (purpose === 0 || purpose === 1)) return 0;
       return Math.min(RAIL_FARE_CAP_YEN, RAIL_FARE_BASE_YEN + km * RAIL_FARE_PER_KM_YEN);

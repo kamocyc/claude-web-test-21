@@ -19,13 +19,14 @@ import {
   BufferAttribute,
 } from 'three';
 import { MAP_H, MAP_W, MAX_PREVIEW_TILES, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
-import type { Overlay } from '@shared/enums';
+import { Overlay } from '@shared/enums';
 import type { Path } from '@sim/network/pathfinder';
 import type { Simulation } from '@sim/simulation';
 import { idx } from '@sim/world/tiles';
 import { AgentLayer } from './agentLayer';
 import { BuildingLayer } from './buildingLayer';
 import { CameraRig } from './cameraRig';
+import { RoadLayer } from './roadLayer';
 import { TerrainMesh } from './terrainMesh';
 import { PREVIEW_BAD_COLOR, PREVIEW_OK_COLOR, skyColor, sunIntensity } from './theme';
 
@@ -40,6 +41,7 @@ export class Renderer {
   readonly rig: CameraRig;
   private readonly renderer: WebGLRenderer;
   private readonly terrain = new TerrainMesh();
+  private readonly roads = new RoadLayer();
   private readonly buildings = new BuildingLayer();
   private readonly agents = new AgentLayer();
   private readonly sun: DirectionalLight;
@@ -78,6 +80,7 @@ export class Renderer {
     this.scene.add(this.sun);
 
     this.scene.add(this.terrain.group);
+    this.scene.add(this.roads.group);
     this.scene.add(this.buildings.group);
     this.scene.add(this.agents.group);
 
@@ -118,6 +121,9 @@ export class Renderer {
 
   setOverlay(o: Overlay): void {
     this.terrain.setOverlay(o);
+    // 情報表示のときは道路の造形を隠す。車道の板がヒートマップを覆ってしまい、
+    // 「どの道が混んでいるか」というオーバーレイ本来の役目が果たせなくなる。
+    this.roads.setVisible(o === Overlay.None);
   }
 
   get overlay(): Overlay {
@@ -132,6 +138,7 @@ export class Renderer {
   /** 世界そのものが差し替わった（セーブデータの読み込み）ときに、全部作り直させる。 */
   invalidateAll(): void {
     this.terrain.invalidateAll();
+    this.roads.invalidate();
     this.buildings.invalidate();
   }
 
@@ -230,7 +237,8 @@ export class Renderer {
 
   /**
    * @param tickFraction 直近 tick からの端数 (0..1)。エージェントの補間に使う。
-   *   これが無いと 12 tick/秒のシミュレーションのカクつきがそのまま見える。
+   *   これが無いと、×1 で 0.75 tick/秒しか進まないシミュレーションのカクつきが
+   *   そのまま見える（1 秒に 1 コマも動かない）。
    */
   render(sim: Simulation, dt: number, tickFraction = 0): void {
     this.rig.update(dt);
@@ -253,7 +261,9 @@ export class Renderer {
     this.sun.target.updateMatrixWorld();
 
     this.terrain.update(sim);
+    this.roads.update(sim);
     this.buildings.update(sim);
+    this.buildings.setTimeOfDay(frac);
     this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance, tickFraction);
 
     this.renderer.render(this.scene, this.rig.camera);
@@ -281,8 +291,14 @@ export class Renderer {
 
   dispose(): void {
     this.terrain.dispose();
+    this.roads.dispose();
     this.buildings.dispose();
     this.agents.dispose();
+    // カーソル・プレビュー・経路ラインも自分で捨てる（誰も解放していなかった）。
+    for (const o of [this.cursor, this.preview, this.routeLine]) {
+      o.geometry.dispose();
+      (o.material as { dispose(): void }).dispose();
+    }
     this.renderer.dispose();
   }
 

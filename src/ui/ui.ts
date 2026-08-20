@@ -84,7 +84,16 @@ export class Ui {
   private celebrateUntil = 0;
 
   selectedCitizen = -1;
-  selectedBuilding = -1;
+  /**
+   * 選択中の建物。**世代タグ付きのハンドル**で持つ（生スロットではない）。
+   *
+   * 生スロットで持っていたときは、選択した建物が撤去・廃墟化して
+   * 同じスロットが再利用されると、インスペクタが黙って別の建物を
+   * 「選択中」として表示し続けていた。`BuildingStore` のコメントが
+   * 「世代タグを見ないと確実に踏むバグ」と書いているとおりの症状で、
+   * UI だけがその規約から外れていた。
+   */
+  selectedBuilding = 0;
 
   constructor(root: HTMLElement, tool: ToolState, cb: UiCallbacks) {
     this.root = root;
@@ -500,7 +509,7 @@ export class Ui {
   }
 
   private renderInspector(sim: Simulation): void {
-    if (this.selectedCitizen < 0 && this.selectedBuilding < 0) {
+    if (this.selectedCitizen < 0 && this.selectedBuilding === 0) {
       this.inspector.style.display = 'none';
       return;
     }
@@ -541,7 +550,7 @@ export class Ui {
       this.inspector.appendChild(el('hr'));
       this.inspector.appendChild(el('h3', undefined, '交通手段の好み（体感分）'));
       row('徒歩 / 自転車', `${c.prefWalk[id]} / ${c.prefBike[id]}`);
-      row('自動車 / 鉄道', `${c.prefCar[id]} / ${c.prefRail[id]}`);
+      row('自動車 / 鉄道', `${c.prefCar[id]} / ${c.prefTransit[id]}`);
 
       const explain = sim.activity.lastChoiceExplanation;
       if (explain) {
@@ -577,12 +586,12 @@ export class Ui {
     }
 
     // --- 建物 ---
-    const slot = this.selectedBuilding;
-    if (sim.buildings.alive[slot] !== 1) {
-      this.selectedBuilding = -1;
+    if (!sim.buildings.valid(this.selectedBuilding)) {
+      this.selectedBuilding = 0;
       this.inspector.style.display = 'none';
       return;
     }
+    const slot = handleSlot(this.selectedBuilding);
     const a = archetype(sim.buildings.archetypeId[slot]!);
     this.inspector.appendChild(el('div', 'title', `${a.nameJa}（Lv${sim.buildings.level[slot]}）`));
     row('用途地域', ZONE_NAMES_JA[a.zone] ?? '—');
@@ -613,7 +622,7 @@ export class Ui {
     this.inspector.appendChild(el('hr'));
     this.inspector.appendChild(
       btn('閉じる', () => {
-        this.selectedBuilding = -1;
+        this.selectedBuilding = 0;
       }),
     );
   }
@@ -664,6 +673,36 @@ export class Ui {
     );
     row('所要時間の倍率', `×${tf.avgDelay.toFixed(2)}`, tf.avgDelay > 1.5 ? 'bad' : tf.avgDelay > 1.2 ? 'warn' : undefined);
 
+    head('公共交通');
+    const tr = s.transit;
+    row('路線', `${tr.lines} 系統`);
+    row('車両', `${tr.vehicles} 台（走行中のバス ${tr.busesRunning}）`);
+    row('今日の乗車', tr.boardingsToday.toLocaleString('ja-JP'));
+
+    head('電気・水道');
+    const u = s.utilities;
+    const ratio = (supply: number, demand: number): string =>
+      demand <= 0 ? '—' : `${Math.round((supply / demand) * 100)}%`;
+    const level = (supply: number, demand: number): 'bad' | 'warn' | undefined =>
+      demand <= 0 ? undefined : supply < demand ? 'bad' : supply < demand * 1.15 ? 'warn' : undefined;
+    row(
+      '電力',
+      `${Math.round(u.powerSupplyKw).toLocaleString('ja-JP')} / ${Math.round(u.powerDemandKw).toLocaleString('ja-JP')} kW（${ratio(u.powerSupplyKw, u.powerDemandKw)}）`,
+      level(u.powerSupplyKw, u.powerDemandKw),
+    );
+    row(
+      '上水',
+      `${Math.round(u.waterSupply).toLocaleString('ja-JP')} / ${Math.round(u.waterDemand).toLocaleString('ja-JP')} m³（${ratio(u.waterSupply, u.waterDemand)}）`,
+      level(u.waterSupply, u.waterDemand),
+    );
+    row(
+      '下水処理',
+      `${Math.round(u.sewageCapacity).toLocaleString('ja-JP')} / ${Math.round(u.sewageDemand).toLocaleString('ja-JP')} m³（${ratio(u.sewageCapacity, u.sewageDemand)}）`,
+      level(u.sewageCapacity, u.sewageDemand),
+    );
+    row('停電・断水', `${u.unpowered} / ${u.unwatered} 棟`, u.unpowered + u.unwatered > 0 ? 'warn' : undefined);
+    row('機能停止', `${u.shutdown} 棟`, u.shutdown > 0 ? 'bad' : undefined);
+
     head('産業・物流');
     for (let g = 1; g < 7; g++) {
       row(GOOD_NAMES_JA[g]!, `${Math.round(s.goodsStock[g] ?? 0).toLocaleString('ja-JP')} (時 +${(s.goodsProduced[g] ?? 0).toFixed(0)})`);
@@ -682,6 +721,7 @@ export class Ui {
     row('収入 合計', man(f.income), 'good');
     row('道路 維持', `-${man(f.upkeepRoads)}`);
     row('鉄道 維持', `-${man(f.upkeepRail)}`);
+    row('運行 維持', `-${man(f.upkeepTransit)}`);
     row('施設 維持', `-${man(f.upkeepServices)}`);
     row('支出 合計', `-${man(f.expense)}`, 'bad');
     row('収支', `${f.net >= 0 ? '+' : ''}${man(f.net)}`, f.net < 0 ? 'bad' : 'good');

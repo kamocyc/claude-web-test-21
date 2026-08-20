@@ -25,6 +25,8 @@ export interface Accrual {
   incomeAgriculture: number;
   upkeepRoads: number;
   upkeepRail: number;
+  /** 公共交通の運行費（車両数 × 1 台あたりの月次）。運行間隔を縮めるほど重くなる。 */
+  upkeepTransit: number;
   upkeepServices: number;
   income: number;
   expense: number;
@@ -46,6 +48,7 @@ export function emptyAccrual(): Accrual {
     incomeAgriculture: 0,
     upkeepRoads: 0,
     upkeepRail: 0,
+    upkeepTransit: 0,
     upkeepServices: 0,
     income: 0,
     expense: 0,
@@ -101,7 +104,7 @@ export class Budget {
    * 決算と切り離してあるのは、プレイヤに「今の収支」を常時見せるため。
    * 集計しながら revenueYen をゼロにしていた頃は、月末にならないと収支が分からなかった。
    */
-  accrue(world: World, buildings: BuildingStore, citizens: CitizenStore): Accrual {
+  accrue(world: World, buildings: BuildingStore, citizens: CitizenStore, transitUpkeep = 0): Accrual {
     const a = emptyAccrual();
     let incomeResidential = 0;
     let incomeCommercial = 0;
@@ -166,16 +169,23 @@ export class Budget {
     a.incomeAgriculture = incomeAgriculture;
     a.upkeepRoads = this.upkeepCache.roads;
     a.upkeepRail = this.upkeepCache.rail;
+    a.upkeepTransit = transitUpkeep;
     a.upkeepServices = upkeepServices;
     a.income = incomeResidential + incomeCommercial + incomeIndustrial + incomeAgriculture;
-    a.expense = a.upkeepRoads + a.upkeepRail + a.upkeepServices;
+    a.expense = a.upkeepRoads + a.upkeepRail + a.upkeepTransit + a.upkeepServices;
     a.net = a.income - a.expense;
     return a;
   }
 
   /** 月次決算。集計をコミットして売上台帳をリセットする。 */
-  closeMonth(world: World, buildings: BuildingStore, citizens: CitizenStore, month: number): MonthlyReport {
-    const a = this.accrue(world, buildings, citizens);
+  closeMonth(
+    world: World,
+    buildings: BuildingStore,
+    citizens: CitizenStore,
+    month: number,
+    transitUpkeep = 0,
+  ): MonthlyReport {
+    const a = this.accrue(world, buildings, citizens, transitUpkeep);
     for (const s of buildings.each()) buildings.revenueYen[s] = 0;
 
     this.cash += a.net;

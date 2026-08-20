@@ -360,3 +360,60 @@ describe('タイル座標', () => {
     }
   });
 });
+
+describe('スカラー場のぼかし', () => {
+  it('公害が発生源を中心に対称に広がる（ぼかしが自分の出力を読み直さない）', () => {
+    const sim = new Simulation(7);
+    const w = sim.world;
+    // 平地だけの区画を作り、真ん中に公害源を 1 つ置く。
+    const cx = 60;
+    const cy = 60;
+    for (let y = cy - 20; y <= cy + 20; y++) {
+      for (let x = cx - 20; x <= cx + 20; x++) {
+        const t = idx(x, y);
+        w.terrain[t] = 0;
+        w.slope[t] = 0;
+      }
+    }
+    sim.budget.cash = 1e9;
+    for (let x = cx - 6; x <= cx + 6; x++) sim.enqueue({ t: 'buildRoad', cls: RoadClass.Street, tiles: [idx(x, cy)] });
+    sim.flushCommands();
+    sim.enqueue({ t: 'placeBuilding', archetype: Arch.Factory, tile: idx(cx, cy + 1) });
+    sim.flushCommands();
+    run(sim, 2);
+
+    // 発生源から南北に同じ距離だけ離れた 2 点は、同じ値になるはず。
+    // ぼかしの縦パスが自分の出力を読み直していたときは、南側だけに尾を引いていた。
+    const origin = idx(cx, cy + 1);
+    let asym = 0;
+    for (let d = 2; d <= 8; d++) {
+      const north = w.pollution[origin - d * 320]!;
+      const south = w.pollution[origin + d * 320]!;
+      asym = Math.max(asym, Math.abs(north - south));
+    }
+    expect(asym).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('セーブデータの忠実さ', () => {
+  it('保存して読み込んだ街と、そのまま進めた街が同じように進む', () => {
+    const a = new Simulation(11);
+    a.bootstrap();
+    flatDistrict(a, 40, 40, 24, Zone.ResidentialLow);
+    a.budget.cash = 1e9;
+    run(a, 3);
+
+    const snap = a.snapshot();
+    const b = new Simulation(11);
+    b.restoreSnapshot(snap);
+    // 読み込んだ直後の状態が一致していること。
+    expect(b.stateHash()).toBe(a.stateHash());
+
+    // ここからが本題。走査カーソルのような「保存し忘れると
+    // 次の 1 tick の中身が変わる」状態を炙り出す。
+    run(a, 2);
+    run(b, 2);
+    expect(b.citizens.count()).toBe(a.citizens.count());
+    expect(b.stateHash()).toBe(a.stateHash());
+  });
+});

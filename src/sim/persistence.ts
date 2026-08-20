@@ -15,8 +15,13 @@
  */
 
 const MAGIC = 'JCITY1\0\0';
-/** 形式のバージョン。上げたら古いセーブデータは読めないものとして扱う。 */
-export const SAVE_FORMAT_VERSION = 1;
+/**
+ * 形式のバージョン。上げたら古いセーブデータは読めないものとして扱う。
+ *
+ * v2: 公共交通を路線ベースにした版。市民の選好配列が `prefRail` → `prefTransit` に
+ * 変わり、`head` に走査カーソルと路線が入った。
+ */
+export const SAVE_FORMAT_VERSION = 2;
 
 export interface SaveMeta {
   cityName: string;

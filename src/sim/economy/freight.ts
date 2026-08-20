@@ -14,7 +14,7 @@ import { tazOf } from '@sim/world/tiles';
  * 物流。消費側の在庫が減ったら発注し、供給側からトラックが出る。
  *
  * 重要なのは、トラックが市民と同じ道路グラフを A* で走り、**同じ交通流に載る**こと。
- * トラックも交差点で信号待ちし、乗用車 2.5 台ぶんの枠を食う。つまり工場を市街地の
+ * トラックも交差点で信号待ちし、道路の枠を食う（`TRUCK_PLATOON_EQUIV`）。つまり工場を市街地の
  * 反対側に置けば、その物流が実際に通勤路を詰まらせる。悪い都市計画が渋滞として返る。
  */
 
@@ -114,6 +114,14 @@ export class FreightSystem {
   /** 入力を必要とする建物のリストと、走査位置。 */
   private consumers: number[] = [];
   private cursor = 0;
+
+  /** 発注の走査位置。セーブ／ロードで復元する。 */
+  get scanCursor(): number {
+    return this.cursor;
+  }
+  set scanCursor(v: number) {
+    this.cursor = Math.max(0, Math.floor(v));
+  }
   /** 稼働中トラック数（O(n) の再カウントを避けるため増減で持つ）。 */
   private activeTrucks = 0;
   /**
@@ -362,9 +370,17 @@ export class FreightSystem {
     const to = this.trucks.toSlot[truck]!;
 
     if (aborted) {
-      if (this.trucks.state[truck] === TruckState.Outbound && buildings.alive[from] === 1) {
-        buildings.outAmt[from] = buildings.outAmt[from]! + this.trucks.amount[truck]!;
+      if (this.trucks.state[truck] === TruckState.Outbound) {
+        // 輸送中の予約を必ず落とす。**供給元が生きているかどうかとは無関係**。
+        // 以前は荷物を返す処理と一緒に alive の内側にあったので、供給元が
+        // 撤去・廃業していると予約が残り続け、その消費建物は
+        // 「もう来る予定がある」と判断して二度と発注しなくなっていた（＝静かに餓死する）。
+        // 道路を 1 マス編集するだけで走行中のトラックは全部中断されるので、
+        // 供給元の取り壊しと同時なら確実に踏む。
         this.clearTransit(truck);
+        if (buildings.alive[from] === 1) {
+          buildings.outAmt[from] = buildings.outAmt[from]! + this.trucks.amount[truck]!;
+        }
       }
       this.trucks.free(truck);
       this.activeTrucks--;

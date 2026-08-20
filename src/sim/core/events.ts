@@ -14,6 +14,7 @@ export type AlertKind =
   | 'budgetDeficit' // 赤字
   | 'noPath' // 経路なし
   | 'congestion' // 渋滞
+  | 'outage' // 停電・断水
   | 'info'; // 操作の結果の通知（保存・読み込みなど）
 
 export type SimEvent =

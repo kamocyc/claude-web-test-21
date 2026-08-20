@@ -7,7 +7,7 @@ import {
   TICKS_PER_SECOND_AT_1X,
   TILE_M,
 } from '@shared/constants';
-import { Activity, Mode, Overlay, RoadClass, TERRAIN_NAMES_JA, ZONE_NAMES_JA, Zone } from '@shared/enums';
+import { Activity, Mode, ONE_WAY_NAMES_JA, OneWay, Overlay, RoadClass, TERRAIN_NAMES_JA, ZONE_NAMES_JA, Zone } from '@shared/enums';
 import { Renderer } from '@render/renderer';
 import { citizenPosition } from '@sim/agents/activity';
 import { archetype } from '@sim/buildings/archetypes';
@@ -16,7 +16,7 @@ import { decodeSave, encodeSave, type SaveMeta } from '@sim/persistence';
 import { buildScenario, findCityCenter } from '@sim/scenario';
 import { idx, tileX, tileY } from '@sim/world/tiles';
 import { Ui } from '@ui/ui';
-import { ToolKind, commandFor, costOf, initialToolState, previewTiles } from '@ui/tools';
+import { ToolKind, commandFor, costOf, dragDirection, initialToolState, previewTiles } from '@ui/tools';
 import { AUTO_SLOT, defaultFileName, downloadSave, pickSaveFile, putSave } from '@ui/storage';
 
 /**
@@ -137,7 +137,7 @@ export class App {
 
     this.ui.cityName = meta.cityName;
     this.ui.selectedCitizen = -1;
-    this.ui.selectedBuilding = -1;
+    this.ui.selectedBuilding = 0;
     this.followCitizen = -1;
     this.probeFrom = -1;
     this.dragStart = -1;
@@ -253,9 +253,11 @@ export class App {
       if (e.key >= '1' && e.key <= '4') {
         this.setSpeed([0, 1, 4, 20][Number(e.key) - 1]!);
       }
+      if (e.key === 'Enter') this.commitLine();
       if (e.key === 'Escape') {
+        this.lineStops.length = 0;
         this.ui.selectedCitizen = -1;
-        this.ui.selectedBuilding = -1;
+        this.ui.selectedBuilding = 0;
         this.followCitizen = -1;
         this.probeFrom = -1;
         this.renderer.showRoute(null, this.sim);
@@ -263,10 +265,16 @@ export class App {
     });
   }
 
+  /**
+   * キーボード（数字キー・スペース）からの速度変更。
+   * コマンドを積むのを忘れないこと — 「シード + コマンド列で同じ街が再現できる」
+   * という前提が、ここだけ抜けていると成立しなくなる。
+   */
   private setSpeed(s: number): void {
     this.speed = s;
     this.ui.currentSpeed = s;
     this.ui.setSpeed(s);
+    this.sim.enqueue({ t: 'setSpeed', speed: s });
   }
 
   /**
@@ -276,6 +284,42 @@ export class App {
    * 「どこからどこまで敷かれるのか」が確定するまで分からなかった。
    * 敷ける／敷けないもタイルごとに色で返す（斜面や水面は赤くなる）。
    */
+  /**
+   * ドラッグ範囲のタイル列。**1 フレームに 1 回だけ計算する。**
+   *
+   * `updatePreview()` と `updateCursorTip()` が毎フレーム別々に呼んでいたので、
+   * マップ端から端まで矩形をドラッグすると 10 万タイルの配列を 1 フレームに
+   * 2 本作り、`canZone` を 20 万回評価していた（そのうち描くのは先頭 4096 枚だけ）。
+   */
+  private previewCache: { key: string; tiles: number[] } | null = null;
+
+  /** 路線ツールで押していった停留所。確定するまでコマンドにしない。 */
+  private lineStops: number[] = [];
+
+  /** 集めた停留所で路線を作る。2 箇所未満なら黙って捨てる。 */
+  private commitLine(): void {
+    if (this.lineStops.length < 2) {
+      this.lineStops.length = 0;
+      return;
+    }
+    this.sim.enqueue({
+      t: 'createLine',
+      kind: this.ui.tool.transitKind,
+      stops: [...this.lineStops],
+    });
+    this.ui.pushAlert(`${this.lineStops.length} 箇所の路線を作りました`, 'info');
+    this.lineStops.length = 0;
+  }
+
+  private dragTiles(): number[] {
+    const tool = this.ui.tool;
+    const key = `${tool.kind}:${tool.zone}:${tool.archetypeId}:${this.dragStart}:${this.hoverTile}`;
+    if (this.previewCache && this.previewCache.key === key) return this.previewCache.tiles;
+    const tiles = previewTiles(tool, this.dragStart, this.hoverTile);
+    this.previewCache = { key, tiles };
+    return tiles;
+  }
+
   private updatePreview(): void {
     const t = this.hoverTile;
     if (t < 0) {
@@ -309,11 +353,18 @@ export class App {
       this.renderer.setPreviewTiles([], null);
       return;
     }
-    const tiles = previewTiles(tool, this.dragStart, t);
+    if (tool.kind === ToolKind.TransitLine) {
+      // 押した停留所を光らせておく。何箇所まで置いたかが地図の上で分かる。
+      const stops = [...this.lineStops, t];
+      this.renderer.setPreviewTiles(stops, w, stops.map(() => true));
+      return;
+    }
+    const tiles = this.dragTiles();
     const flags = tiles.map((i) => {
       if (tool.kind === ToolKind.Road) return w.canBuildRoad(i);
       if (tool.kind === ToolKind.Rail) return w.canBuildRail(i);
       if (tool.kind === ToolKind.Zone) return tool.zone === Zone.None || w.canZone(i, tool.zone);
+      if (tool.kind === ToolKind.OneWay) return w.road[i] !== RoadClass.None;
       return true;
     });
     this.renderer.setPreviewTiles(tiles, w, flags);
@@ -330,7 +381,7 @@ export class App {
     const t = this.hoverTile;
 
     if (tool.kind === ToolKind.Road || tool.kind === ToolKind.Rail) {
-      const tiles = this.dragStart >= 0 ? previewTiles(tool, this.dragStart, t) : [t];
+      const tiles = this.dragStart >= 0 ? this.dragTiles() : [t];
       const buildable = tiles.filter((i) =>
         tool.kind === ToolKind.Road ? w.canBuildRoad(i) : w.canBuildRail(i),
       ).length;
@@ -344,7 +395,10 @@ export class App {
     }
     if (tool.kind === ToolKind.Place) {
       const a = archetype(tool.archetypeId);
-      const ok = w.canBuildStructure(t);
+      // プレビューと同じ判定を使う。1 タイルだけ見る `canBuildStructure` だと、
+      // 2×2 の建物で左上 1 マスだけ空いている場所に「建てられます」と出たあと、
+      // プレビューは赤く、クリックしても拒否される、という食い違いが起きる。
+      const ok = this.sim.canPlace(tool.archetypeId, t);
       this.ui.showCursorTip(
         this.pointerX,
         this.pointerY,
@@ -353,9 +407,31 @@ export class App {
       return;
     }
     if (tool.kind === ToolKind.Zone) {
-      const tiles = this.dragStart >= 0 ? previewTiles(tool, this.dragStart, t) : [t];
+      const tiles = this.dragStart >= 0 ? this.dragTiles() : [t];
       const ok = tiles.filter((i) => tool.zone === Zone.None || w.canZone(i, tool.zone)).length;
       this.ui.showCursorTip(this.pointerX, this.pointerY, `${ok} / ${tiles.length} マスに指定できます`);
+      return;
+    }
+    if (tool.kind === ToolKind.OneWay) {
+      const tiles = this.dragStart >= 0 ? this.dragTiles() : [t];
+      const roads = tiles.filter((i) => w.road[i] !== RoadClass.None).length;
+      const dir = this.dragStart >= 0 ? dragDirection(this.dragStart, t) : OneWay.None;
+      const name = ONE_WAY_NAMES_JA[dir] ?? '解除';
+      this.ui.showCursorTip(
+        this.pointerX,
+        this.pointerY,
+        roads === 0 ? '道路がありません' : `${roads} マスを ${name} 向きの一方通行に`,
+      );
+      return;
+    }
+    if (tool.kind === ToolKind.TransitLine) {
+      this.ui.showCursorTip(
+        this.pointerX,
+        this.pointerY,
+        this.lineStops.length === 0
+          ? '最初の停留所をクリック'
+          : `停留所 ${this.lineStops.length} 箇所（Enter で確定）`,
+      );
       return;
     }
     // 通常時は地形と用途を出す
@@ -397,6 +473,23 @@ export class App {
       return;
     }
 
+    // 路線は「1 ドラッグ = 1 コマンド」に収まらない唯一の道具。
+    // 停留所を順に押していき、Enter か最後の停留所の再クリックで確定する
+    // （経路確認ツールが既に「1 点目を覚えて 2 点目で確定」をやっているので、
+    //   その形を多点に広げただけ）。
+    if (tool.kind === ToolKind.TransitLine) {
+      if (this.lineStops.length > 0 && this.lineStops[this.lineStops.length - 1] === to) {
+        this.commitLine();
+        return;
+      }
+      this.lineStops.push(to);
+      this.ui.pushAlert(
+        `停留所 ${this.lineStops.length} 箇所。Enter か最後の停留所をもう一度クリックで確定します`,
+        'info',
+      );
+      return;
+    }
+
     const cmd = commandFor(tool, from, to);
     if (cmd) this.sim.enqueue(cmd);
   }
@@ -420,19 +513,19 @@ export class App {
     }
     if (bestId >= 0) {
       this.ui.selectedCitizen = bestId;
-      this.ui.selectedBuilding = -1;
+      this.ui.selectedBuilding = 0;
       this.sim.activity.inspectedCitizen = bestId;
       return;
     }
 
     const ref = this.sim.world.buildingRef[tile]!;
     if (ref !== 0 && this.sim.buildings.alive[ref - 1] === 1) {
-      this.ui.selectedBuilding = ref - 1;
+      this.ui.selectedBuilding = this.sim.buildings.handleOf(ref - 1);
       this.ui.selectedCitizen = -1;
       return;
     }
     this.ui.selectedCitizen = -1;
-    this.ui.selectedBuilding = -1;
+    this.ui.selectedBuilding = 0;
   }
 
   // ---------------- ループ ----------------

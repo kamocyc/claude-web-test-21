@@ -6,6 +6,7 @@ import {
   MAP_W,
   MAX_VISIBLE_AGENTS,
   MAX_VISIBLE_TRAIN_CARS,
+  MAX_VISIBLE_BUSES,
   MAX_VISIBLE_TRUCKS,
   MAX_VISIBLE_VEHICLES,
   PARKED_CARS_PER_TILE,
@@ -35,7 +36,7 @@ import {
   type RailPose,
   type TrainHead,
 } from '@sim/network/railLines';
-import { CARGO_COLORS, TRAIN_BODY_COLOR, TRAIN_HEAD_COLOR, carColor } from './theme';
+import { CARGO_COLORS, TRAIN_BODY_COLOR, TRAIN_HEAD_COLOR, carColor, lineColor } from './theme';
 
 /** 1 フレームで進行方向をどれだけ目標へ寄せるか。1 = 即座（＝スナップ）。 */
 const HEADING_SMOOTHING = 0.15;
@@ -47,8 +48,9 @@ import { idx, tileX, tileY } from '@sim/world/tiles';
  * 位置はシミュレーションが毎 tick 更新しているのではなく、
  * (出発 tick, 到着 tick, 経路) から描画時に補間して求める。
  * これにより 1 万人分の座標更新を毎 tick 走らせずに済む。
- * さらに端数 tick を受け取って補間するので、12 tick/秒のシミュレーションでも
- * 60fps で連続的に動いて見える（整数 tick で補間すると 12 段階のカクつきになる）。
+ * さらに端数 tick を受け取って補間するので、×1 で 0.75 tick/秒しか進まない
+ * シミュレーションでも 60fps で連続的に動いて見える
+ * （整数 tick で補間すると 1.33 秒に 1 コマのカクつきになる）。
  *
  * カメラの近くにいるエージェントだけをインスタンス化する。
  * 引きの画では点にしかならないものに描画予算を使わない。
@@ -60,6 +62,7 @@ export class AgentLayer {
   private readonly cars: InstancedMesh;
   private readonly trains: InstancedMesh;
   private readonly trucks: InstancedMesh;
+  private readonly buses: InstancedMesh;
   private readonly materials: MeshLambertMaterial[] = [];
 
   private readonly mat = new Matrix4();
@@ -119,6 +122,9 @@ export class AgentLayer {
     this.cars = mk(1.7, 1.45, 4.2, MAX_VISIBLE_VEHICLES);
     this.trains = mk(2.9, 3.6, TRAIN_CAR_LENGTH_M, MAX_VISIBLE_TRAIN_CARS);
     this.trucks = mk(2.2, 2.6, 6.5, MAX_VISIBLE_TRUCKS);
+    // 路線バス。実車 11m は車 1 台（画面上 4.2＝実車 9 台の車列）の 3 分の 1 ほどだが、
+    // それだと近景で車と見分けが付かないので、少し長めに描く。
+    this.buses = mk(2.4, 3.0, 7.5, MAX_VISIBLE_BUSES);
   }
 
   /**
@@ -167,7 +173,11 @@ export class AgentLayer {
     const trainDist2 = TRAIN_DRAW_DISTANCE_M * TRAIN_DRAW_DISTANCE_M;
 
     const c = sim.citizens;
-    for (let id = 0; id < c.high; id++) {
+    // 引きの画では 1 人も描かないので、走査自体を丸ごと飛ばす。
+    // 以前はここを回り続けて、全員ぶんの citizenPosition（経路のエッジを線形走査）を
+    // 毎フレーム計算してから捨てていた。
+    for (let id = 0; drawPedestrians && id < c.high; id++) {
+      if (ped >= MAX_VISIBLE_AGENTS) break;
       if (!c.isAlive(id)) continue;
       if (c.state[id] !== Activity.Traveling) continue;
       const mode = c.mode[id]! as Mode;
@@ -182,8 +192,7 @@ export class AgentLayer {
       // 「歩道を走る車」や「線路を降りて歩道を歩く電車」になる。
       const bits = this.tmp.edge >= 0 ? sim.graph.edgeMask[this.tmp.edge]! : 0;
       // 線路上の鉄道利用者は電車の中にいるので描かない（電車の方を描く）
-      if (mode === Mode.Rail && bits & ModeBit.Rail) continue;
-      if (!drawPedestrians || ped >= MAX_VISIBLE_AGENTS) continue;
+      if (mode === Mode.Transit && bits & ModeBit.Rail) continue;
 
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
@@ -327,15 +336,17 @@ export class AgentLayer {
       if (access < 0) continue;
 
       // 同じ接道タイルに何台も重ねない
-      const used = this.parkSlots.get(access) ?? 0;
-      if (used >= PARKED_CARS_PER_TILE) continue;
-      this.parkSlots.set(access, used + 1);
-
       const wx = (tileX(access) + 0.5) * TILE_M;
       const wz = (tileY(access) + 0.5) * TILE_M;
       const dx = wx - camX;
       const dz = wz - camZ;
+      // 距離の判定を駐車枠の確保より先に置く。逆にすると、視野の外にいて
+      // 描かない車が枠を潰し、境界のタイルに本来より少ない台数しか並ばない。
       if (dx * dx + dz * dz > maxDist2) continue;
+
+      const used = this.parkSlots.get(access) ?? 0;
+      if (used >= PARKED_CARS_PER_TILE) continue;
+      this.parkSlots.set(access, used + 1);
 
       // 道路の走っている向きに沿って縦列駐車させる。
       // 向きを見ずに置くと、車が道路を跨いで横向きに刺さる。
@@ -454,12 +465,17 @@ export class AgentLayer {
   ): { cars: number; trucks: number } {
     let car = fromCar;
     let truck = 0;
+    let bus = 0;
     const tr = sim.traffic;
     const nowSec = tick * 60;
     const t = sim.freight.trucks;
     tr.forEachVehicle((v) => {
-      const isTruck = tr.kind[v] === VehicleKind.Truck;
-      if (isTruck ? truck >= MAX_VISIBLE_TRUCKS : car >= MAX_VISIBLE_VEHICLES) return;
+      const kind = tr.kind[v]!;
+      const isTruck = kind === VehicleKind.Truck;
+      const isBus = kind === VehicleKind.Bus;
+      if (isTruck && truck >= MAX_VISIBLE_TRUCKS) return;
+      if (isBus && bus >= MAX_VISIBLE_BUSES) return;
+      if (!isTruck && !isBus && car >= MAX_VISIBLE_VEHICLES) return;
       if (!tr.pose(sim.graph, v, nowSec, this.tmp)) return;
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
@@ -481,6 +497,13 @@ export class AgentLayer {
         this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[owner]!] ?? CARGO_COLORS[0]!);
         this.trucks.setColorAt(truck, this.color);
         truck++;
+      } else if (isBus) {
+        // 車体は路線の色。路線一覧の色と揃えてあるので、
+        // 「いま目の前を通ったのがどの系統か」が地図の上で分かる。
+        this.buses.setMatrixAt(bus, this.mat);
+        this.color.setHex(lineColor(sim.transit.lineOfBus(owner)));
+        this.buses.setColorAt(bus, this.color);
+        bus++;
       } else {
         this.cars.setMatrixAt(car, this.mat);
         this.color.setHex(carColor((owner * 2654435761) >>> 0));
@@ -488,11 +511,16 @@ export class AgentLayer {
         car++;
       }
     });
+    this.buses.count = bus;
     return { cars: car, trucks: truck };
   }
 
   dispose(): void {
-    for (const m of this.meshes) m.dispose();
+    // InstancedMesh.dispose() はジオメトリを解放しない。明示的に捨てる。
+    for (const m of this.meshes) {
+      m.geometry.dispose();
+      m.dispose();
+    }
     for (const m of this.materials) m.dispose();
   }
 }

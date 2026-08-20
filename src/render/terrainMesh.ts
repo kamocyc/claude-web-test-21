@@ -166,6 +166,15 @@ export class TerrainMesh {
         const a = world.transitAccess[t]!;
         return heatColor(a >= 255 ? 0 : 1 - a / 20);
       }
+      case Overlay.Power:
+      case Overlay.Water: {
+        // 供給網の中かどうかと、余裕の度合い。
+        // 0 は「網の外」で、青く塗ると街じゅうが水色になるので暗く落とす。
+        const src = this.overlay === Overlay.Power ? sim.utilities.powerOverlay : sim.utilities.waterOverlay;
+        const v = src[t]!;
+        if (v === 0) return zoneColor(-1).setHex(0x1b2026);
+        return heatColor(1 - v / 255);
+      }
       case Overlay.Zone:
         if (world.zone[t] !== Zone.None) return zoneColor(world.zone[t]!);
         break;

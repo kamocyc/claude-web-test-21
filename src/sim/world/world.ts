@@ -1,5 +1,5 @@
 import { CHUNK_COUNT, MAP_H, MAP_W, TILE_COUNT } from '@shared/constants';
-import { RoadClass, Terrain, Zone } from '@shared/enums';
+import { OneWay, RoadClass, Terrain, Zone } from '@shared/enums';
 import { type Epochs, EventRing, newEpochs } from '@sim/core/events';
 import { generateTerrain } from './terrainGen';
 import { chunkOf, idx, inBounds, neighbor } from './tiles';
@@ -19,6 +19,11 @@ export class World {
 
   readonly zone = new Uint8Array(TILE_COUNT);
   readonly road = new Uint8Array(TILE_COUNT);
+  /**
+   * 一方通行の向き（`OneWay`）。0 = 双方向。
+   * 車だけに効かせる — 徒歩と自転車は逆向きにも通す。
+   */
+  readonly oneWay = new Uint8Array(TILE_COUNT);
   readonly rail = new Uint8Array(TILE_COUNT);
   /** 建物 ID + 1（0 = 建物なし）。フットプリント内の全タイルが同じ値を持つ。 */
   readonly buildingRef = new Uint32Array(TILE_COUNT);
@@ -123,6 +128,9 @@ export class World {
     // 路線がつながらなくなる。
     this.road[i] = cls;
     if (cls !== RoadClass.None) this.zone[i] = Zone.None;
+    // 道路を消したら一方通行も消す。残すと、あとで敷き直したときに
+    // 見えない一方通行が復活して「なぜか車が来ない道」になる。
+    else this.oneWay[i] = OneWay.None;
     this.epochs.roads++;
     this.networkVersion++;
     this.markDirty(i);
@@ -131,6 +139,20 @@ export class World {
       const nb = neighbor(i, d);
       if (nb >= 0 && this.road[nb] !== RoadClass.None) this.markDirty(nb);
     }
+    return true;
+  }
+
+  /**
+   * 一方通行の向きを設定する。道路のないタイルには付かない。
+   * 交通グラフの張り方が変わるので `networkVersion` を進める。
+   */
+  setOneWay(i: number, dir: number): boolean {
+    if (this.road[i] === RoadClass.None) dir = OneWay.None;
+    if (this.oneWay[i] === dir) return false;
+    this.oneWay[i] = dir;
+    this.epochs.roads++;
+    this.networkVersion++;
+    this.markDirty(i);
     return true;
   }
 

@@ -144,7 +144,7 @@ export function seekJob(
   citizens.workBuilding[id] = buildings.handleOf(best);
   citizens.incomeYenMo[id] = wageOf(buildings, best, skill);
   citizens.set(id, CitizenFlag.Employed, true);
-  // 通勤定期は鉄道アクセスが良い人が持つ
+  // 通勤定期の付与は lifecycle 側でまとめてやる（住まいと職場が決まってからでないと決められない）。
   return true;
 }
 

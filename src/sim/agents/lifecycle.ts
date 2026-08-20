@@ -18,6 +18,7 @@ import type { BuildingStore } from '@sim/buildings/buildings';
 import { handleSlot } from '@sim/buildings/buildings';
 import type { TazMatrix } from '@sim/network/tazMatrix';
 import type { World } from '@sim/world/world';
+import type { UtilitySystem } from '@sim/world/utilities';
 import type { ActivitySystem } from './activity';
 import { CitizenFlag, type CitizenStore } from './citizens';
 import {
@@ -53,9 +54,8 @@ export interface LifecycleContext {
   rng: Rng;
   wheel: TimeWheel;
   activity: ActivitySystem;
+  utilities?: UtilitySystem;
 }
-
-let nextHouseholdId = 1;
 
 /**
  * 市民を 1 人生成する。嗜好はここで一度だけ引き、生涯変わらない。
@@ -86,7 +86,7 @@ export function createCitizen(
   c.prefWalk[id] = clampI8(rng.normal(0, 6));
   c.prefBike[id] = clampI8(rng.normal(0, 6));
   c.prefCar[id] = clampI8(rng.normal(0, 7));
-  c.prefRail[id] = clampI8(rng.normal(0, 6));
+  c.prefTransit[id] = clampI8(rng.normal(0, 6));
   c.leisureTaste[id] = Math.max(0, Math.min(255, Math.round(rng.normal(120, 50))));
 
   const canDrive = age >= 18 && rng.chance(0.72);
@@ -117,31 +117,47 @@ function clampI8(v: number): number {
   return Math.max(-127, Math.min(127, Math.round(v)));
 }
 
-export function newHouseholdId(): number {
-  return nextHouseholdId++;
-}
-
-/** 決定論を保つため、シード読み込み時に世帯 ID カウンタも戻す。 */
-export function resetHouseholdIds(): void {
-  nextHouseholdId = 1;
-}
-
-/** セーブ／ロード用。復元しないと、読み込み後の世帯 ID が既存と衝突する。 */
-export function householdIdCounter(): number {
-  return nextHouseholdId;
-}
-export function setHouseholdIdCounter(n: number): void {
-  nextHouseholdId = Math.max(1, Math.floor(n));
-}
-
 /**
  * 日次のライフサイクル処理。全市民を毎日見るのではなく 1/7 ずつ処理して
  * 1 週間で一巡させる（人口 1 万人でも 1 日あたり 1400 人分の軽い処理で済む）。
  */
 export class LifecycleSystem {
+  /**
+   * 世帯 ID の採番。**モジュール変数ではなくインスタンス変数**に置く。
+   * 以前はモジュール変数で、`Simulation` を 2 つ作ると
+   * （セーブデータの読み込みでシードが変わったときなど）
+   * 1 つ目のカウンタが 1 に巻き戻り、以後に生まれる市民が既存の世帯と
+   * 同じ ID を持つようになっていた。「街はシードとコマンド列だけで決まる」
+   * という前提も、ここだけ他のインスタンスに影響される形で破れていた。
+   */
+  private nextHouseholdId = 1;
+
+  /** 新しい世帯 ID を 1 つ払い出す。 */
+  newHouseholdId(): number {
+    return this.nextHouseholdId++;
+  }
+
+  /** セーブ／ロード用。復元しないと、読み込み後の世帯 ID が既存と衝突する。 */
+  householdIdCounter(): number {
+    return this.nextHouseholdId;
+  }
+
+  setHouseholdIdCounter(n: number): void {
+    this.nextHouseholdId = Math.max(1, Math.floor(n));
+  }
+
   private slice = 0;
   /** 求職の走査位置。未就業者を一巡させるための回転カーソル。 */
   private jobCursor = 0;
+
+  /** 走査位置。セーブ／ロードで復元しないと、読み込んだ街の進み方が変わる。 */
+  get cursors(): [number, number] {
+    return [this.slice, this.jobCursor];
+  }
+  set cursors(v: [number, number]) {
+    this.slice = Math.max(0, Math.floor(v[0]));
+    this.jobCursor = Math.max(0, Math.floor(v[1]));
+  }
   private readonly seekers: number[] = [];
   readonly stats: LifecycleStats = {
     births: 0,
@@ -336,9 +352,16 @@ export class LifecycleSystem {
       // 学校・病院・交番・公園を届かせて初めて満足が上回る。
       // 基礎をプラスにすると、プレイヤが何もしなくても全員が幸福度の上限に張り付き、
       // 公共サービスにも公害にも意味が無くなる。
-      const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
+      const homeSlot = b.valid(c.homeBuilding[id]!) ? handleSlot(c.homeBuilding[id]!) : -1;
+      const homeTile = homeSlot >= 0 ? b.originTile[homeSlot]! : -1;
       if (homeTile >= 0) {
         let delta = -2;
+        // 停電・断水。サービスが 1 つ届く価値（+1）より重くしてある。
+        // 学校や公園が無い暮らしは不便だが、電気と水が来ない家には住めない。
+        if (ctx.utilities) {
+          if (!ctx.utilities.hasPower(homeSlot)) delta -= 2;
+          if (!ctx.utilities.hasWater(homeSlot)) delta -= 2;
+        }
         const svc = ctx.world.svcMask[homeTile]!;
         if ((svc & Service.Education) !== 0) delta += 1;
         if ((svc & Service.Health) !== 0) delta += 1;
@@ -384,7 +407,7 @@ export class LifecycleSystem {
         }
       }
       if (slot < 0) break;
-      const hh = newHouseholdId();
+      const hh = this.newHouseholdId();
       const handle = b.handleOf(slot);
       // 単身か夫婦か。世帯人数は住戸の空きに収まる範囲で。
       const room = b.capacityResidents[slot]! - b.residents[slot]!;

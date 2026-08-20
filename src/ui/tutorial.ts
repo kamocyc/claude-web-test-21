@@ -34,6 +34,9 @@ export interface CityCounts {
   stations: number;
   lumberPerHour: number;
   foodPerHour: number;
+  /** 発電容量 (kW) と浄水容量 (m3/日)。0 なら 1 基も建っていない。 */
+  powerSupply: number;
+  waterSupply: number;
 }
 
 export function countCity(sim: Simulation): CityCounts {
@@ -64,6 +67,8 @@ export function countCity(sim: Simulation): CityCounts {
     stations: sim.stations.length,
     lumberPerHour: st.goodsProduced[Good.Lumber] ?? 0,
     foodPerHour: st.goodsProduced[Good.Food] ?? 0,
+    powerSupply: st.utilities.powerSupplyKw,
+    waterSupply: st.utilities.waterSupply,
   };
 }
 
@@ -77,6 +82,16 @@ export const TUTORIAL_STEPS: TutorialStep[] = [
       '下の「道路」から生活道路を選び、地図をドラッグして道を引きましょう。\n街のすべては道路から始まります。道路に接していない土地には、建物は決して建ちません。',
     highlight: 'cat:road',
     done: (c) => c.roads >= 20,
+  },
+  {
+    id: 'utilities',
+    titleJa: '電気と水を用意する',
+    bodyJa:
+      '「公共施設」から太陽光発電所と浄水場を、引いた道路のそばに建てましょう。\n' +
+      '電気と水は**道路の下を通って**届きます。道路で繋がっていない建物には届きません。\n' +
+      '足りない地区には新しい建物が建たないので、街より先に用意しておくのが要点です。',
+    highlight: 'cat:service',
+    done: (c) => c.powerSupply > 0 && c.waterSupply > 0,
   },
   {
     id: 'residential',

@@ -1,4 +1,5 @@
 import {
+  BUS_PLATOON_EQUIV,
   GRIDLOCK_RELIEF_STEPS,
   MAX_TRIP_TICKS,
   SATURATION_VPH_PER_LANE,
@@ -41,8 +42,24 @@ import type { Path, PathPose } from './pathfinder';
 export const VehicleKind = {
   Car: 0,
   Truck: 1,
+  /**
+   * 路線バス。**乗用車と同じ待ち行列に載せるのがこの種別を足した理由**で、
+   * バスは信号でも止まるし、前が詰まれば動けない。
+   * 電車は専用軌道なのでここには一切現れない。
+   */
+  Bus: 2,
 } as const;
 export type VehicleKind = (typeof VehicleKind)[keyof typeof VehicleKind];
+
+/**
+ * 車両種別ごとの占有量（乗用車の車列 1 台 = 1）。
+ * 場所（リンクの収容）と交通容量（交差点の放出枠）の両方に効く。
+ */
+const PLATOON_EQUIV: Record<number, number> = {
+  [VehicleKind.Car]: 1,
+  [VehicleKind.Truck]: TRUCK_PLATOON_EQUIV,
+  [VehicleKind.Bus]: BUS_PLATOON_EQUIV,
+};
 
 /** 到着（または打ち切り）の通知。 */
 export interface VehicleEvent {
@@ -111,7 +128,7 @@ export class TrafficSystem {
   private edgeCount = 0;
   private head = new Int32Array(0);
   private tail = new Int32Array(0);
-  /** リンク上の占有量（乗用車の車列を 1 とする単位）。トラックは 0.22。 */
+  /** リンク上の占有量（乗用車の車列を 1 とする単位）。トラックは 0.22、バスは 0.25。 */
   private count = new Float32Array(0);
   private credit = new Float32Array(0);
   /** 収容台数。長さ × 車線数 ÷ 車列長。 */
@@ -319,7 +336,7 @@ export class TrafficSystem {
     if (path.edges.length === 0) return -1;
     const first = path.edges[0]!;
     if (first >= this.edgeCount) return -1;
-    const size = kind === VehicleKind.Truck ? TRUCK_PLATOON_EQUIV : 1;
+    const size = PLATOON_EQUIV[kind] ?? 1;
     if (this.count[first]! + size > this.storage[first]!) return -1;
 
     const slot = this.freeSlots.pop() ?? this.high++;

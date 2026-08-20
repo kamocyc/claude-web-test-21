@@ -41,7 +41,7 @@ export const CITIZEN_FIELDS = [
   'prefWalk',
   'prefBike',
   'prefCar',
-  'prefRail',
+  'prefTransit',
   'leisureTaste',
   'state',
   'scheduleId',
@@ -88,7 +88,7 @@ export class CitizenStore {
   prefWalk!: Int8Array;
   prefBike!: Int8Array;
   prefCar!: Int8Array;
-  prefRail!: Int8Array;
+  prefTransit!: Int8Array;
   /** レジャーへの出かけやすさ 0..255。 */
   leisureTaste!: Uint8Array;
 
@@ -146,7 +146,7 @@ export class CitizenStore {
     this.prefWalk = g(this.prefWalk, (n) => new Int8Array(n));
     this.prefBike = g(this.prefBike, (n) => new Int8Array(n));
     this.prefCar = g(this.prefCar, (n) => new Int8Array(n));
-    this.prefRail = g(this.prefRail, (n) => new Int8Array(n));
+    this.prefTransit = g(this.prefTransit, (n) => new Int8Array(n));
     this.leisureTaste = g(this.leisureTaste, (n) => new Uint8Array(n));
     this.state = g(this.state, (n) => new Uint8Array(n));
     this.scheduleId = g(this.scheduleId, (n) => new Uint8Array(n));
@@ -232,7 +232,7 @@ export class CitizenStore {
     out.prefWalk = this.prefWalk[id]!;
     out.prefBike = this.prefBike[id]!;
     out.prefCar = this.prefCar[id]!;
-    out.prefRail = this.prefRail[id]!;
+    out.prefTransit = this.prefTransit[id]!;
     out.incomeYenMo = this.incomeYenMo[id]!;
     out.age = this.age[id]!;
     out.hasCar = this.has(id, CitizenFlag.OwnsCar);
@@ -252,7 +252,7 @@ export function newTravelerProfile(): TravelerProfile {
     prefWalk: 0,
     prefBike: 0,
     prefCar: 0,
-    prefRail: 0,
+    prefTransit: 0,
     incomeYenMo: 0,
     age: 30,
     hasCar: false,

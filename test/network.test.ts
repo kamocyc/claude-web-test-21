@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { COST_SMOOTHING_LAMBDA, MAX_CONGESTION_FACTOR } from '@shared/constants';
-import { Mode, ModeBit, RoadClass } from '@shared/enums';
+import { Mode, ModeBit, OneWay, RoadClass } from '@shared/enums';
 import { Pathfinder } from '@sim/network/pathfinder';
 import { PathCache } from '@sim/network/pathCache';
 import { Rng } from '@sim/core/rng';
 import { idx } from '@sim/world/tiles';
-import { buildGraph, layRail, layRoadGrid, layRoadLine, makeTestWorld } from './helpers';
+import type { Graph } from '@sim/network/graph';
+import { TransitSystem } from '@sim/network/transit';
+import { buildGraph, layRail, layRoadGrid, layRoadLine, makeTestWorld, rebuildTransit } from './helpers';
 
 describe('マルチモーダルグラフ', () => {
-  it('駅が徒歩レイヤと鉄道レイヤを接続する', () => {
+  it('駅と線路をつなぐ路線があると、徒歩では行けない場所へ行ける', () => {
     const world = makeTestWorld();
     // 離れた 2 か所に道路、その間を線路で結ぶ
     layRoadLine(world, 20, 20, 26, 20);
@@ -19,22 +21,25 @@ describe('マルチモーダルグラフ', () => {
     world.terrain[stationA] = 0;
     world.terrain[stationB] = 0;
 
-    const graph = buildGraph(world, [stationA, stationB]);
+    // 線路と駅だけを置けば、路線は自動で生成される。
+    const transit = new TransitSystem();
+    const graph = rebuildTransit(transit, world, [stationA, stationB]);
     const finder = new Pathfinder();
     const a = graph.roadNodeAt[idx(20, 20)]!;
     const b = graph.roadNodeAt[idx(20, 80)]!;
 
     // 徒歩だけでは到達できない（道路が分断されている）
     expect(finder.search(graph, a, b, Mode.Walk)).toBeNull();
-    // 鉄道なら到達できる
-    const byRail = finder.search(graph, a, b, Mode.Rail);
-    expect(byRail).not.toBeNull();
-    // 乗降エッジを実際に通っている
-    const usedBoard = Array.from(byRail!.edges).some((e) => (graph.edgeMask[e]! & ModeBit.Board) !== 0);
-    expect(usedBoard).toBe(true);
+    // 公共交通なら到達できる
+    const byTransit = finder.search(graph, a, b, Mode.Transit);
+    expect(byTransit).not.toBeNull();
+    // 乗車エッジと乗車中エッジを実際に通っている
+    const masks = Array.from(byTransit!.edges).map((e) => graph.edgeMask[e]!);
+    expect(masks.some((m) => (m & ModeBit.Board) !== 0)).toBe(true);
+    expect(masks.some((m) => (m & ModeBit.Ride) !== 0)).toBe(true);
   });
 
-  it('駅を撤去すると鉄道で到達できなくなる', () => {
+  it('駅を撤去すると公共交通で到達できなくなる', () => {
     const world = makeTestWorld();
     layRoadLine(world, 20, 20, 26, 20);
     layRoadLine(world, 20, 80, 26, 80);
@@ -42,16 +47,17 @@ describe('マルチモーダルグラフ', () => {
     const stationA = idx(23, 21);
     const stationB = idx(23, 79);
 
-    const withStations = buildGraph(world, [stationA, stationB]);
+    const transit = new TransitSystem();
+    const withStations = rebuildTransit(transit, world, [stationA, stationB]);
     const finder = new Pathfinder();
     expect(
-      finder.search(withStations, withStations.roadNodeAt[idx(20, 20)]!, withStations.roadNodeAt[idx(20, 80)]!, Mode.Rail),
+      finder.search(withStations, withStations.roadNodeAt[idx(20, 20)]!, withStations.roadNodeAt[idx(20, 80)]!, Mode.Transit),
     ).not.toBeNull();
 
-    // 片方の駅を外す
-    const oneStation = buildGraph(world, [stationA]);
+    // 片方の駅を外すと、停留所が 1 つしかない路線は成立しない。
+    const oneStation = rebuildTransit(new TransitSystem(), world, [stationA]);
     expect(
-      finder.search(oneStation, oneStation.roadNodeAt[idx(20, 20)]!, oneStation.roadNodeAt[idx(20, 80)]!, Mode.Rail),
+      finder.search(oneStation, oneStation.roadNodeAt[idx(20, 20)]!, oneStation.roadNodeAt[idx(20, 80)]!, Mode.Transit),
     ).toBeNull();
   });
 
@@ -185,5 +191,85 @@ describe('経路キャッシュ', () => {
       cache.set(rng.int(100000), rng.int(100000), Mode.Car, p);
     }
     expect(cache.size).toBeLessThanOrEqual(120_000);
+  });
+});
+
+/** 2 つのタイルを結ぶ有向エッジ。見つからなければ -1。 */
+function edgeBetween(graph: Graph, from: number, to: number): number {
+  const a = graph.roadNodeAt[from]!;
+  const b = graph.roadNodeAt[to]!;
+  for (let e = graph.edgeStart[a]!; e < graph.edgeStart[a + 1]!; e++) {
+    if (graph.edgeTo[e] === b) return e;
+  }
+  return -1;
+}
+
+describe('一方通行', () => {
+  it('逆走のエッジからは車のビットが落ちる（歩行者と自転車は通れる）', () => {
+    const world = makeTestWorld();
+    // 東西に 1 本の道。真ん中の数マスを東向きの一方通行にする。
+    layRoadLine(world, 20, 40, 40, 40);
+    for (let x = 26; x <= 34; x++) world.setOneWay(idx(x, 40), OneWay.East);
+
+    const graph = buildGraph(world);
+    const forward = edgeBetween(graph, idx(33, 40), idx(34, 40));
+    const backward = edgeBetween(graph, idx(34, 40), idx(33, 40));
+    expect(graph.edgeMask[forward]! & ModeBit.Car).not.toBe(0);
+    // 逆走だけが塞がる。徒歩と自転車のビットは残る（歩行者に一方通行はない）。
+    expect(graph.edgeMask[backward]! & ModeBit.Car).toBe(0);
+    expect(graph.edgeMask[backward]! & ModeBit.Walk).not.toBe(0);
+    expect(graph.edgeMask[backward]! & ModeBit.Bike).not.toBe(0);
+  });
+
+  it('車は一方通行を迂回する', () => {
+    const world = makeTestWorld();
+    // 迂回できる格子。中央の 1 行だけを東向きの一方通行にする。
+    layRoadGrid(world, 20, 20, 12, 4);
+    const row = 20 + 4; // 格子の 2 本目の東西路
+    for (let x = 22; x <= 30; x++) {
+      if (world.road[idx(x, row)] !== RoadClass.None) world.setOneWay(idx(x, row), OneWay.East);
+    }
+
+    const graph = buildGraph(world);
+    const finder = new Pathfinder();
+    const east = graph.roadNodeAt[idx(32, row)]!;
+    const west = graph.roadNodeAt[idx(20, row)]!;
+    const path = finder.search(graph, east, west, Mode.Car);
+    expect(path).not.toBeNull();
+    // 逆走のエッジを 1 本も含まない
+    const usedWrongWay = Array.from(path!.edges).some((e) => (graph.edgeMask[e]! & ModeBit.Car) === 0);
+    expect(usedWrongWay).toBe(false);
+    // 一方通行が無ければもっと短い（＝迂回している）
+    for (let x = 22; x <= 30; x++) world.setOneWay(idx(x, row), OneWay.None);
+    const free = buildGraph(world);
+    const direct = finder.search(free, free.roadNodeAt[idx(32, row)]!, free.roadNodeAt[idx(20, row)]!, Mode.Car);
+    expect(path!.lengthM).toBeGreaterThan(direct!.lengthM);
+  });
+
+  it('一方通行から脇道へ曲がることは塞がない', () => {
+    const world = makeTestWorld();
+    // 東西の本線と、その途中から南へ伸びる脇道
+    layRoadLine(world, 20, 40, 40, 40);
+    layRoadLine(world, 30, 40, 30, 50);
+    for (let x = 26; x <= 34; x++) world.setOneWay(idx(x, 40), OneWay.East);
+
+    const graph = buildGraph(world);
+    const finder = new Pathfinder();
+    const west = graph.roadNodeAt[idx(20, 40)]!;
+    const south = graph.roadNodeAt[idx(30, 50)]!;
+    // 一方通行を東へ進んでから南へ折れる経路が成立する。
+    // 「指定の向きに出るときだけ通す」という実装にすると、ここが塞がって
+    // 入ったら最後まで抜けられない道になる。
+    expect(finder.search(graph, west, south, Mode.Car)).not.toBeNull();
+  });
+
+  it('道路を消すと一方通行も消える', () => {
+    const world = makeTestWorld();
+    layRoadLine(world, 20, 40, 40, 40);
+    const t = idx(30, 40);
+    world.setOneWay(t, OneWay.East);
+    expect(world.oneWay[t]).toBe(OneWay.East);
+    world.setRoad(t, RoadClass.None);
+    expect(world.oneWay[t]).toBe(OneWay.None);
   });
 });

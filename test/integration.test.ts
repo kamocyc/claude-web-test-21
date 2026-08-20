@@ -71,7 +71,7 @@ describe('街の 90 日運転', () => {
     const used = last.modeShare.filter((s) => s > 0.02).length;
     expect(used).toBeGreaterThanOrEqual(3);
     // 駅を敷いたので鉄道が使われているはず
-    expect(last.modeShare[Mode.Rail]!).toBeGreaterThan(0.02);
+    expect(last.modeShare[Mode.Transit]!).toBeGreaterThan(0.02);
   });
 
   it('どの市民も同じ状態に張り付いたままにならない', () => {

@@ -223,7 +223,9 @@ function placeNear(sim: Simulation, arch: number, px: number, py: number, maxR =
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         if (!inBounds(px + dx, py + dy)) continue;
         const t = idx(px + dx, py + dy);
-        if (!world.canBuildStructure(t)) continue;
+        // 1 タイルだけでなくフットプリント全体と立地条件を見る
+        // （火力発電所は 3×3、浄水場は水辺が要る）。
+        if (!sim.canPlace(arch, t)) continue;
         if (!world.isAdjacentToRoad(t)) continue;
         const before = world.buildingRef[t];
         sim.enqueue({ t: 'placeBuilding', archetype: arch, tile: t });
@@ -377,6 +379,27 @@ export function buildScenario(sim: Simulation, opts: ScenarioOptions = {}): Scen
   // TAZ 行列を一度きちんと埋めてから走らせる
   // （初日の行き先選択と交通手段選択が全部 Infinity になるのを防ぐ）
   sim.taz.computeAll(sim.graph);
+
+  // ---------- 5.5 インフラ ----------
+  // **道路が全部出そろってから置く。** `placeNear` は接道しているタイルしか
+  // 選べないので、幹線やベッドタウンの道より先に走らせると、
+  // 川沿いの候補地がまだ接道しておらず浄水場が 1 つも建たない。
+  // そうなった街は上水が既存系統ぶんで頭打ちになり、成長が止まる。
+  // インフラ。発電所は工業側（南東）に寄せて、住宅地から公害を離す。
+  // 浄水場は取水できる水辺の近くにしか建たないので、広めに探させる。
+  placeNear(sim, Arch.ThermalPowerPlant, cx + Math.round(q * 1.8), cy + Math.round(q * 1.8), 26);
+  // 浄水場は水辺が要るので探索範囲を広く取る。2 基置くのは、
+  // 1 基だと街が育った時点で上水が頭打ちになるため。
+  placeNear(sim, Arch.WaterWorks, cx, cy, 90);
+  placeNear(sim, Arch.WaterWorks, cx - Math.round(q * 1.5), cy + Math.round(q * 1.5), 90);
+  placeNear(sim, Arch.SewagePlant, cx + Math.round(q * 1.6), cy + Math.round(q * 1.2), 26);
+  placeNear(sim, Arch.SewagePlant, cx - Math.round(q * 1.6), cy + Math.round(q * 1.4), 26);
+  // 太陽光を郊外に散らす。火力 1 基だけだと開幕から電力が足りない。
+  placeNear(sim, Arch.SolarFarm, cx - Math.round(q * 1.9), cy - Math.round(q * 1.5), 26);
+  placeNear(sim, Arch.SolarFarm, cx + Math.round(q * 1.9), cy - Math.round(q * 1.7), 26);
+  placeNear(sim, Arch.SolarFarm, cx - Math.round(q * 1.2), cy - Math.round(q * 2.0), 26);
+  placeNear(sim, Arch.SolarFarm, cx + Math.round(q * 1.2), cy - Math.round(q * 2.1), 26);
+  placeNear(sim, Arch.SolarFarm, cx - Math.round(q * 2.1), cy + Math.round(q * 0.6), 26);
 
   // ---------- 6. 初期人口 ----------
   if (opts.seedPopulation && opts.seedPopulation > 0) {

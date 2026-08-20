@@ -20,6 +20,7 @@ import {
 import { pathPosition, type PathPose } from '@sim/network/pathfinder';
 import type { Router } from '@sim/network/router';
 import type { TazMatrix } from '@sim/network/tazMatrix';
+import type { TransitSystem } from '@sim/network/transit';
 import { VehicleKind, type TrafficSystem } from '@sim/network/traffic';
 import { MODE_NAMES_JA } from '@shared/enums';
 import { tileDistanceM } from '@sim/world/tiles';
@@ -40,6 +41,7 @@ export interface ActivityContext {
   rng: Rng;
   destinations: Destinations;
   traffic: TrafficSystem;
+  transit: TransitSystem;
 }
 
 /**
@@ -93,7 +95,7 @@ export class ActivitySystem {
     prefWalk: 0,
     prefBike: 0,
     prefCar: 0,
-    prefRail: 0,
+    prefTransit: 0,
     incomeYenMo: 0,
     age: 30,
     hasCar: false,
@@ -307,7 +309,10 @@ export class ActivitySystem {
       c.tripArriveTick[id] = ctx.clock.tick + travelMin; // 見込み。インスペクタ用
       c.wakeTick[id] = NEVER_WAKE;
     } else {
-      // 徒歩・自転車・鉄道は互いに干渉しないので、経路長から到着時刻を決めてよい。
+      // 徒歩・自転車・公共交通は互いに干渉しないので、経路長から到着時刻を決めてよい
+      // （バス自体は道路の渋滞に巻き込まれるが、それは車両の側で表現されていて、
+      //   乗客の所要時間には路線の区間所要という形で既に織り込まれている）。
+      if (mode === Mode.Transit) ctx.transit.countRiders(path);
       c.state[id] = Activity.Traveling;
       c.tripArriveTick[id] = ctx.clock.tick + travelMin;
       // wakeTick は「次にホイールから起こされるべき tick」。到着もここに含める（遅延削除の判定に使う）。
@@ -336,13 +341,13 @@ export class ActivitySystem {
         const speedMs = mode === Mode.Walk ? 1.33 : mode === Mode.Bike ? 4.2 : mode === Mode.Car ? 8.3 : 12;
         sec = (straight / speedMs) * 1.35;
         // 鉄道は駅が近くに無ければ使えない
-        if (mode === Mode.Rail) {
+        if (mode === Mode.Transit) {
           const a = ctx.world.transitAccess[originTile]!;
           const b = ctx.world.transitAccess[destTile]!;
           if (a >= 255 || b >= 255) sec = Infinity;
           else sec += (a + b) * 60;
         }
-      } else if (mode === Mode.Rail) {
+      } else if (mode === Mode.Transit) {
         const a = ctx.world.transitAccess[originTile]!;
         const b = ctx.world.transitAccess[destTile]!;
         if (a >= 255 || b >= 255) sec = Infinity;
@@ -517,7 +522,7 @@ function destTileOf(ctx: ActivityContext, slot: number): number {
  * 市民が「移動中」かつ経路を持つとき、現在位置をワールド座標で返す（描画用）。
  *
  * `tick` は端数を含んでよい。描画側はフレームごとの端数 tick を渡すことで、
- * 12 tick/秒のシミュレーションでも 60fps の滑らかな動きになる。
+ * ×1 で 0.75 tick/秒しか進まないシミュレーションでも 60fps の滑らかな動きになる。
  */
 export function citizenPosition(
   citizens: CitizenStore,
