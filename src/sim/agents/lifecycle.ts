@@ -1,10 +1,12 @@
 import {
   DAYS_PER_YEAR,
-  JOB_SEEKERS_PER_DAY,
+  JOB_SEEKERS_PER_PERIOD,
   MORTALITY_A,
   MORTALITY_B,
+  NIGHT_SHIFT_SHARE,
   RELOCATE_PATIENCE_DAYS,
   RETIRE_AGE,
+  SHIFT_WORK_SHARE,
   TARGET_TFR,
   WORK_AGE_MIN,
 } from '@shared/constants';
@@ -16,6 +18,7 @@ import type { BuildingStore } from '@sim/buildings/buildings';
 import { handleSlot } from '@sim/buildings/buildings';
 import type { TazMatrix } from '@sim/network/tazMatrix';
 import type { World } from '@sim/world/world';
+import type { UtilitySystem } from '@sim/world/utilities';
 import type { ActivitySystem } from './activity';
 import { CitizenFlag, type CitizenStore } from './citizens';
 import {
@@ -51,9 +54,8 @@ export interface LifecycleContext {
   rng: Rng;
   wheel: TimeWheel;
   activity: ActivitySystem;
+  utilities?: UtilitySystem;
 }
-
-let nextHouseholdId = 1;
 
 /**
  * 市民を 1 人生成する。嗜好はここで一度だけ引き、生涯変わらない。
@@ -84,7 +86,7 @@ export function createCitizen(
   c.prefWalk[id] = clampI8(rng.normal(0, 6));
   c.prefBike[id] = clampI8(rng.normal(0, 6));
   c.prefCar[id] = clampI8(rng.normal(0, 7));
-  c.prefRail[id] = clampI8(rng.normal(0, 6));
+  c.prefTransit[id] = clampI8(rng.normal(0, 6));
   c.leisureTaste[id] = Math.max(0, Math.min(255, Math.round(rng.normal(120, 50))));
 
   const canDrive = age >= 18 && rng.chance(0.72);
@@ -95,7 +97,7 @@ export function createCitizen(
   c.set(id, CitizenFlag.Retired, age >= RETIRE_AGE);
   c.set(id, CitizenFlag.Student, age >= 6 && age < 18);
 
-  c.scheduleId[id] = pickSchedule(age, false, age >= RETIRE_AGE, rng.chance(0.08));
+  c.scheduleId[id] = pickSchedule(age, false, age >= RETIRE_AGE, rng.chance(NIGHT_SHIFT_SHARE));
   c.scheduleStep[id] = 0;
   c.state[id] = Activity.AtHome;
   c.unhappyDays[id] = 0;
@@ -115,21 +117,48 @@ function clampI8(v: number): number {
   return Math.max(-127, Math.min(127, Math.round(v)));
 }
 
-export function newHouseholdId(): number {
-  return nextHouseholdId++;
-}
-
-/** 決定論を保つため、シード読み込み時に世帯 ID カウンタも戻す。 */
-export function resetHouseholdIds(): void {
-  nextHouseholdId = 1;
-}
-
 /**
  * 日次のライフサイクル処理。全市民を毎日見るのではなく 1/7 ずつ処理して
  * 1 週間で一巡させる（人口 1 万人でも 1 日あたり 1400 人分の軽い処理で済む）。
  */
 export class LifecycleSystem {
+  /**
+   * 世帯 ID の採番。**モジュール変数ではなくインスタンス変数**に置く。
+   * 以前はモジュール変数で、`Simulation` を 2 つ作ると
+   * （セーブデータの読み込みでシードが変わったときなど）
+   * 1 つ目のカウンタが 1 に巻き戻り、以後に生まれる市民が既存の世帯と
+   * 同じ ID を持つようになっていた。「街はシードとコマンド列だけで決まる」
+   * という前提も、ここだけ他のインスタンスに影響される形で破れていた。
+   */
+  private nextHouseholdId = 1;
+
+  /** 新しい世帯 ID を 1 つ払い出す。 */
+  newHouseholdId(): number {
+    return this.nextHouseholdId++;
+  }
+
+  /** セーブ／ロード用。復元しないと、読み込み後の世帯 ID が既存と衝突する。 */
+  householdIdCounter(): number {
+    return this.nextHouseholdId;
+  }
+
+  setHouseholdIdCounter(n: number): void {
+    this.nextHouseholdId = Math.max(1, Math.floor(n));
+  }
+
   private slice = 0;
+  /** 求職の走査位置。未就業者を一巡させるための回転カーソル。 */
+  private jobCursor = 0;
+
+  /** 走査位置。セーブ／ロードで復元しないと、読み込んだ街の進み方が変わる。 */
+  get cursors(): [number, number] {
+    return [this.slice, this.jobCursor];
+  }
+  set cursors(v: [number, number]) {
+    this.slice = Math.max(0, Math.floor(v[0]));
+    this.jobCursor = Math.max(0, Math.floor(v[1]));
+  }
+  private readonly seekers: number[] = [];
   readonly stats: LifecycleStats = {
     births: 0,
     deaths: 0,
@@ -142,6 +171,81 @@ export class LifecycleSystem {
     housingIndex: { byTaz: [], totalVacant: 0, totalDwellings: 0 },
   };
 
+  /**
+   * 労働市場。経済期ごと（2 シミュレーション時間 = ×1 で約 2.7 実分）に回す。
+   *
+   * 元は日次ライフサイクルの中にあり、しかも「市民 1 人につき 7 日に 1 回」しか
+   * 求職しなかった。1 日が 32 実分になった今それは ×1 で 3.7 実時間に 1 回であり、
+   * 商店を建てても就業者が 0 のまま、失業率も下がらないという体感になっていた。
+   *
+   * 求職の実行は回転カーソルで分散させる。先頭から N 人だけ処理すると、
+   * ID の大きい市民が永久に職に就けない。
+   */
+  updateLabourMarket(ctx: LifecycleContext): void {
+    const c = ctx.citizens;
+    const b = ctx.buildings;
+    const rng = ctx.rng;
+    const jobIndex = this.refreshCounts(ctx);
+
+    const n = this.seekers.length;
+    if (n === 0) {
+      this.jobCursor = 0;
+      return;
+    }
+    const attempts = Math.min(n, JOB_SEEKERS_PER_PERIOD);
+    for (let k = 0; k < attempts; k++) {
+      const id = this.seekers[(this.jobCursor + k) % n]!;
+      if (!seekJob(c, b, ctx.taz, jobIndex, rng, id)) continue;
+      c.scheduleId[id] = pickSchedule(
+        c.age[id]!,
+        true,
+        false,
+        rng.chance(NIGHT_SHIFT_SHARE),
+        rng.chance(SHIFT_WORK_SHARE),
+      );
+      // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
+      const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
+      c.set(id, CitizenFlag.TransitPass, homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15);
+      ctx.activity.rescheduleCitizen(ctx as never, id);
+    }
+    this.jobCursor = (this.jobCursor + attempts) % n;
+  }
+
+  /**
+   * 求人・住宅の在庫と、就業／失業／住居なしの人数を数え直す。
+   * 求職者の一覧も作る。セーブデータの読み込み直後にも単独で呼ぶ
+   * （統計だけが古いまま表示されるのを防ぐ）。
+   */
+  refreshCounts(ctx: LifecycleContext): JobIndex {
+    const c = ctx.citizens;
+    const b = ctx.buildings;
+    const jobIndex = buildJobIndex(b);
+    this.stats.jobIndex = jobIndex;
+    this.stats.housingIndex = buildHousingIndex(b);
+
+    let employed = 0;
+    let unemployed = 0;
+    let homeless = 0;
+    this.seekers.length = 0;
+
+    for (const id of c.each()) {
+      if (c.homeBuilding[id] === 0) homeless++;
+      if (c.has(id, CitizenFlag.Employed)) {
+        employed++;
+        continue;
+      }
+      const age = c.age[id]!;
+      if (age < WORK_AGE_MIN || age >= RETIRE_AGE) continue;
+      unemployed++;
+      if (!c.has(id, CitizenFlag.Retired) && c.homeBuilding[id] !== 0) this.seekers.push(id);
+    }
+
+    this.stats.employed = employed;
+    this.stats.unemployed = unemployed;
+    this.stats.homeless = homeless;
+    return jobIndex;
+  }
+
   daily(ctx: LifecycleContext): void {
     const c = ctx.citizens;
     const b = ctx.buildings;
@@ -152,19 +256,13 @@ export class LifecycleSystem {
     this.stats.immigrants = 0;
     this.stats.emigrants = 0;
 
-    const jobIndex = buildJobIndex(b);
+    // 求職と雇用統計は経済期ごと（updateLabourMarket）に回すので、ここでは扱わない。
     const housingIndex = buildHousingIndex(b);
-    this.stats.jobIndex = jobIndex;
     this.stats.housingIndex = housingIndex;
 
     const dayOfYear = ctx.clock.dayOfYear;
     const slice = this.slice;
     this.slice = (this.slice + 1) % 7;
-
-    let employed = 0;
-    let unemployed = 0;
-    let homeless = 0;
-    let jobSeekers = 0;
 
     for (const id of c.each()) {
       // --- 参照の健全性: 建物が壊れていたら参照を切る ---
@@ -174,10 +272,6 @@ export class LifecycleSystem {
         c.incomeYenMo[id] = 0;
         c.set(id, CitizenFlag.Employed, false);
       }
-
-      if (c.homeBuilding[id] === 0) homeless++;
-      if (c.has(id, CitizenFlag.Employed)) employed++;
-      else if (c.age[id]! >= WORK_AGE_MIN && c.age[id]! < RETIRE_AGE) unemployed++;
 
       // 週に 1 度だけ重い処理を回す
       if (id % 7 !== slice) continue;
@@ -207,33 +301,11 @@ export class LifecycleSystem {
         continue;
       }
 
-      // --- 求職 ---
-      if (
-        !c.has(id, CitizenFlag.Employed) &&
-        !c.has(id, CitizenFlag.Retired) &&
-        age >= WORK_AGE_MIN &&
-        age < RETIRE_AGE &&
-        c.homeBuilding[id] !== 0 &&
-        jobSeekers < JOB_SEEKERS_PER_DAY
-      ) {
-        jobSeekers++;
-        if (seekJob(c, b, ctx.taz, jobIndex, rng, id)) {
-          c.scheduleId[id] = pickSchedule(age, true, false, rng.chance(0.08));
-          // 鉄道アクセスの良い勤め人は定期券を持つ（通勤の鉄道分担率を大きく押し上げる）
-          const homeTile = b.valid(c.homeBuilding[id]!)
-            ? b.originTile[handleSlot(c.homeBuilding[id]!)]!
-            : -1;
-          const pass = homeTile >= 0 && ctx.world.transitAccess[homeTile]! < 15;
-          c.set(id, CitizenFlag.TransitPass, pass);
-          ctx.activity.initCitizen(ctx as never, id);
-        }
-      }
-
       // --- 住居探し・転居 ---
       if (c.homeBuilding[id] === 0) {
         if (seekHome(c, b, ctx.taz, housingIndex, rng, id, ctx.world.landValue)) {
           c.unhappyDays[id] = 0;
-          ctx.activity.initCitizen(ctx as never, id);
+          ctx.activity.rescheduleCitizen(ctx as never, id);
         } else {
           // 住むところが無い状態が続いたら転出
           c.unhappyDays[id] = c.unhappyDays[id]! + 7;
@@ -250,7 +322,7 @@ export class LifecycleSystem {
           if (seekHome(c, b, ctx.taz, housingIndex, rng, id, ctx.world.landValue)) {
             c.unhappyDays[id] = 0;
             c.happiness[id] = 130;
-            ctx.activity.initCitizen(ctx as never, id);
+            ctx.activity.rescheduleCitizen(ctx as never, id);
           } else if (c.unhappyDays[id]! > RELOCATE_PATIENCE_DAYS * 3) {
             this.emigrate(ctx, id);
             this.stats.emigrants++;
@@ -280,9 +352,16 @@ export class LifecycleSystem {
       // 学校・病院・交番・公園を届かせて初めて満足が上回る。
       // 基礎をプラスにすると、プレイヤが何もしなくても全員が幸福度の上限に張り付き、
       // 公共サービスにも公害にも意味が無くなる。
-      const homeTile = b.valid(c.homeBuilding[id]!) ? b.originTile[handleSlot(c.homeBuilding[id]!)]! : -1;
+      const homeSlot = b.valid(c.homeBuilding[id]!) ? handleSlot(c.homeBuilding[id]!) : -1;
+      const homeTile = homeSlot >= 0 ? b.originTile[homeSlot]! : -1;
       if (homeTile >= 0) {
         let delta = -2;
+        // 停電・断水。サービスが 1 つ届く価値（+1）より重くしてある。
+        // 学校や公園が無い暮らしは不便だが、電気と水が来ない家には住めない。
+        if (ctx.utilities) {
+          if (!ctx.utilities.hasPower(homeSlot)) delta -= 2;
+          if (!ctx.utilities.hasWater(homeSlot)) delta -= 2;
+        }
         const svc = ctx.world.svcMask[homeTile]!;
         if ((svc & Service.Education) !== 0) delta += 1;
         if ((svc & Service.Health) !== 0) delta += 1;
@@ -302,10 +381,6 @@ export class LifecycleSystem {
         c.happiness[id] = Math.max(0, Math.min(255, c.happiness[id]! + delta));
       }
     }
-
-    this.stats.employed = employed;
-    this.stats.unemployed = unemployed;
-    this.stats.homeless = homeless;
   }
 
   /**
@@ -332,7 +407,7 @@ export class LifecycleSystem {
         }
       }
       if (slot < 0) break;
-      const hh = newHouseholdId();
+      const hh = this.newHouseholdId();
       const handle = b.handleOf(slot);
       // 単身か夫婦か。世帯人数は住戸の空きに収まる範囲で。
       const room = b.capacityResidents[slot]! - b.residents[slot]!;

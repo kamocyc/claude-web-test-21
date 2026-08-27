@@ -80,25 +80,23 @@ export const ROAD_NAMES_JA: Record<number, string> = {
   [RoadClass.Boulevard]: '大通り',
 };
 
-/** 自由流速度 (km/h) と容量 (台/時)。BPR 関数の t0 と C。 */
+/** 自由流速度 (km/h)。混雑していないリンクの通過時間はこれで決まる。 */
 export const ROAD_SPEED_KMH: Record<number, number> = {
   [RoadClass.None]: 0,
   [RoadClass.Street]: 30,
   [RoadClass.Avenue]: 45,
   [RoadClass.Boulevard]: 60,
 };
-export const ROAD_CAPACITY_VPH: Record<number, number> = {
+/**
+ * 片方向の車線数。交差点で捌ける台数（飽和交通流率 × 車線数）と、
+ * リンクに溜められる台数（長さ × 車線数）の両方を決める。
+ * 生活道路を大通りに広げると行列が捌けるのは、この 2 つが同時に増えるため。
+ */
+export const ROAD_LANES: Record<number, number> = {
   [RoadClass.None]: 0,
-  [RoadClass.Street]: 600,
-  [RoadClass.Avenue]: 1400,
-  [RoadClass.Boulevard]: 2600,
-};
-/** BPR の α。生活道路ほど混雑で急激に遅くなる。 */
-export const ROAD_BPR_ALPHA: Record<number, number> = {
-  [RoadClass.None]: 0,
-  [RoadClass.Street]: 0.9,
-  [RoadClass.Avenue]: 0.6,
-  [RoadClass.Boulevard]: 0.35,
+  [RoadClass.Street]: 1,
+  [RoadClass.Avenue]: 2,
+  [RoadClass.Boulevard]: 3,
 };
 /** 建設費 (円/タイル) と月次維持費 (円/タイル)。 */
 export const ROAD_BUILD_COST: Record<number, number> = {
@@ -114,12 +112,21 @@ export const ROAD_UPKEEP: Record<number, number> = {
   [RoadClass.Boulevard]: 4800,
 };
 
-/** 交通手段。エッジのモードマスクにビットとして使う。 */
+/**
+ * 交通手段。エッジのモードマスクにビットとして使う。
+ *
+ * `Transit`（値 3）はバスと鉄道の両方を指す。路線ごとにプラットフォーム・ノードを
+ * 置き、乗車・乗車中・降車のエッジで表現するので、1 回のトリップの中で
+ * 「バスで駅まで行って電車に乗り換える」が自然に出る。
+ * モードを 4 つに保っているのは、`ModeTimes` の固定長タプル・`MODE_ASC` の行長・
+ * 市民の選好配列・TAZ 行列がすべて `MODE_COUNT` に張り付いているため。
+ */
 export const Mode = {
   Walk: 0,
   Bike: 1,
   Car: 2,
-  Rail: 3,
+  /** 公共交通（バス・鉄道）。値は 3 のまま — セーブデータに入っている。 */
+  Transit: 3,
 } as const;
 export type Mode = (typeof Mode)[keyof typeof Mode];
 export const MODE_COUNT = 4;
@@ -128,7 +135,7 @@ export const MODE_NAMES_JA: Record<number, string> = {
   [Mode.Walk]: '徒歩',
   [Mode.Bike]: '自転車',
   [Mode.Car]: '自動車',
-  [Mode.Rail]: '鉄道',
+  [Mode.Transit]: '公共交通',
 };
 
 /** エッジのモードマスク（ビットフラグ）。 */
@@ -136,9 +143,16 @@ export const ModeBit = {
   Walk: 1 << 0,
   Bike: 1 << 1,
   Car: 1 << 2,
+  /**
+   * 線路タイルどうしを結ぶエッジ。
+   * 経路探索には使わない（乗客は路線のプラットフォームを渡り歩く）が、
+   * 線路の折れ線を抽出して自動路線と電車の描画に使うので残してある。
+   */
   Rail: 1 << 3,
-  /** 乗降エッジ。鉄道クエリでのみ通行可能。 */
+  /** 停留所 ↔ プラットフォームの乗降エッジ。公共交通クエリでのみ通行可能。 */
   Board: 1 << 4,
+  /** プラットフォーム間の乗車中エッジ。運行間隔と区間所要が載る。 */
+  Ride: 1 << 5,
 } as const;
 
 /** モード -> そのモードのクエリで通行可能なエッジマスク。 */
@@ -146,7 +160,7 @@ export const MODE_EDGE_MASK: Record<number, number> = {
   [Mode.Walk]: ModeBit.Walk,
   [Mode.Bike]: ModeBit.Walk | ModeBit.Bike,
   [Mode.Car]: ModeBit.Walk | ModeBit.Car,
-  [Mode.Rail]: ModeBit.Walk | ModeBit.Rail | ModeBit.Board,
+  [Mode.Transit]: ModeBit.Walk | ModeBit.Board | ModeBit.Ride,
 };
 
 /** 各モードの最高速度 (km/h)。A* のヒューリスティックを許容的に保つために使う。 */
@@ -154,7 +168,7 @@ export const MODE_MAX_SPEED_KMH: Record<number, number> = {
   [Mode.Walk]: 4.8,
   [Mode.Bike]: 15,
   [Mode.Car]: 60,
-  [Mode.Rail]: 70,
+  [Mode.Transit]: 70,
 };
 
 /** 市民の行動状態。 */
@@ -167,6 +181,7 @@ export const Activity = {
   Leisure: 5, // レジャー中
   WaitingForRoute: 6, // 経路探索待ち
   Traveling: 7, // 移動中
+  Business: 8, // 業務で外出中（勤務先とは別の事業所にいる）
 } as const;
 export type Activity = (typeof Activity)[keyof typeof Activity];
 
@@ -179,6 +194,7 @@ export const ACTIVITY_NAMES_JA: Record<number, string> = {
   [Activity.Leisure]: 'レジャー',
   [Activity.WaitingForRoute]: '出発準備',
   [Activity.Traveling]: '移動中',
+  [Activity.Business]: '外回り',
 };
 
 /** 移動の目的。交通手段選択のバイアスに使う。 */
@@ -188,6 +204,7 @@ export const Purpose = {
   Shopping: 2, // 買い物
   Leisure: 3, // レジャー
   Home: 4, // 帰宅
+  Business: 5, // 業務移動
 } as const;
 export type Purpose = (typeof Purpose)[keyof typeof Purpose];
 
@@ -197,6 +214,7 @@ export const PURPOSE_NAMES_JA: Record<number, string> = {
   [Purpose.Shopping]: '買い物',
   [Purpose.Leisure]: 'レジャー',
   [Purpose.Home]: '帰宅',
+  [Purpose.Business]: '業務',
 };
 
 /** 資源（財）。サプライチェーンの単位。 */
@@ -256,6 +274,8 @@ export const Overlay = {
   Pollution: 3, // 公害
   TransitAccess: 4, // 公共交通アクセス
   Zone: 5, // 用途地域
+  Power: 6, // 電力
+  Water: 7, // 上水道
 } as const;
 export type Overlay = (typeof Overlay)[keyof typeof Overlay];
 
@@ -264,6 +284,43 @@ export const OVERLAY_NAMES_JA: Record<number, string> = {
   [Overlay.LandValue]: '地価',
   [Overlay.Traffic]: '交通量',
   [Overlay.Pollution]: '公害',
-  [Overlay.TransitAccess]: '鉄道アクセス',
+  [Overlay.TransitAccess]: '交通アクセス',
   [Overlay.Zone]: '用途地域',
+  [Overlay.Power]: '電力',
+  [Overlay.Water]: '上水道',
+};
+
+/**
+ * 公共交通の車両種別。路線が持つ。
+ *
+ * バスは道路を走るので `TrafficSystem` の待ち行列に載り、渋滞に巻き込まれる。
+ * 電車は専用軌道なので巻き込まれない — 路線を分ける理由はここにある。
+ */
+export const TransitKind = {
+  Bus: 0,
+  Train: 1,
+} as const;
+export type TransitKind = (typeof TransitKind)[keyof typeof TransitKind];
+
+export const TRANSIT_KIND_NAMES_JA: Record<number, string> = {
+  [TransitKind.Bus]: 'バス',
+  [TransitKind.Train]: '電車',
+};
+
+/** 一方通行の向き。0 = 双方向。値はタイル配列に入るので変えない。 */
+export const OneWay = {
+  None: 0,
+  North: 1,
+  East: 2,
+  South: 3,
+  West: 4,
+} as const;
+export type OneWay = (typeof OneWay)[keyof typeof OneWay];
+
+export const ONE_WAY_NAMES_JA: Record<number, string> = {
+  [OneWay.None]: '双方向',
+  [OneWay.North]: '北',
+  [OneWay.East]: '東',
+  [OneWay.South]: '南',
+  [OneWay.West]: '西',
 };

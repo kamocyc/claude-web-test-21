@@ -2,6 +2,7 @@ import { Good, Season } from '@shared/enums';
 import { archetype, isProducer } from '@sim/buildings/archetypes';
 import type { BuildingStore } from '@sim/buildings/buildings';
 import type { Clock } from '@sim/core/clock';
+import type { UtilitySystem } from '@sim/world/utilities';
 
 
 /**
@@ -67,6 +68,7 @@ export function runProduction(
   buildings: BuildingStore,
   clock: Clock,
   stats: ProductionStats,
+  utilities?: UtilitySystem,
 ): void {
   stats.produced.fill(0);
   stats.consumed.fill(0);
@@ -90,6 +92,9 @@ export function runProduction(
     if (buildings.outGood[s] !== Good.None) stats.stock[buildings.outGood[s]!]! += buildings.outAmt[s]!;
 
     if (!isProducer(archId)) continue;
+    // 電気か水が止まって機能停止している事業所は生産しない。
+    // 在庫の集計より後に置くのは、止まっていても倉庫の中身は在庫として数えたいため。
+    if (utilities?.isShutdown(s)) continue;
 
     const level = buildings.level[s]!;
     const total = buildings.jobsTotal[s]!;

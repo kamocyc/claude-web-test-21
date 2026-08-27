@@ -4,8 +4,10 @@ import {
   Color,
   DirectionalLight,
   Fog,
+  InstancedMesh,
   Line,
   LineBasicMaterial,
+  Matrix4,
   Mesh,
   MeshBasicMaterial,
   PlaneGeometry,
@@ -16,16 +18,19 @@ import {
   WebGLRenderer,
   BufferAttribute,
 } from 'three';
-import { MAP_H, MAP_W, TILE_M } from '@shared/constants';
-import type { Overlay } from '@shared/enums';
+import { MAP_H, MAP_W, MAX_PREVIEW_TILES, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
+import { Overlay } from '@shared/enums';
 import type { Path } from '@sim/network/pathfinder';
 import type { Simulation } from '@sim/simulation';
 import { idx } from '@sim/world/tiles';
 import { AgentLayer } from './agentLayer';
 import { BuildingLayer } from './buildingLayer';
 import { CameraRig } from './cameraRig';
+import { NatureLayer } from './natureLayer';
+import { RailLayer } from './railLayer';
+import { RoadLayer } from './roadLayer';
 import { TerrainMesh } from './terrainMesh';
-import { skyColor, sunIntensity } from './theme';
+import { PREVIEW_BAD_COLOR, PREVIEW_OK_COLOR, skyColor, sunIntensity } from './theme';
 
 /**
  * 描画レイヤの統括。
@@ -38,6 +43,9 @@ export class Renderer {
   readonly rig: CameraRig;
   private readonly renderer: WebGLRenderer;
   private readonly terrain = new TerrainMesh();
+  private readonly roads = new RoadLayer();
+  private readonly rails = new RailLayer();
+  private readonly nature = new NatureLayer();
   private readonly buildings = new BuildingLayer();
   private readonly agents = new AgentLayer();
   private readonly sun: DirectionalLight;
@@ -45,11 +53,16 @@ export class Renderer {
 
   /** タイル選択のハイライト。 */
   private readonly cursor: Mesh;
+  /** ドラッグ中に「これから敷かれる範囲」を光らせるインスタンス群。 */
+  private readonly preview: InstancedMesh;
+  private readonly previewMat = new Matrix4();
+  private readonly previewPos = new Vector3();
+  private readonly previewOkColor = new Color(PREVIEW_OK_COLOR);
+  private readonly previewBadColor = new Color(PREVIEW_BAD_COLOR);
   /** 経路デバッグ表示用のライン。 */
   private readonly routeLine: Line;
   private readonly raycaster = new Raycaster();
   private readonly ndc = new Vector2();
-  private readonly groundPlane: Mesh;
 
   drawCalls = 0;
 
@@ -71,6 +84,9 @@ export class Renderer {
     this.scene.add(this.sun);
 
     this.scene.add(this.terrain.group);
+    this.scene.add(this.nature.group);
+    this.scene.add(this.roads.group);
+    this.scene.add(this.rails.group);
     this.scene.add(this.buildings.group);
     this.scene.add(this.agents.group);
 
@@ -85,6 +101,20 @@ export class Renderer {
     this.cursor.visible = false;
     this.scene.add(this.cursor);
 
+    // ドラッグ範囲のプレビュー。1 タイル 1 インスタンス。
+    const previewGeom = new PlaneGeometry(TILE_M * 0.92, TILE_M * 0.92);
+    previewGeom.rotateX(-Math.PI / 2);
+    this.preview = new InstancedMesh(
+      previewGeom,
+      new MeshBasicMaterial({ transparent: true, opacity: 0.5, depthTest: false }),
+      MAX_PREVIEW_TILES,
+    );
+    this.preview.count = 0;
+    this.preview.visible = false;
+    this.preview.frustumCulled = false;
+    this.preview.renderOrder = 9;
+    this.scene.add(this.preview);
+
     // 経路表示
     const routeGeom = new BufferGeometry();
     routeGeom.setAttribute('position', new BufferAttribute(new Float32Array(3 * 4096), 3));
@@ -93,17 +123,15 @@ export class Renderer {
     this.routeLine.renderOrder = 11;
     this.routeLine.frustumCulled = false;
     this.scene.add(this.routeLine);
-
-    // ピッキング用の不可視平面（地形の凹凸を無視した近似で十分）
-    const planeGeom = new PlaneGeometry(MAP_W * TILE_M, MAP_H * TILE_M);
-    planeGeom.rotateX(-Math.PI / 2);
-    planeGeom.translate((MAP_W * TILE_M) / 2, 0, (MAP_H * TILE_M) / 2);
-    this.groundPlane = new Mesh(planeGeom, new MeshBasicMaterial({ visible: false }));
-    this.scene.add(this.groundPlane);
   }
 
   setOverlay(o: Overlay): void {
     this.terrain.setOverlay(o);
+    // 情報表示のときは道路の造形を隠す。車道の板がヒートマップを覆ってしまい、
+    // 「どの道が混んでいるか」というオーバーレイ本来の役目が果たせなくなる。
+    this.roads.setVisible(o === Overlay.None);
+    this.rails.setVisible(o === Overlay.None);
+    this.nature.setVisible(o === Overlay.None);
   }
 
   get overlay(): Overlay {
@@ -115,19 +143,73 @@ export class Renderer {
     this.terrain.invalidateAll();
   }
 
-  /** 画面座標からタイル index を求める。範囲外なら -1。 */
-  pickTile(clientX: number, clientY: number, canvas: HTMLCanvasElement): number {
+  /** 世界そのものが差し替わった（セーブデータの読み込み）ときに、全部作り直させる。 */
+  invalidateAll(): void {
+    this.terrain.invalidateAll();
+    this.roads.invalidate();
+    this.rails.invalidate();
+    this.nature.invalidate();
+    this.buildings.invalidate();
+  }
+
+  /**
+   * 画面座標からタイル index を求める。範囲外なら -1。
+   *
+   * 高さ 0 の平面と交差させるだけでは、斜めから見たときにカーソルが**手前にずれる**。
+   * 標高 20m の丘を仰角 40°から見ると、実際に見えている地面と高さ 0 の交点は
+   * 20 / tan(40°) ≒ 24m ＝ 2 タイル以上離れる。
+   *
+   * そこで「今の推定高さの水平面と交差 → その位置の標高を読む」を数回繰り返す。
+   * 斜面が視線より急でなければ 2〜3 回で収束する。
+   */
+  pickTile(clientX: number, clientY: number, canvas: HTMLCanvasElement, world?: { heightDm: Uint16Array }): number {
     const rect = canvas.getBoundingClientRect();
     this.ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     this.ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.ndc, this.rig.camera);
-    const hits = this.raycaster.intersectObject(this.groundPlane, false);
-    if (hits.length === 0) return -1;
-    const p = hits[0]!.point;
-    const tx = Math.floor(p.x / TILE_M);
-    const ty = Math.floor(p.z / TILE_M);
-    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return -1;
-    return idx(tx, ty);
+    const ray = this.raycaster.ray;
+    // 上を向いている視線は地面と交わらない
+    if (ray.direction.y > -1e-6) return -1;
+
+    let height = 0;
+    let tile = -1;
+    for (let iter = 0; iter < 4; iter++) {
+      const t = (height - ray.origin.y) / ray.direction.y;
+      if (t <= 0) return -1;
+      const tx = Math.floor((ray.origin.x + ray.direction.x * t) / TILE_M);
+      const ty = Math.floor((ray.origin.z + ray.direction.z * t) / TILE_M);
+      if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return -1;
+      const next = idx(tx, ty);
+      if (!world) return next;
+      const h = world.heightDm[next]! * TERRAIN_HEIGHT_SCALE;
+      if (next === tile) return next; // 同じタイルに落ち着いた
+      tile = next;
+      height = h;
+    }
+    return tile;
+  }
+
+  /**
+   * これから敷かれる範囲を光らせる。ドラッグ中に呼ぶ。
+   * @param ok タイルごとの可否。false のタイルは赤くする。
+   */
+  setPreviewTiles(tiles: readonly number[], world: { heightDm: Uint16Array } | null, ok?: readonly boolean[]): void {
+    const n = Math.min(tiles.length, MAX_PREVIEW_TILES);
+    this.preview.count = n;
+    this.preview.visible = n > 0;
+    if (n === 0) return;
+    for (let i = 0; i < n; i++) {
+      const tile = tiles[i]!;
+      const x = tile % MAP_W;
+      const y = (tile / MAP_W) | 0;
+      const h = world ? world.heightDm[tile]! * TERRAIN_HEIGHT_SCALE : 0;
+      this.previewPos.set((x + 0.5) * TILE_M, h + 0.35, (y + 0.5) * TILE_M);
+      this.previewMat.makeTranslation(this.previewPos.x, this.previewPos.y, this.previewPos.z);
+      this.preview.setMatrixAt(i, this.previewMat);
+      this.preview.setColorAt(i, ok && ok[i] === false ? this.previewBadColor : this.previewOkColor);
+    }
+    this.preview.instanceMatrix.needsUpdate = true;
+    if (this.preview.instanceColor) this.preview.instanceColor.needsUpdate = true;
   }
 
   /** 選択中のタイルを光らせる。-1 で非表示。 */
@@ -138,7 +220,7 @@ export class Renderer {
     }
     const x = tile % MAP_W;
     const y = (tile / MAP_W) | 0;
-    const h = world ? world.heightDm[tile]! * 0.02 : 0;
+    const h = world ? world.heightDm[tile]! * TERRAIN_HEIGHT_SCALE : 0;
     this.cursor.position.set((x + 0.5) * TILE_M, h + 0.5, (y + 0.5) * TILE_M);
     this.cursor.visible = true;
   }
@@ -165,7 +247,8 @@ export class Renderer {
 
   /**
    * @param tickFraction 直近 tick からの端数 (0..1)。エージェントの補間に使う。
-   *   これが無いと 12 tick/秒のシミュレーションのカクつきがそのまま見える。
+   *   これが無いと、×1 で 0.75 tick/秒しか進まないシミュレーションのカクつきが
+   *   そのまま見える（1 秒に 1 コマも動かない）。
    */
   render(sim: Simulation, dt: number, tickFraction = 0): void {
     this.rig.update(dt);
@@ -188,7 +271,12 @@ export class Renderer {
     this.sun.target.updateMatrixWorld();
 
     this.terrain.update(sim);
+    this.nature.update(sim);
+    this.roads.update(sim);
+    this.rails.update(sim);
     this.buildings.update(sim);
+    this.buildings.setTimeOfDay(frac);
+    this.agents.setTimeOfDay(frac);
     this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance, tickFraction);
 
     this.renderer.render(this.scene, this.rig.camera);
@@ -216,8 +304,16 @@ export class Renderer {
 
   dispose(): void {
     this.terrain.dispose();
+    this.nature.dispose();
+    this.roads.dispose();
+    this.rails.dispose();
     this.buildings.dispose();
     this.agents.dispose();
+    // カーソル・プレビュー・経路ラインも自分で捨てる（誰も解放していなかった）。
+    for (const o of [this.cursor, this.preview, this.routeLine]) {
+      o.geometry.dispose();
+      (o.material as { dispose(): void }).dispose();
+    }
     this.renderer.dispose();
   }
 

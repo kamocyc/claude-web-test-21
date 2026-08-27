@@ -67,7 +67,7 @@ export class BinaryHeap {
     return top;
   }
 
-  /** 直前に pop した要素のキー。pop の戻り値と併せて使う。 */
+  /** 次に pop される要素のキー（取り出しはしない）。 */
   peekKey(): number {
     return this.n === 0 ? Infinity : this.keys[0]!;
   }

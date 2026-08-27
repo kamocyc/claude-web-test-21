@@ -12,7 +12,10 @@ export type AlertKind =
   | 'stockout' // 商品切れ
   | 'abandoned' // 廃墟化
   | 'budgetDeficit' // 赤字
-  | 'noPath'; // 経路なし
+  | 'noPath' // 経路なし
+  | 'congestion' // 渋滞
+  | 'outage' // 停電・断水
+  | 'info'; // 操作の結果の通知（保存・読み込みなど）
 
 export type SimEvent =
   | { t: 'buildingSpawned'; id: number }

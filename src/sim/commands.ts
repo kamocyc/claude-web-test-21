@@ -1,4 +1,4 @@
-import type { RoadClass, Zone } from '@shared/enums';
+import type { RoadClass, TransitKind, Zone } from '@shared/enums';
 
 /**
  * プレイヤ操作はすべてシリアライズ可能なコマンドとして表現し、tick 境界でのみ適用する。
@@ -14,7 +14,13 @@ export type Command =
   | { t: 'zonePaint'; zone: Zone; tiles: number[] }
   | { t: 'bulldoze'; tiles: number[] }
   | { t: 'setTax'; zone: Zone; pct: number }
-  | { t: 'setSpeed'; speed: number };
+  | { t: 'setSpeed'; speed: number }
+  /** 一方通行。`dir` は `OneWay`。0 で解除。 */
+  | { t: 'setOneWay'; dir: number; tiles: number[] }
+  /** 路線を敷く。`stops` は停留所のタイル番号を通る順に並べたもの。 */
+  | { t: 'createLine'; kind: TransitKind; stops: number[] }
+  | { t: 'setLineHeadway'; line: number; headwayMin: number }
+  | { t: 'deleteLine'; line: number };
 
 export class CommandLog {
   /** [tick, command] のペア。 */

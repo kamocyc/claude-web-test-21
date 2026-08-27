@@ -38,8 +38,12 @@ export const MILESTONES: Milestone[] = [
       `zone:${Zone.None}`,
       `place:${Arch.CityHall}`,
       `place:${Arch.Park}`,
+      // 電気と水は最初から要る。建てないと最初の 1 軒が 2 日で機能停止し、
+      // 「供給が足りない地区には建たない」規則で街がそこから伸びなくなる。
+      `place:${Arch.SolarFarm}`,
+      `place:${Arch.WaterWorks}`,
     ],
-    summaryJa: '生活道路・低層住居・畑・公園・役所',
+    summaryJa: '生活道路・低層住居・畑・公園・役所・太陽光発電所・浄水場',
   },
   {
     population: 40,
@@ -55,13 +59,23 @@ export const MILESTONES: Milestone[] = [
   {
     population: 150,
     nameJa: '村',
-    unlocks: [`road:${RoadClass.Avenue}`, `zone:${Zone.IndustrialLight}`, `place:${Arch.School}`],
-    summaryJa: '二車線道路・準工業・学校',
+    unlocks: [
+      `road:${RoadClass.Avenue}`,
+      `zone:${Zone.IndustrialLight}`,
+      `place:${Arch.School}`,
+      `place:${Arch.SewagePlant}`,
+    ],
+    summaryJa: '二車線道路・準工業・学校・下水処理場',
   },
   {
     population: 400,
     nameJa: '町',
-    unlocks: ['rail', `place:${Arch.Station}`, `place:${Arch.FireStation}`, `zone:${Zone.ResidentialMid}`],
+    unlocks: [
+      'rail',
+      `place:${Arch.Station}`,
+      `place:${Arch.FireStation}`,
+      `zone:${Zone.ResidentialMid}`,
+    ],
     summaryJa: '鉄道・駅・消防署・中高層住居',
   },
   {
@@ -73,8 +87,9 @@ export const MILESTONES: Milestone[] = [
       `zone:${Zone.IndustrialHeavy}`,
       `place:${Arch.Hospital}`,
       `place:${Arch.Shrine}`,
+      `place:${Arch.ThermalPowerPlant}`,
     ],
-    summaryJa: '大通り・商業地域・工業地域・病院・神社',
+    summaryJa: '大通り・商業地域・工業地域・病院・神社・火力発電所',
   },
   {
     population: 3000,

@@ -26,7 +26,7 @@ export class PathCache {
   misses = 0;
 
   private static key(origin: number, dest: number, mode: Mode): number {
-    // ノード数の上限を 2^21 (約 200 万) と仮定。TILE_COUNT = 65536 なので十分。
+    // ノード数の上限を 2^21 (約 200 万) と仮定。TILE_COUNT = 102400 なので十分。
     return (origin * 2097152 + dest) * 8 + mode;
   }
 

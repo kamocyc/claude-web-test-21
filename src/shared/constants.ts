@@ -59,6 +59,16 @@ export const DAYS_PER_YEAR = DAYS_PER_MONTH * MONTHS_PER_YEAR;
 export const TICKS_PER_SECOND_AT_1X = 0.75;
 /** 1 フレームで消化する tick の上限。長い tick が続いても死のスパイラルに入らないための蓋。 */
 export const MAX_TICKS_PER_FRAME = 8;
+/**
+ * 経済の反応を回す周期（tick）。
+ *
+ * 転入・求職・地価は元は「1 日 1 回」だった。1 日が 2 実分だった頃はそれで
+ * 十分だったが、移動の見た目を実トリップに合わせて 1 日 = 32 実分にしたため、
+ * 実時間で見ると 16 倍遅くなり「家を建てても 30 分誰も来ない」状態になった。
+ * 1 日の長さと移動の見た目は変えず、経済の時間だけデフォルメして取り戻す。
+ */
+export const ECONOMY_PERIOD_TICKS = 120; // 2 シミュレーション時間 = ×1 で 2.7 実分
+export const ECONOMY_PERIODS_PER_DAY = TICKS_PER_DAY / ECONOMY_PERIOD_TICKS;
 
 // ---------- 経路探索 ----------
 /** 1 tick あたりに許す A* のノード展開総数。フレーム落ちを防ぐ予算。 */
@@ -76,21 +86,88 @@ export const PATH_CACHE_CAPACITY = 120_000;
 /** 建物 → 最寄り道路ノードを探す最大距離（タイル）。これを超えると「接道なし」。 */
 export const ROAD_ACCESS_RADIUS = 4;
 
-// ---------- 交通・渋滞 ----------
-/** BPR の β。 */
-export const BPR_BETA = 4;
+// ---------- 交通流 ----------
+/**
+ * 画面の車 1 台が表す実際の車の台数。**この計画で一番大事な定数。**
+ *
+ * 人口 2000 の街では、朝ラッシュに最も混む道でも 1 時間に 33 台しか通らない。
+ * 生活道路の実容量 600 台/時 の 5% で、実車 1 台 = 1 エージェントとして
+ * 車間を取らせても行列は一生できない。
+ *
+ * 一方、地図は 1/15 縮尺（TILE_SPAN_M / TILE_M）で描いていて、車は 4.2m で描かれている。
+ * この車 1 台が地図上で占める実距離は 63m ＝ 実車 9 台分の車列にあたる。
+ * そこで「画面の車 1 台 = 実車およそ 9 台の車列」と定義し直すと、
+ * 縮尺のデフォルメと台数のデフォルメが 1 個の係数に集約されて数字が噛み合う。
+ *
+ *   車列 1 台の長さ            65m      （描画の車長 4.2m × 15）
+ *   1 リンク(150m)の収容        2 台     （150 / 65。車線数を掛ける）
+ *   交差点の飽和交通流率        200 台列/時（実車 1800 ÷ 9）
+ *   青が半分なら 1 方向の容量   100 台列/時
+ *   実測のピーク需要（最混雑）  33〜100 台列/時
+ *
+ * つまり最混雑の数本だけが飽和し、残りは自由流になる。
+ * ここを知らずに下の定数をいじると、渋滞が全域に出るか一切出ないかのどちらかになる。
+ */
+export const VEHICLE_PLATOON = 9;
+/** 車列 1 台がリンク上で占める長さ (m)。描画の車長 × SIM_PER_RENDER。 */
+export const VEHICLE_LENGTH_M = 65;
+/** 1 車線あたりの飽和交通流率（実車 台/時）。青の間に交差点を捌ける率。 */
+export const SATURATION_VPH_PER_LANE = 1800;
+/**
+ * 1 tick を何分割して交通流を解くか。
+ * 1 tick = 1 分だと、車は 1 分に 1 リンク（150m）しか進めず時速 9km になってしまう。
+ * 5 秒刻みにすると自由流で 1 分に 3〜4 リンク進み、信号も現実的な周期で書ける。
+ */
+export const TRAFFIC_SUBSTEPS_PER_TICK = 12;
+export const TRAFFIC_STEP_SEC = 60 / TRAFFIC_SUBSTEPS_PER_TICK;
+/** 信号の 1 周期（サブステップ数）。12 = 60 秒。 */
+export const SIGNAL_CYCLE_STEPS = 12;
+/** 主道路に与える青の長さ（サブステップ）。残りが従道路。同格の交差点は半分ずつ。 */
+export const SIGNAL_MAJOR_GREEN_STEPS = 8;
+/** 交差点とみなす道路リンクの本数。これ未満のノードには信号を置かない。 */
+export const SIGNAL_MIN_DEGREE = 3;
+/**
+ * これだけ連続で前に進めなかった車両は、満杯のリンクにも 1 台だけ入れる。
+ * 閉路上の全リンクが満杯になると永久に止まる（グリッドロック）ための逃がし弁。
+ */
+export const GRIDLOCK_RELIEF_STEPS = 240;
+/** 1 トリップの上限（tick）。超えたら移動失敗として打ち切る。 */
+export const MAX_TRIP_TICKS = 480;
+/**
+ * トラック 1 台が「乗用車の車列 1 台」に対して占める大きさ（場所と交通容量の両方）。
+ *
+ * 乗用車は 1 台が実車 9 台の車列を表すが、トラックは配送 1 件 = 実車 1 台のまま。
+ * 大型車は乗用車 2 台ぶんに数えるのが交通工学の慣習なので、2 ÷ 9 ≒ 0.22。
+ *
+ * ここを 2.5（＝車列 2.5 台ぶん）にしていたとき、人口 1400 の街で
+ * 稼働トラック 587 台が道路を埋め尽くし、走行 572 台中 516 台が信号待ちになった。
+ * トラックは建物 1 棟につき 1 台走りうるので、乗用車と同じ縮尺で数えてはいけない。
+ */
+export const TRUCK_PLATOON_EQUIV = 0.22;
+/** リンク実測所要時間の EMA 係数（観測 1 回あたり）。 */
+export const LINK_TIME_LAMBDA = 0.3;
+/** 観測がこれだけ古いリンクは自由流に戻していく（tick）。 */
+export const LINK_TIME_FORGET_TICKS = 60;
+/** 経路コストへ実測を反映する間隔（tick）。 */
+export const LINK_TIME_RELAX_TICKS = 10;
+/**
+ * これだけの本数の道路が収容いっぱいになったら、渋滞をプレイヤに通知する。
+ *
+ * 「全道路に対する割合」で見ていたが、地図の道路の大半は郊外の空いた道なので、
+ * 街なかが完全に詰まっていても割合は 0.2% にしかならず一度も鳴らなかった。
+ * 詰まっている本数そのもので見る。
+ */
+export const CONGESTION_ALERT_LINKS = 8;
+/** 渋滞通知のクールダウン（tick）。1 日に何度も出さない。 */
+export const CONGESTION_ALERT_COOLDOWN_TICKS = 480;
+
+// ---------- 経路コスト ----------
 /** 混雑による遅延の上限倍率。無限大コストが A* のヒープを壊すのを防ぐ。 */
 export const MAX_CONGESTION_FACTOR = 8;
 /** エッジコストの EMA 平滑化係数（1 分あたり）。経路選択の発振を抑える中心的な仕掛け。 */
 export const COST_SMOOTHING_LAMBDA = 0.05;
-/** 走行中の再探索を試みる確率。全員が一斉に経路を変えるのを防ぐ。 */
-export const REROUTE_PROBABILITY = 0.1;
-/** 再探索のトリガとなる ETA 超過率。 */
-export const REROUTE_ETA_RATIO = 1.4;
 /** 市民ごとのコスト摂動幅。等コストの並行路に流れを分散させる（確率的利用者均衡）。 */
 export const COST_PERTURBATION = 0.05;
-/** 交通量カウンタの減衰（1 分あたり）。直近 1 時間相当の移動平均になる。 */
-export const VOLUME_DECAY = 1 / 60;
 
 // ---------- 公共交通 ----------
 /** 駅の徒歩アクセス圏（タイル）。8 タイル = 1.2km。 */
@@ -107,6 +184,89 @@ export const TRANSFER_PENALTY_MIN = 4.0;
 export const DEFAULT_HEADWAY_MIN = 8;
 /** 鉄道の表定速度 (km/h)。 */
 export const RAIL_SPEED_KMH = 70;
+
+// ---------- 路線 ----------
+/**
+ * 停留所での停車時間（秒）。乗降と発進をまとめた値。
+ * バスは停留所が多いので、これが積み上がって「各駅停車は遅い」が自然に出る。
+ */
+export const STOP_DWELL_SEC = 25;
+/** 運行間隔の設定できる範囲（分）。 */
+export const MIN_HEADWAY_MIN = 3;
+export const MAX_HEADWAY_MIN = 30;
+/** 1 編成・1 台の定員（人/便）。実車ベース。 */
+export const BUS_CAPACITY = 70;
+export const TRAIN_CAPACITY = 1000;
+/**
+ * 車両 1 台あたりの月次維持費（円）。運転士の人件費が主。
+ * 運行間隔を縮めると必要な車両数が増え、そのぶん費用も増える。
+ */
+export const BUS_VEHICLE_UPKEEP = 850_000;
+export const TRAIN_VEHICLE_UPKEEP = 4_200_000;
+/** 停留所の設置費（円）。バス停は安く、駅は建物として別に建てる。 */
+export const BUS_STOP_COST = 120_000;
+/**
+ * 混雑ペナルティの上限（分）。
+ * 乗車率が定員を超えたぶんを待ち時間に上乗せする（＝積み残し）。
+ * 上限を置かないと、一度あふれた路線が二度と選ばれなくなって振動する。
+ */
+export const CROWDING_PENALTY_MAX_MIN = 12;
+/**
+ * バス 1 台が道路で占める車列の長さ（画面上の車 1 台 = 実車 9 台に対する比）。
+ * 実車の路線バスは 11m。乗用車 4.5m の車列 9 台分（63m）に対して 11/63 ≒ 0.17 だが、
+ * 車間が広く発進が遅いぶんを見て少し重くする。
+ */
+export const BUS_PLATOON_EQUIV = 0.25;
+
+// ---------- 電気・水道 ----------
+/**
+ * 供給は道路網の連結成分を伝わる（電線と水道管は道路の下を通っているものとする）。
+ * 専用の管路を敷かせないのは、このタイル数だと操作が煩雑になる割に、
+ * 意思決定が「繋いだかどうか」しか生まないため。
+ */
+/**
+ * 需要は**定員 1 人あたり**で数える（`capacityResidents` / `jobsTotal`）。
+ *
+ * 実入居・実就業で数えると、転入や離職のたびに需要が揺れて、
+ * ぎりぎりの街が経済期ごとに点いたり消えたりする。定員なら
+ * 「この街区を建てたらいくら要るか」を建てる前に見積もれる。
+ *
+ * 値は日本の実績から。家庭用は 1 世帯 1.2kW・2.4 人世帯として 1 人 0.5kW、
+ * 生活用水は 1 人 1 日 300L。事業所側は延べ床ではなく従業者定員で数えるので、
+ * 「席 1 つあたり」に均した値になっている。
+ */
+/** 居住定員 1 人あたりの電力需要 (kW)。 */
+export const POWER_PER_RESIDENT_KW = 0.5;
+/** 雇用定員 1 人あたりの電力需要 (kW)。 */
+export const POWER_PER_JOB_KW = 0.9;
+/** 居住定員 1 人あたりの上水需要 (m3/日)。 */
+export const WATER_PER_RESIDENT = 0.3;
+/** 雇用定員 1 人あたりの上水需要 (m3/日)。 */
+export const WATER_PER_JOB = 0.12;
+/** 停電・断水が続いたときに建物が機能停止するまでの日数。 */
+export const UTILITY_GRACE_DAYS = 2;
+/**
+ * 浄水場が取水できる水辺までの距離（タイル）。1 タイル = 150m なので 8 タイル = 1.2km。
+ * 導水管を引く距離として現実的な範囲。
+ *
+ * 3 タイル（450m）にしていたときは、川がタイル 1 本の細い線なうえ
+ * 「接道していて 2×2 が入る平地」まで同時に満たす場所がほとんど無く、
+ * シナリオ生成でも浄水場が 1 つも建たない街ができた。
+ * その街は上水が既存系統ぶんしか無いまま成長が止まる。
+ * 逆に 20 も許すと街のどこにでも建ってしまい、立地の判断が消える。
+ */
+export const WATER_INTAKE_TILES = 8;
+
+/**
+ * 未処理の下水 1 m3/日 が生む公害の量。
+ *
+ * 単位は `Archetype.pollution` と同じ。目安として、上水を 100 m3/日 使う地区が
+ * 下水処理場を持たないと 60 相当（＝工場 45 より少し重い）の公害源になる。
+ * ここを 0.1 まで落とすと下水を無視しても何も起きず、施設を建てる理由が消える。
+ * 逆に 2.0 にすると、下水処理場が 1 日遅れただけで地価が崩壊した。
+ */
+export const POLLUTION_PER_UNTREATED_M3 = 0.6;
+
 
 // ---------- 交通手段選択（多項ロジット） ----------
 /** ロジットのスケール（分）。大きいほど選択がばらける。 */
@@ -125,6 +285,7 @@ export const PURPOSE_MODE_BIAS: number[][] = [
   /* 買い物     */ [1, 2, 5, 0],
   /* レジャー   */ [1, 2, 2, 3],
   /* 帰宅       */ [0, 1, 0, 3],
+  /* 業務移動   */ [0, 1, 4, 3],
 ];
 /** 時間価値 (円/分) の基礎値。所得で増える。 */
 export const VOT_BASE_YEN_PER_MIN = 20;
@@ -167,18 +328,32 @@ export const TARGET_TFR = 1.8;
 /** 就労年齢。 */
 export const WORK_AGE_MIN = 18;
 export const RETIRE_AGE = 65;
+/** 夜勤の割合。 */
+export const NIGHT_SHIFT_SHARE = 0.08;
+/** 早番（シフト勤務）の割合。夜勤に当たらなかった就業者から抽選する。 */
+export const SHIFT_WORK_SHARE = 0.25;
 /** 求職時に評価する求人候補数。 */
 export const JOB_SAMPLE_COUNT = 8;
-/** 1 日に処理する求職者数の上限。 */
-export const JOB_SEEKERS_PER_DAY = 400;
+/** 1 経済期に処理する求職者数の上限（日換算で約 960 人）。 */
+export const JOB_SEEKERS_PER_PERIOD = 80;
 /** 転居判定のしきい値（不満が連続してこの日数を超えたら引っ越す）。 */
 export const RELOCATE_PATIENCE_DAYS = 30;
 
 // ---------- 建物・成長 ----------
 /** 1 tick に評価するゾーンタイル数。 */
 export const GROWTH_SCAN_PER_TICK = 128;
-/** レベルアップ / 廃墟化の判定に必要な連続日数。 */
-export const UPGRADE_PATIENCE_DAYS = 20;
+/**
+ * 建設確率の係数。実際の確率は `GROWTH_BUILD_RATE × 需要 × 魅力度^2`。
+ * 1 tick が 1/12 実秒だった頃の 0.02 のままだと、ゾーニングしてから最初の 1 軒が
+ * 建つまで ×1 で 50 実分かかる。時計を遅くした分をここで戻す。
+ */
+export const GROWTH_BUILD_RATE = 0.1;
+/**
+ * レベルアップ / 廃墟化の判定に必要な連続日数。
+ * 育つ側だけ速める。廃墟化と廃業まで速めると、サプライチェーンが立ち上がる前に
+ * 上流が全滅する（過去に実際に起きた）ので据え置く。
+ */
+export const UPGRADE_PATIENCE_DAYS = 5;
 export const ABANDON_PATIENCE_DAYS = 30;
 /** 建設に必要な資材（1 建物あたり）。林業チェーンが街の成長速度を律速する。 */
 export const CONSTRUCTION_LUMBER = 4;
@@ -213,11 +388,22 @@ export const FREIGHT_DISPATCH_INTERVAL = 10;
 export const STOCKOUT_ABANDON_DAYS = 20;
 
 // ---------- 描画 ----------
+/** 標高 (heightDm) → ワールド座標の Y。地形メッシュ・建物・人・カーソルで共通。 */
+export const TERRAIN_HEIGHT_SCALE = 0.02;
+/**
+ * 交通量オーバーレイの色を塗り直す間隔（tick）。
+ * 地価や公害は日次で足りるが、渋滞は分単位で育って引くので短くする。
+ */
+export const OVERLAY_REFRESH_TICKS = 5;
+/** ドラッグ中のプレビューで同時に光らせるタイル数の上限。 */
+export const MAX_PREVIEW_TILES = 4096;
 /** 同時に描画する市民インスタンスの上限。 */
 export const MAX_VISIBLE_AGENTS = 4000;
 export const MAX_VISIBLE_VEHICLES = 3000;
 /** 描画するトラックの上限。シミュレーション側の上限より少ないと黙って消えるので揃える。 */
 export const MAX_VISIBLE_TRUCKS = MAX_TRUCKS;
+/** 同時に描く路線バスの上限。路線数 × 車両数の見積もりより多めに取ってある。 */
+export const MAX_VISIBLE_BUSES = 400;
 /** 描画する電車の車両数の上限（編成数ではなく 1 両単位）。 */
 export const MAX_VISIBLE_TRAIN_CARS = 512;
 /** これより遠い歩行者は描画しない (m)。 */

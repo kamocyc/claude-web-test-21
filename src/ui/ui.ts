@@ -45,6 +45,8 @@ export interface UiCallbacks {
   onOverlay(o: Overlay): void;
   onTax(zone: Zone, pct: number): void;
   onFollowCitizen(): void;
+  onSave(): void;
+  onLoad(): void;
 }
 
 export class Ui {
@@ -82,7 +84,16 @@ export class Ui {
   private celebrateUntil = 0;
 
   selectedCitizen = -1;
-  selectedBuilding = -1;
+  /**
+   * 選択中の建物。**世代タグ付きのハンドル**で持つ（生スロットではない）。
+   *
+   * 生スロットで持っていたときは、選択した建物が撤去・廃墟化して
+   * 同じスロットが再利用されると、インスペクタが黙って別の建物を
+   * 「選択中」として表示し続けていた。`BuildingStore` のコメントが
+   * 「世代タグを見ないと確実に踏むバグ」と書いているとおりの症状で、
+   * UI だけがその規約から外れていた。
+   */
+  selectedBuilding = 0;
 
   constructor(root: HTMLElement, tool: ToolState, cb: UiCallbacks) {
     this.root = root;
@@ -145,13 +156,18 @@ export class Ui {
     const colors = ['var(--r)', 'var(--c)', 'var(--i)', 'var(--a)'];
     const labels = ['住', '商', '工', '農'];
     for (let i = 0; i < 4; i++) {
-      const col = el('div');
+      const col = el('div', 'col');
+      // 上半分が正の需要、下半分が負の需要。中央が 0。
       const bar = el('div', 'bar');
-      const fill = el('i');
-      fill.style.background = colors[i]!;
-      fill.style.height = '0%';
-      bar.appendChild(fill);
-      this.rciFills.push(fill);
+      const up = el('i', 'up');
+      const down = el('i', 'down');
+      up.style.background = colors[i]!;
+      down.style.background = colors[i]!;
+      up.style.height = '0%';
+      down.style.height = '0%';
+      bar.appendChild(up);
+      bar.appendChild(down);
+      this.rciFills.push(up, down);
       col.appendChild(bar);
       col.appendChild(el('div', 'lab', labels[i]!));
       rci.appendChild(col);
@@ -341,6 +357,9 @@ export class Ui {
     };
     add('人口', s.population.toLocaleString('ja-JP'));
     add('資金', man(s.cash), s.cash < 0 ? 'bad' : undefined);
+    // 決算を待たずに今の収支が分かるようにする
+    const net = s.finance.net;
+    add('収支/月', `${net >= 0 ? '+' : ''}${man(net)}`, net < 0 ? 'bad' : net > 0 ? 'good' : undefined);
     add('幸福度', `${Math.round((s.avgHappiness / 255) * 100)}%`, s.avgHappiness < 90 ? 'bad' : s.avgHappiness > 170 ? 'good' : undefined);
     const jobless = s.employed + s.unemployed;
     add('失業率', jobless > 0 ? `${Math.round((s.unemployed / jobless) * 100)}%` : '—', s.unemployed > s.employed * 0.2 ? 'bad' : undefined);
@@ -374,6 +393,13 @@ export class Ui {
       sc.appendChild(b);
     }
     clock.appendChild(sc);
+
+    // セーブ / ロード。時計の下に置くのは、時間を止めてから保存する動線が自然なため。
+    const io = el('div');
+    io.id = 'saveio';
+    io.appendChild(btn('保存', () => this.cb.onSave()));
+    io.appendChild(btn('読込', () => this.cb.onLoad()));
+    clock.appendChild(io);
     this.cityInfo.appendChild(clock);
     this.setSpeed(this.currentSpeed);
   }
@@ -414,9 +440,11 @@ export class Ui {
     const d = sim.stats().demand;
     const values = [d.residential, d.commercial, d.industrial, d.agriculture];
     for (let i = 0; i < 4; i++) {
-      const v = Math.max(0, values[i]!);
-      this.rciFills[i]!.style.height = `${Math.min(100, v)}%`;
-      this.rciFills[i]!.style.opacity = values[i]! < 0 ? '0.25' : '1';
+      const v = Math.max(-100, Math.min(100, values[i]!));
+      // 高さはトラック全体（＝上下 2 分割）に対する割合なので半分にする。
+      // 需要 100 で上半分をちょうど埋める。
+      this.rciFills[i * 2]!.style.height = `${Math.max(0, v) / 2}%`;
+      this.rciFills[i * 2 + 1]!.style.height = `${Math.max(0, -v) / 2}%`;
     }
   }
 
@@ -481,7 +509,7 @@ export class Ui {
   }
 
   private renderInspector(sim: Simulation): void {
-    if (this.selectedCitizen < 0 && this.selectedBuilding < 0) {
+    if (this.selectedCitizen < 0 && this.selectedBuilding === 0) {
       this.inspector.style.display = 'none';
       return;
     }
@@ -522,7 +550,7 @@ export class Ui {
       this.inspector.appendChild(el('hr'));
       this.inspector.appendChild(el('h3', undefined, '交通手段の好み（体感分）'));
       row('徒歩 / 自転車', `${c.prefWalk[id]} / ${c.prefBike[id]}`);
-      row('自動車 / 鉄道', `${c.prefCar[id]} / ${c.prefRail[id]}`);
+      row('自動車 / 鉄道', `${c.prefCar[id]} / ${c.prefTransit[id]}`);
 
       const explain = sim.activity.lastChoiceExplanation;
       if (explain) {
@@ -558,12 +586,12 @@ export class Ui {
     }
 
     // --- 建物 ---
-    const slot = this.selectedBuilding;
-    if (sim.buildings.alive[slot] !== 1) {
-      this.selectedBuilding = -1;
+    if (!sim.buildings.valid(this.selectedBuilding)) {
+      this.selectedBuilding = 0;
       this.inspector.style.display = 'none';
       return;
     }
+    const slot = handleSlot(this.selectedBuilding);
     const a = archetype(sim.buildings.archetypeId[slot]!);
     this.inspector.appendChild(el('div', 'title', `${a.nameJa}（Lv${sim.buildings.level[slot]}）`));
     row('用途地域', ZONE_NAMES_JA[a.zone] ?? '—');
@@ -594,7 +622,7 @@ export class Ui {
     this.inspector.appendChild(el('hr'));
     this.inspector.appendChild(
       btn('閉じる', () => {
-        this.selectedBuilding = -1;
+        this.selectedBuilding = 0;
       }),
     );
   }
@@ -630,6 +658,51 @@ export class Ui {
     head('交通分担率');
     for (let m = 0; m < 4; m++) row(MODE_NAMES_JA[m]!, `${Math.round((s.modeShare[m] ?? 0) * 100)}%`);
 
+    head('道路の混雑');
+    const tf = s.traffic;
+    row('走行中の車両', tf.running.toLocaleString('ja-JP'));
+    row(
+      '信号待ち・渋滞',
+      `${tf.waiting.toLocaleString('ja-JP')} 台`,
+      tf.running > 0 && tf.waiting > tf.running * 0.5 ? 'bad' : tf.waiting > 0 ? 'warn' : undefined,
+    );
+    row(
+      '詰まっている道路',
+      `${(tf.congestedShare * 100).toFixed(1)}%`,
+      tf.congestedShare > 0.05 ? 'bad' : tf.congestedShare > 0.01 ? 'warn' : undefined,
+    );
+    row('所要時間の倍率', `×${tf.avgDelay.toFixed(2)}`, tf.avgDelay > 1.5 ? 'bad' : tf.avgDelay > 1.2 ? 'warn' : undefined);
+
+    head('公共交通');
+    const tr = s.transit;
+    row('路線', `${tr.lines} 系統`);
+    row('車両', `${tr.vehicles} 台（走行中のバス ${tr.busesRunning}）`);
+    row('今日の乗車', tr.boardingsToday.toLocaleString('ja-JP'));
+
+    head('電気・水道');
+    const u = s.utilities;
+    const ratio = (supply: number, demand: number): string =>
+      demand <= 0 ? '—' : `${Math.round((supply / demand) * 100)}%`;
+    const level = (supply: number, demand: number): 'bad' | 'warn' | undefined =>
+      demand <= 0 ? undefined : supply < demand ? 'bad' : supply < demand * 1.15 ? 'warn' : undefined;
+    row(
+      '電力',
+      `${Math.round(u.powerSupplyKw).toLocaleString('ja-JP')} / ${Math.round(u.powerDemandKw).toLocaleString('ja-JP')} kW（${ratio(u.powerSupplyKw, u.powerDemandKw)}）`,
+      level(u.powerSupplyKw, u.powerDemandKw),
+    );
+    row(
+      '上水',
+      `${Math.round(u.waterSupply).toLocaleString('ja-JP')} / ${Math.round(u.waterDemand).toLocaleString('ja-JP')} m³（${ratio(u.waterSupply, u.waterDemand)}）`,
+      level(u.waterSupply, u.waterDemand),
+    );
+    row(
+      '下水処理',
+      `${Math.round(u.sewageCapacity).toLocaleString('ja-JP')} / ${Math.round(u.sewageDemand).toLocaleString('ja-JP')} m³（${ratio(u.sewageCapacity, u.sewageDemand)}）`,
+      level(u.sewageCapacity, u.sewageDemand),
+    );
+    row('停電・断水', `${u.unpowered} / ${u.unwatered} 棟`, u.unpowered + u.unwatered > 0 ? 'warn' : undefined);
+    row('機能停止', `${u.shutdown} 棟`, u.shutdown > 0 ? 'bad' : undefined);
+
     head('産業・物流');
     for (let g = 1; g < 7; g++) {
       row(GOOD_NAMES_JA[g]!, `${Math.round(s.goodsStock[g] ?? 0).toLocaleString('ja-JP')} (時 +${(s.goodsProduced[g] ?? 0).toFixed(0)})`);
@@ -638,12 +711,28 @@ export class Ui {
     row('累計配送', sim.freight.totalDelivered.toLocaleString('ja-JP'));
     row('在庫切れ', String(s.stockouts), s.stockouts > 20 ? 'bad' : undefined);
 
+    // 決算を待たずに今の収支が見えるようにする（月換算の run-rate）
+    head('収支（今の月換算）');
+    const f = s.finance;
+    row('住民税・固定資産税', man(f.incomeResidential));
+    row('商業', man(f.incomeCommercial));
+    row('工業', man(f.incomeIndustrial));
+    row('農林', man(f.incomeAgriculture));
+    row('収入 合計', man(f.income), 'good');
+    row('道路 維持', `-${man(f.upkeepRoads)}`);
+    row('鉄道 維持', `-${man(f.upkeepRail)}`);
+    row('運行 維持', `-${man(f.upkeepTransit)}`);
+    row('施設 維持', `-${man(f.upkeepServices)}`);
+    row('支出 合計', `-${man(f.expense)}`, 'bad');
+    row('収支', `${f.net >= 0 ? '+' : ''}${man(f.net)}`, f.net < 0 ? 'bad' : 'good');
+    row('今月の建設費', `-${man(s.capexThisMonth)}`);
+    if (s.deficitMonths > 0) row('赤字が続いた月数', String(s.deficitMonths), 'bad');
+
     head('財政');
     row('建物数', s.buildings.toLocaleString('ja-JP'));
     if (s.lastReport) {
-      row('先月の収入', man(s.lastReport.income));
-      row('先月の支出', man(s.lastReport.expense));
-      row('収支', man(s.lastReport.net), s.lastReport.net < 0 ? 'bad' : 'good');
+      row('先月の収支', `${s.lastReport.net >= 0 ? '+' : ''}${man(s.lastReport.net)}`, s.lastReport.net < 0 ? 'bad' : 'good');
+      row('先月の建設費', `-${man(s.lastReport.capex)}`);
     }
     for (const [label, zone] of [
       ['住宅税', Zone.ResidentialLow],

@@ -32,6 +32,19 @@ export class Rng {
     if ((this.s0 | this.s1 | this.s2 | this.s3) === 0) this.s0 = 1;
   }
 
+  /** 内部状態。セーブ／ロードで乱数列の続きを再現するために使う。 */
+  getState(): [number, number, number, number] {
+    return [this.s0, this.s1, this.s2, this.s3];
+  }
+
+  setState(s: readonly number[]): void {
+    this.s0 = s[0]! >>> 0;
+    this.s1 = s[1]! >>> 0;
+    this.s2 = s[2]! >>> 0;
+    this.s3 = s[3]! >>> 0;
+    if ((this.s0 | this.s1 | this.s2 | this.s3) === 0) this.s0 = 1;
+  }
+
   /** 32bit 符号なし整数を返す。 */
   nextU32(): number {
     const t = Math.imul(this.s1, 5);

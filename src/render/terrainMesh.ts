@@ -1,5 +1,5 @@
 import { BufferAttribute, BufferGeometry, Mesh, MeshLambertMaterial, Object3D } from 'three';
-import { CHUNK, CHUNKS_X, CHUNK_COUNT, TILE_M } from '@shared/constants';
+import { CHUNK, CHUNKS_X, CHUNK_COUNT, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
 import { Overlay, RoadClass, Terrain, Zone } from '@shared/enums';
 import type { Simulation } from '@sim/simulation';
 import { idx, inBounds } from '@sim/world/tiles';
@@ -166,18 +166,33 @@ export class TerrainMesh {
         const a = world.transitAccess[t]!;
         return heatColor(a >= 255 ? 0 : 1 - a / 20);
       }
+      case Overlay.Power:
+      case Overlay.Water: {
+        // 供給網の中かどうかと、余裕の度合い。
+        // 0 は「網の外」で、青く塗ると街じゅうが水色になるので暗く落とす。
+        const src = this.overlay === Overlay.Power ? sim.utilities.powerOverlay : sim.utilities.waterOverlay;
+        const v = src[t]!;
+        if (v === 0) return zoneColor(-1).setHex(0x1b2026);
+        return heatColor(1 - v / 255);
+      }
       case Overlay.Zone:
         if (world.zone[t] !== Zone.None) return zoneColor(world.zone[t]!);
         break;
       case Overlay.Traffic: {
-        // 道路タイルの混雑度。道路以外は暗く落とす。
-        if (world.road[t] === RoadClass.None) return heatColor(0);
+        // 道路タイルの混雑度。車がどれだけリンクを埋めているかをそのまま出す。
+        // 道路以外は暗く落とす（heatColor(0) は青なので、そのまま使うと
+        // 街じゅうが水色に染まって道路の色が読めない）。
+        if (world.road[t] === RoadClass.None) return zoneColor(-1).setHex(0x1b2026);
         const node = sim.graph.roadNodeAt[t]!;
         if (node < 0) return heatColor(0);
         let worst = 0;
         const e1 = sim.graph.edgeStart[node + 1] ?? 0;
         for (let e = sim.graph.edgeStart[node] ?? 0; e < e1; e++) {
-          worst = Math.max(worst, sim.graph.congestionRatio(e));
+          // 流出リンクの占有率と、そこへ入ってくるリンクの占有率の両方を見る。
+          // 交差点で止まっている車列は流入側に溜まるので、片方だけでは赤くならない。
+          worst = Math.max(worst, sim.traffic.occupancy(e));
+          const rev = sim.graph.reverseEdge(e);
+          if (rev >= 0) worst = Math.max(worst, sim.traffic.occupancy(rev));
         }
         return heatColor(worst);
       }
@@ -185,9 +200,13 @@ export class TerrainMesh {
         break;
     }
 
-    // 道路・線路
+    // 道路
     if (world.road[t] !== RoadClass.None) return zoneColor(-1).setHex(ROAD_COLORS[world.road[t]!]!);
-    if (world.rail[t] !== 0) return zoneColor(-1).setHex(0x5a5048);
+    // 線路タイルは塗らない。以前はここで軌道敷の色（濃い茶）に塗りつぶしていたが、
+    // 線路レイヤがバラストを実寸で敷くようになったので、そのままだと
+    // 幅 4.6m のバラストの両脇に、幅 2.7m ずつの濃い茶色が残って
+    // 「妙に広い土手」に見える。地面は地形の色のままにして、
+    // 軌道はレイヤの造形だけで表す。
 
     // 田んぼは季節で色が変わる。街の時間経過が一番わかりやすく伝わる要素。
     if (world.zone[t] === Zone.AgriPaddy) return zoneColor(-1).setHex(PADDY_SEASON_COLORS[season]!);
@@ -225,7 +244,7 @@ function cornerHeight(world: { terrain: Uint8Array; heightDm: Uint16Array }, cx:
       const y = cy + dy;
       if (!inBounds(x, y)) continue;
       const t = idx(x, y);
-      sum += world.terrain[t] === Terrain.Sea ? -1.5 : world.heightDm[t]! * 0.02;
+      sum += world.terrain[t] === Terrain.Sea ? -1.5 : world.heightDm[t]! * TERRAIN_HEIGHT_SCALE;
       n++;
     }
   }

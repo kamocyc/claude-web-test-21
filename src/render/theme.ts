@@ -79,9 +79,26 @@ export const CARGO_COLORS: Record<number, number> = {
   [Good.ConsumerGoods]: 0x4a6a9a,
 };
 
+/**
+ * 路線の色。バスの車体と路線一覧で同じ色を使うので、
+ * 「いま走っているのがどの系統か」が地図の上で分かる。
+ * 日本の路線図でよく使われる色から、隣り合っても見分けの付く順に並べてある。
+ */
+export const LINE_COLORS: number[] = [
+  0x2f7fbf, 0xd9534f, 0x4caf50, 0xe8a33d, 0x8e5ea2, 0x36b8b8, 0xd06ba0, 0x7a8a3a,
+];
+
+export function lineColor(id: number): number {
+  return LINE_COLORS[((id % LINE_COLORS.length) + LINE_COLORS.length) % LINE_COLORS.length]!;
+}
+
 /** 電車の車体色。先頭車だけ帯を濃くして向きが分かるようにする。 */
 export const TRAIN_BODY_COLOR = 0xd8dde4;
 export const TRAIN_HEAD_COLOR = 0x3f6fa8;
+
+/** ドラッグ中のプレビュー。敷ける／敷けないを色で分ける。 */
+export const PREVIEW_OK_COLOR = 0x6fe08a;
+export const PREVIEW_BAD_COLOR = 0xff5555;
 
 /** 建物の形状キーごとの色と高さ（レベル 1 のとき、m）。 */
 export interface MeshStyle {
@@ -90,53 +107,77 @@ export interface MeshStyle {
   baseHeight: number;
   /** レベルごとの追加高さ (m)。 */
   perLevel: number;
-  /** 切妻の瓦屋根を載せるか（日本的意匠）。 */
-  roof: boolean;
+  /**
+   * 屋根の形。
+   *
+   * 以前は `roof: boolean` で、立てば一律に 4 角錐を載せていた
+   * （コメントは「切妻」と書いてあったのに、実際は方形屋根だった）。
+   * 日本の街並みは切妻・寄棟・陸屋根の混在で出来ているので、
+   * ここを 3 種類に分けるだけで一気にそれらしくなる。
+   */
+  roofKind: RoofKind;
   roofColor: number;
   /** 敷地に対する建物の占有率。小さいほど庭・空地が見える。 */
   inset: number;
 }
 
+/** 屋根の形。`none` は屋上に何も載せない（背の低い農地・公園など）。 */
+export const RoofKind = {
+  None: 'none',
+  /** 切妻。棟が 1 本通る、日本の住宅でいちばん多い形。 */
+  Gable: 'gable',
+  /** 寄棟（方形）。4 方向に流れる。 */
+  Hip: 'hip',
+  /** 陸屋根。平らな屋上にパラペット（立ち上がり）を回す。 */
+  Flat: 'flat',
+} as const;
+export type RoofKind = (typeof RoofKind)[keyof typeof RoofKind];
+
 const style = (
   color: number,
   baseHeight: number,
   perLevel: number,
-  roof = false,
+  roofKind: RoofKind = RoofKind.None,
   roofColor = 0x4a4a52,
   inset = 0.78,
-): MeshStyle => ({ color, baseHeight, perLevel, roof, roofColor, inset });
+): MeshStyle => ({ color, baseHeight, perLevel, roofKind, roofColor, inset });
 
 export const MESH_STYLES: Record<string, MeshStyle> = {
   // 住宅: 瓦屋根の切妻
-  house: style(0xeae5d8, 5, 2.5, true, 0x69747f, 0.62),
-  apartment: style(0xded8c8, 8, 3.5, true, 0x6d6a75, 0.74),
-  mansion: style(0xcfcabb, 16, 8, false, 0x4a4a52, 0.84),
-  tower: style(0xc4c8cf, 46, 14, false, 0x4a4a52, 0.7),
+  house: style(0xeae5d8, 5, 2.5, RoofKind.Gable, 0x69747f, 0.62),
+  apartment: style(0xded8c8, 8, 3.5, RoofKind.Gable, 0x6d6a75, 0.74),
+  mansion: style(0xcfcabb, 16, 8, RoofKind.Flat, 0x9c9a95, 0.84),
+  tower: style(0xc4c8cf, 46, 14, RoofKind.Flat, 0x9aa0a8, 0.7),
   // 商業
-  konbini: style(0xf2f2ee, 4.5, 1.5, false, 0x4a4a52, 0.8),
-  shotengai: style(0xe2ccab, 6, 2.5, true, 0x8a6350, 0.9),
-  supermarket: style(0xe6e2d4, 7, 2, false, 0x4a4a52, 0.9),
-  zakkyo: style(0xd6d2c8, 14, 7, false, 0x4a4a52, 0.88),
-  office: style(0xb9c4cf, 24, 11, false, 0x4a4a52, 0.86),
+  konbini: style(0xf2f2ee, 4.5, 1.5, RoofKind.Flat, 0xcfcdc6, 0.8),
+  shotengai: style(0xe2ccab, 6, 2.5, RoofKind.Gable, 0x8a6350, 0.9),
+  supermarket: style(0xe6e2d4, 7, 2, RoofKind.Flat, 0xc6c3ba, 0.9),
+  zakkyo: style(0xd6d2c8, 14, 7, RoofKind.Flat, 0xa8a49b, 0.88),
+  office: style(0xb9c4cf, 24, 11, RoofKind.Flat, 0x99a3ad, 0.86),
   // 工業
-  smallfactory: style(0xbdb7a8, 6, 2, true, 0x93826a, 0.84),
-  factory: style(0xa8a294, 11, 4, false, 0x6b665c, 0.9),
-  sawmill: style(0x9c8b6f, 9, 3, true, 0x87735a, 0.88),
-  ricemill: style(0xcfc7b2, 10, 3, false, 0x6b665c, 0.9),
-  warehouse: style(0xb0aca0, 8, 2, false, 0x6b665c, 0.94),
+  smallfactory: style(0xbdb7a8, 6, 2, RoofKind.Gable, 0x93826a, 0.84),
+  factory: style(0xa8a294, 11, 4, RoofKind.Flat, 0x6b665c, 0.9),
+  sawmill: style(0x9c8b6f, 9, 3, RoofKind.Gable, 0x87735a, 0.88),
+  ricemill: style(0xcfc7b2, 10, 3, RoofKind.Flat, 0x6b665c, 0.9),
+  warehouse: style(0xb0aca0, 8, 2, RoofKind.Flat, 0x6b665c, 0.94),
   // 農林（背が低く、地面の色が主役）
-  paddy: style(0x5aa84a, 0.35, 0, false, 0x4a4a52, 0.98),
-  field: style(0xb08d5a, 0.5, 0, false, 0x4a4a52, 0.96),
-  forestry: style(0x2f7a45, 3.5, 0, false, 0x4a4a52, 0.9),
+  paddy: style(0x5aa84a, 0.35, 0, RoofKind.None, 0x4a4a52, 0.98),
+  field: style(0xb08d5a, 0.5, 0, RoofKind.None, 0x4a4a52, 0.96),
+  forestry: style(0x2f7a45, 3.5, 0, RoofKind.None, 0x4a4a52, 0.9),
   // 公共
-  station: style(0xdfe4ea, 9, 0, true, 0x54687e, 0.9),
-  school: style(0xe4dcc6, 10, 0, true, 0x74858e, 0.9),
-  hospital: style(0xf0f0ee, 14, 0, false, 0x4a4a52, 0.88),
-  police: style(0xd6dce6, 6, 0, true, 0x4e6288, 0.8),
-  fire: style(0xe6b8b0, 9, 0, false, 0x6b3a3a, 0.86),
-  park: style(0x6fbf6f, 1.2, 0, false, 0x4a4a52, 0.95),
-  shrine: style(0xc4553f, 7, 0, true, 0x54545e, 0.7),
-  cityhall: style(0xd8d4c8, 16, 0, true, 0x5c6a78, 0.9),
+  station: style(0xdfe4ea, 9, 0, RoofKind.Hip, 0x54687e, 0.9),
+  school: style(0xe4dcc6, 10, 0, RoofKind.Flat, 0x74858e, 0.9),
+  hospital: style(0xf0f0ee, 14, 0, RoofKind.Flat, 0xb9bcbe, 0.88),
+  police: style(0xd6dce6, 6, 0, RoofKind.Hip, 0x4e6288, 0.8),
+  fire: style(0xe6b8b0, 9, 0, RoofKind.Flat, 0x6b3a3a, 0.86),
+  park: style(0x6fbf6f, 1.2, 0, RoofKind.None, 0x4a4a52, 0.95),
+  shrine: style(0xc4553f, 7, 0, RoofKind.Hip, 0x54545e, 0.7),
+  cityhall: style(0xd8d4c8, 16, 0, RoofKind.Hip, 0x5c6a78, 0.9),
+  // インフラ（発電所は煙突が要るので背を高く、太陽光は地面すれすれ）
+  powerplant: style(0x9aa0a4, 22, 0, RoofKind.Flat, 0x76797c, 0.82),
+  solar: style(0x2b3a54, 0.8, 0, RoofKind.None, 0x4a4a52, 0.94),
+  waterworks: style(0xc9d3d8, 6, 0, RoofKind.Flat, 0x8fa0a8, 0.9),
+  sewage: style(0xa9b0a4, 5, 0, RoofKind.Flat, 0x7d8478, 0.92),
 };
 
 export function meshStyle(key: string): MeshStyle {
@@ -162,7 +203,14 @@ export function zoneColor(zone: number, out = tmpColor): Color {
 
 /** そのオーバーレイが値ベース（ヒートマップ）か。 */
 export function isHeatOverlay(o: Overlay): boolean {
-  return o === Overlay.LandValue || o === Overlay.Traffic || o === Overlay.Pollution || o === Overlay.TransitAccess;
+  return (
+    o === Overlay.LandValue ||
+    o === Overlay.Traffic ||
+    o === Overlay.Pollution ||
+    o === Overlay.TransitAccess ||
+    o === Overlay.Power ||
+    o === Overlay.Water
+  );
 }
 
 /** 空の色。時刻で朝焼け〜昼〜夕焼け〜夜に変わる。 */

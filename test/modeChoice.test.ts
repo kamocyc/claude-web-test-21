@@ -16,7 +16,7 @@ function profile(over: Partial<TravelerProfile> = {}): TravelerProfile {
     prefWalk: 0,
     prefBike: 0,
     prefCar: 0,
-    prefRail: 0,
+    prefTransit: 0,
     incomeYenMo: 300_000,
     age: 35,
     hasCar: true,
@@ -59,9 +59,9 @@ describe('交通手段の選択', () => {
   it('鉄道が到達不能なら鉄道の確率は 0', () => {
     const out = newModeOptions();
     const t = times(900, 3000);
-    t.sec[Mode.Rail] = Infinity;
+    t.sec[Mode.Transit] = Infinity;
     evaluateModes(profile(), t, Purpose.Commute, Zone.CommercialCentral, out);
-    expect(out[Mode.Rail]!.probability).toBe(0);
+    expect(out[Mode.Transit]!.probability).toBe(0);
     expect(out.reduce((a, o) => a + o.probability, 0)).toBeCloseTo(1, 6);
   });
 
@@ -101,12 +101,12 @@ describe('交通手段の選択', () => {
   it('定期券があると通勤の鉄道運賃が 0 になり、鉄道が選ばれやすくなる', () => {
     const out = newModeOptions();
     evaluateModes(profile({ hasTransitPass: false }), times(1500, 6000), Purpose.Commute, Zone.CommercialCentral, out);
-    const noPass = out[Mode.Rail]!.probability;
-    const fare = out[Mode.Rail]!.costYen;
+    const noPass = out[Mode.Transit]!.probability;
+    const fare = out[Mode.Transit]!.costYen;
     evaluateModes(profile({ hasTransitPass: true }), times(1500, 6000), Purpose.Commute, Zone.CommercialCentral, out);
     expect(fare).toBeGreaterThan(0);
-    expect(out[Mode.Rail]!.costYen).toBe(0);
-    expect(out[Mode.Rail]!.probability).toBeGreaterThan(noPass);
+    expect(out[Mode.Transit]!.costYen).toBe(0);
+    expect(out[Mode.Transit]!.probability).toBeGreaterThan(noPass);
   });
 
   it('所得が高いほど時間価値が上がる', () => {

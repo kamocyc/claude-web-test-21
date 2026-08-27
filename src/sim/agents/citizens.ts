@@ -23,6 +23,43 @@ export const CitizenFlag = {
  * ここをオブジェクト配列にすると 1 万人で数十 MB になり、
  * 日次のライフサイクル処理が GC ヒッチとして目に見えるようになる。
  */
+/**
+ * セーブ対象の SoA 配列名。フィールドを足したらここにも足すこと。
+ * `tripPath` は節点番号への参照なので保存できない（読み込み時に打ち切る）。
+ */
+export const CITIZEN_FIELDS = [
+  'flags',
+  'age',
+  'birthDay',
+  'education',
+  'skill',
+  'happiness',
+  'incomeYenMo',
+  'homeBuilding',
+  'workBuilding',
+  'householdId',
+  'prefWalk',
+  'prefBike',
+  'prefCar',
+  'prefTransit',
+  'leisureTaste',
+  'state',
+  'scheduleId',
+  'scheduleStep',
+  'wakeTick',
+  'destBuilding',
+  'currentTile',
+  'purpose',
+  'mode',
+  'tripDepartTick',
+  'tripArriveTick',
+  'waitingSince',
+  'unhappyDays',
+  'lastCommuteMin',
+  'tripsCompleted',
+] as const;
+export type CitizenField = (typeof CITIZEN_FIELDS)[number];
+
 export class CitizenStore {
   capacity = 0;
   /** 使用中スロットの上限。 */
@@ -51,7 +88,7 @@ export class CitizenStore {
   prefWalk!: Int8Array;
   prefBike!: Int8Array;
   prefCar!: Int8Array;
-  prefRail!: Int8Array;
+  prefTransit!: Int8Array;
   /** レジャーへの出かけやすさ 0..255。 */
   leisureTaste!: Uint8Array;
 
@@ -109,7 +146,7 @@ export class CitizenStore {
     this.prefWalk = g(this.prefWalk, (n) => new Int8Array(n));
     this.prefBike = g(this.prefBike, (n) => new Int8Array(n));
     this.prefCar = g(this.prefCar, (n) => new Int8Array(n));
-    this.prefRail = g(this.prefRail, (n) => new Int8Array(n));
+    this.prefTransit = g(this.prefTransit, (n) => new Int8Array(n));
     this.leisureTaste = g(this.leisureTaste, (n) => new Uint8Array(n));
     this.state = g(this.state, (n) => new Uint8Array(n));
     this.scheduleId = g(this.scheduleId, (n) => new Uint8Array(n));
@@ -127,6 +164,26 @@ export class CitizenStore {
     this.tripsCompleted = g(this.tripsCompleted, (n) => new Uint32Array(n));
     while (this.tripPath.length < capacity) this.tripPath.push(null);
     this.capacity = capacity;
+  }
+
+  /** セーブデータを流し込む前に容量を確保する。 */
+  ensureCapacity(n: number): void {
+    if (n <= this.capacity) return;
+    let cap = Math.max(1, this.capacity);
+    while (cap < n) cap *= 2;
+    this.grow(cap);
+  }
+
+  /**
+   * 読み込み後に使用中スロットと空きスロットを作り直す。
+   * freeList を復元しないと、次に生成した市民が生きている市民を上書きする。
+   */
+  rebuildFreeList(high: number): void {
+    this.high = high;
+    this.freeList.length = 0;
+    for (let i = high - 1; i >= 0; i--) {
+      if ((this.flags[i]! & CitizenFlag.Alive) === 0) this.freeList.push(i);
+    }
   }
 
   /** 新しい市民スロットを確保する。 */
@@ -175,7 +232,7 @@ export class CitizenStore {
     out.prefWalk = this.prefWalk[id]!;
     out.prefBike = this.prefBike[id]!;
     out.prefCar = this.prefCar[id]!;
-    out.prefRail = this.prefRail[id]!;
+    out.prefTransit = this.prefTransit[id]!;
     out.incomeYenMo = this.incomeYenMo[id]!;
     out.age = this.age[id]!;
     out.hasCar = this.has(id, CitizenFlag.OwnsCar);
@@ -195,7 +252,7 @@ export function newTravelerProfile(): TravelerProfile {
     prefWalk: 0,
     prefBike: 0,
     prefCar: 0,
-    prefRail: 0,
+    prefTransit: 0,
     incomeYenMo: 0,
     age: 30,
     hasCar: false,

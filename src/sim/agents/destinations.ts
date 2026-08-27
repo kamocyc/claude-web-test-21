@@ -17,6 +17,8 @@ export class Destinations {
   private shops: number[] = [];
   private leisure: number[] = [];
   private schools: number[] = [];
+  /** 業務移動の行き先。雇用のある事業所すべて。 */
+  private workplaces: number[] = [];
   private dirty = true;
 
   /** 候補数の上限。多すぎると抽選コストが上がるだけで質は上がらない。 */
@@ -30,11 +32,13 @@ export class Destinations {
     this.shops.length = 0;
     this.leisure.length = 0;
     this.schools.length = 0;
+    this.workplaces.length = 0;
     for (const s of buildings.each()) {
       const a = archetype(buildings.archetypeId[s]!);
       if (isShop(a.id)) this.shops.push(s);
       if (a.leisureAppeal > 0) this.leisure.push(s);
       if (a.id === Arch.School) this.schools.push(s);
+      if (buildings.jobsTotal[s]! > 0) this.workplaces.push(s);
     }
     this.dirty = false;
   }
@@ -62,6 +66,12 @@ export class Destinations {
   pickLeisure(ctx: ActivityContext, fromTile: number): number {
     if (this.dirty) this.rebuild(ctx.buildings);
     return this.pickFrom(ctx, fromTile, this.leisure, (slot) => archetype(ctx.buildings.archetypeId[slot]!).leisureAppeal);
+  }
+
+  /** 業務移動の行き先。人の多い事業所ほど用事が多い。 */
+  pickBusiness(ctx: ActivityContext, fromTile: number): number {
+    if (this.dirty) this.rebuild(ctx.buildings);
+    return this.pickFrom(ctx, fromTile, this.workplaces, (slot) => ctx.buildings.jobsTotal[slot]! + 2);
   }
 
   pickSchool(ctx: ActivityContext, fromTile: number): number {

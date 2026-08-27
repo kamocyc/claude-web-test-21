@@ -1,4 +1,14 @@
-import { BoxGeometry, Color, InstancedMesh, Matrix4, MeshLambertMaterial, Object3D, Quaternion, Vector3 } from 'three';
+import {
+  BoxGeometry,
+  Color,
+  InstancedMesh,
+  Matrix4,
+  MeshBasicMaterial,
+  MeshLambertMaterial,
+  Object3D,
+  Quaternion,
+  Vector3,
+} from 'three';
 import {
   AGENT_DRAW_DISTANCE_M,
   LANE_OFFSET_M,
@@ -6,14 +16,15 @@ import {
   MAP_W,
   MAX_VISIBLE_AGENTS,
   MAX_VISIBLE_TRAIN_CARS,
+  MAX_VISIBLE_BUSES,
   MAX_VISIBLE_TRUCKS,
   MAX_VISIBLE_VEHICLES,
   PARKED_CARS_PER_TILE,
   PARKED_CAR_LOD_DISTANCE_M,
   PEDESTRIAN_LOD_DISTANCE_M,
+  TERRAIN_HEIGHT_SCALE,
   TILE_M,
   TRAIN_CARS,
-  TRAIN_CAR_LENGTH_M,
   TRAIN_DRAW_DISTANCE_M,
   VEHICLE_DRAW_DISTANCE_M,
 } from '@shared/constants';
@@ -23,7 +34,8 @@ import { CitizenFlag } from '@sim/agents/citizens';
 import { handleSlot } from '@sim/buildings/buildings';
 import type { Simulation } from '@sim/simulation';
 import { TruckState } from '@sim/economy/freight';
-import { pathPosition, type PathPose } from '@sim/network/pathfinder';
+import { type PathPose } from '@sim/network/pathfinder';
+import { VehicleKind } from '@sim/network/traffic';
 import {
   TRAIN_CAR_PITCH_M,
   railPoseAt,
@@ -33,7 +45,32 @@ import {
   type RailPose,
   type TrainHead,
 } from '@sim/network/railLines';
-import { CARGO_COLORS, TRAIN_BODY_COLOR, TRAIN_HEAD_COLOR, carColor } from './theme';
+import { CARGO_COLORS, TRAIN_BODY_COLOR, TRAIN_HEAD_COLOR, carColor, lineColor } from './theme';
+import {
+  BUS_LAMPS,
+  BUS_PARTS,
+  CAR_LAMPS,
+  CAR_PARTS,
+  TRAIN_LAMPS,
+  TRAIN_PARTS,
+  TRUCK_LAMPS,
+  TRUCK_PARTS,
+  type Part,
+  partsGeometry,
+} from './vehicleParts';
+
+/** 夜とみなす時間帯（1 日 0..1）。建物の窓を灯すのと同じ境目にする。 */
+const NIGHT_FROM = 17.5 / 24;
+const NIGHT_TO = 5.5 / 24;
+
+/**
+ * レール面の高さ (m)。線路レイヤが敷くバラスト・枕木・レールの厚みの合計。
+ * 電車の台車をここに載せる。
+ */
+const RAIL_TOP_M = 0.55;
+
+/** 1 フレームで進行方向をどれだけ目標へ寄せるか。1 = 即座（＝スナップ）。 */
+const HEADING_SMOOTHING = 0.15;
 import { idx, tileX, tileY } from '@sim/world/tiles';
 
 /**
@@ -42,8 +79,9 @@ import { idx, tileX, tileY } from '@sim/world/tiles';
  * 位置はシミュレーションが毎 tick 更新しているのではなく、
  * (出発 tick, 到着 tick, 経路) から描画時に補間して求める。
  * これにより 1 万人分の座標更新を毎 tick 走らせずに済む。
- * さらに端数 tick を受け取って補間するので、12 tick/秒のシミュレーションでも
- * 60fps で連続的に動いて見える（整数 tick で補間すると 12 段階のカクつきになる）。
+ * さらに端数 tick を受け取って補間するので、×1 で 0.75 tick/秒しか進まない
+ * シミュレーションでも 60fps で連続的に動いて見える
+ * （整数 tick で補間すると 1.33 秒に 1 コマのカクつきになる）。
  *
  * カメラの近くにいるエージェントだけをインスタンス化する。
  * 引きの画では点にしかならないものに描画予算を使わない。
@@ -55,7 +93,14 @@ export class AgentLayer {
   private readonly cars: InstancedMesh;
   private readonly trains: InstancedMesh;
   private readonly trucks: InstancedMesh;
-  private readonly materials: MeshLambertMaterial[] = [];
+  private readonly buses: InstancedMesh;
+  /** 夜の灯り（前照灯・尾灯・車内灯）。光源の影響を受けない材質で描く。 */
+  private readonly carLamps: InstancedMesh;
+  private readonly busLamps: InstancedMesh;
+  private readonly truckLamps: InstancedMesh;
+  private readonly trainLamps: InstancedMesh;
+  private night = false;
+  private readonly materials: (MeshLambertMaterial | MeshBasicMaterial)[] = [];
 
   private readonly mat = new Matrix4();
   private readonly pos = new Vector3();
@@ -87,7 +132,7 @@ export class AgentLayer {
   private groundAt(sim: Simulation, x: number, z: number): number {
     const tx = Math.max(0, Math.min(MAP_W - 1, Math.floor(x / TILE_M)));
     const tz = Math.max(0, Math.min(MAP_H - 1, Math.floor(z / TILE_M)));
-    return sim.world.heightDm[idx(tx, tz)]! * 0.02;
+    return sim.world.heightDm[idx(tx, tz)]! * TERRAIN_HEIGHT_SCALE;
   }
 
   constructor() {
@@ -109,11 +154,57 @@ export class AgentLayer {
 
     // 人は実寸（肩幅 0.55m・身長 1.75m）。近景で見たときに建物や車と
     // 縮尺が合っていないと、街の大きさが読み取れなくなる。
-    // 車両も同様に実寸。箱の長辺は必ず +Z 側（heading をそのまま Y 回転に使うため）。
     this.pedestrians = mk(0.55, 1.75, 0.35, MAX_VISIBLE_AGENTS);
-    this.cars = mk(1.7, 1.45, 4.2, MAX_VISIBLE_VEHICLES);
-    this.trains = mk(2.9, 3.6, TRAIN_CAR_LENGTH_M, MAX_VISIBLE_TRAIN_CARS);
-    this.trucks = mk(2.2, 2.6, 6.5, MAX_VISIBLE_TRUCKS);
+
+    // 車両は部品（車体・窓・屋根・車輪）を焼き込んだジオメトリ 1 つ。
+    // インスタンスは今までどおり 1 台 1 つなので、ドローコールは増えない。
+    // 長辺は必ず +Z 側（heading をそのまま Y 回転に使うため）。
+    this.cars = this.makeVehicle(CAR_PARTS, MAX_VISIBLE_VEHICLES);
+    this.trains = this.makeVehicle(TRAIN_PARTS, MAX_VISIBLE_TRAIN_CARS);
+    this.trucks = this.makeVehicle(TRUCK_PARTS, MAX_VISIBLE_TRUCKS);
+    // 路線バス。実車 11m は車 1 台（画面上 4.2＝実車 9 台の車列）の 3 分の 1 ほどだが、
+    // それだと近景で車と見分けが付かないので、少し長めに描く。
+    this.buses = this.makeVehicle(BUS_PARTS, MAX_VISIBLE_BUSES);
+
+    this.carLamps = this.makeLamps(CAR_LAMPS, MAX_VISIBLE_VEHICLES);
+    this.busLamps = this.makeLamps(BUS_LAMPS, MAX_VISIBLE_BUSES);
+    this.truckLamps = this.makeLamps(TRUCK_LAMPS, MAX_VISIBLE_TRUCKS);
+    this.trainLamps = this.makeLamps(TRAIN_LAMPS, MAX_VISIBLE_TRAIN_CARS);
+  }
+
+  /**
+   * 車両 1 種類ぶんのインスタンス群。
+   *
+   * `vertexColors` を有効にしているが、色属性は**変調係数**として作ってある
+   * （`vehicleParts.ts` 参照）。three.js は `頂点色 × instanceColor` を掛けるので、
+   * 車体色を 1 つ入れるだけで窓もタイヤも一緒に付いてくる。
+   */
+  private makeVehicle(parts: readonly Part[], capacity: number): InstancedMesh {
+    const material = new MeshLambertMaterial({ vertexColors: true });
+    this.materials.push(material);
+    const mesh = new InstancedMesh(partsGeometry(parts), material, capacity);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+    this.meshes.push(mesh);
+    return mesh;
+  }
+
+  /** 夜の灯り。こちらは頂点色をそのまま出す（instanceColor は使わない）。 */
+  private makeLamps(parts: readonly Part[], capacity: number): InstancedMesh {
+    const material = new MeshBasicMaterial({ vertexColors: true });
+    this.materials.push(material);
+    const mesh = new InstancedMesh(partsGeometry(parts), material, capacity);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+    this.meshes.push(mesh);
+    return mesh;
+  }
+
+  /** 時刻を受け取り、夜なら灯りを点ける。 */
+  setTimeOfDay(dayFraction: number): void {
+    this.night = dayFraction >= NIGHT_FROM || dayFraction < NIGHT_TO;
   }
 
   /**
@@ -121,6 +212,10 @@ export class AgentLayer {
    * 対向車が中心線上で重なって「流れ」に見えない。
    * 前方 = (sin h, cos h)、左 = 上 × 前方 = (cos h, -sin h)。
    */
+  /** 車両スロットごとの直前の向きと、そのときの出発 tick。 */
+  private headingOf = new Float32Array(0);
+  private headingTag = new Int32Array(0);
+
   private laneOffsetX(heading: number, side: number): number {
     return Math.cos(heading) * side;
   }
@@ -136,7 +231,15 @@ export class AgentLayer {
   update(sim: Simulation, camX: number, camZ: number, camDistance: number, tickFraction = 0): void {
     let ped = 0;
     let car = 0;
-    const tick = sim.clock.tick + Math.max(0, Math.min(1, tickFraction));
+    /**
+     * 描画する時刻。**直前に計算し終えた tick の中**をなぞる。
+     *
+     * `clock.tick` は tick の最後に加算されるので、`clock.tick + 端数` は
+     * まだ計算していない未来を指す。車は 1 tick に平均 4 リンク進むので、
+     * それだと端数 0 の瞬間から既に「最後のリンクの終端」に着いていて、
+     * 毎 tick「4 マス瞬間移動 → 停止線で待つ」に見える。
+     */
+    const tick = sim.clock.tick - 1 + Math.max(0, Math.min(1, tickFraction));
 
     // 歩行者は寄ったときだけ描く。引きの画では 1px 未満にしかならず、
     // 描画予算だけを食って何も見えない。
@@ -150,10 +253,17 @@ export class AgentLayer {
     const trainDist2 = TRAIN_DRAW_DISTANCE_M * TRAIN_DRAW_DISTANCE_M;
 
     const c = sim.citizens;
-    for (let id = 0; id < c.high; id++) {
+    // 引きの画では 1 人も描かないので、走査自体を丸ごと飛ばす。
+    // 以前はここを回り続けて、全員ぶんの citizenPosition（経路のエッジを線形走査）を
+    // 毎フレーム計算してから捨てていた。
+    for (let id = 0; drawPedestrians && id < c.high; id++) {
+      if (ped >= MAX_VISIBLE_AGENTS) break;
       if (!c.isAlive(id)) continue;
       if (c.state[id] !== Activity.Traveling) continue;
       const mode = c.mode[id]! as Mode;
+      // 自動車は交通流が位置を持っているので、下の drawVehicles で描く。
+      // ここで経路長から補間すると、信号待ちで止まっている車が走り続けてしまう。
+      if (mode === Mode.Car) continue;
       if (!citizenPosition(c, sim.graph, id, tick, this.tmp)) continue;
 
       // 今どのエッジの上にいるかで見た目を決める。
@@ -162,72 +272,49 @@ export class AgentLayer {
       // 「歩道を走る車」や「線路を降りて歩道を歩く電車」になる。
       const bits = this.tmp.edge >= 0 ? sim.graph.edgeMask[this.tmp.edge]! : 0;
       // 線路上の鉄道利用者は電車の中にいるので描かない（電車の方を描く）
-      if (mode === Mode.Rail && bits & ModeBit.Rail) continue;
-      const onRoadway = mode === Mode.Car && (bits & ModeBit.Car) !== 0;
-
-      if (onRoadway) {
-        if (car >= MAX_VISIBLE_VEHICLES) continue;
-      } else {
-        if (!drawPedestrians || ped >= MAX_VISIBLE_AGENTS) continue;
-      }
+      if (mode === Mode.Transit && bits & ModeBit.Rail) continue;
 
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
-      const d2 = dx * dx + dz * dz;
-      if (d2 > (onRoadway ? vehDist2 : pedDist2)) continue;
+      if (dx * dx + dz * dz > pedDist2) continue;
 
       const groundY = this.groundAt(sim, this.tmp.x, this.tmp.z) + 0.05;
       this.quat.setFromAxisAngle(this.axisY, this.tmp.heading);
 
-      if (onRoadway) {
-        // 左側通行。対向車が別の車線を流れる
-        this.pos.set(
-          this.tmp.x + this.laneOffsetX(this.tmp.heading, LANE_OFFSET_M),
-          groundY,
-          this.tmp.z + this.laneOffsetZ(this.tmp.heading, LANE_OFFSET_M),
-        );
-        this.mat.compose(this.pos, this.quat, this.scl);
-        this.cars.setMatrixAt(car, this.mat);
-        this.color.setHex(carColor((id * 2654435761) >>> 0));
-        this.cars.setColorAt(car, this.color);
-        car++;
+      // 道路の中央ではなく端を歩かせる。全員が真ん中を一列で進むと、
+      // 近景で見たときに人の流れではなく点線に見える。
+      // 車道の外側になるよう、車線より外に置く。
+      const side = LANE_OFFSET_M + 1.2 + ((id >> 1) % 3) * 0.7;
+      this.pos.set(
+        this.tmp.x + this.laneOffsetX(this.tmp.heading, side),
+        groundY,
+        this.tmp.z + this.laneOffsetZ(this.tmp.heading, side),
+      );
+      this.mat.compose(this.pos, this.quat, this.scl);
+      this.pedestrians.setMatrixAt(ped, this.mat);
+      // 服の色を人ごとに散らす。自転車は目立つ色にして見分けられるようにする。
+      if (mode === Mode.Bike) {
+        this.color.setHex(0xe08a3a);
       } else {
-        // 道路の中央ではなく端を歩かせる。全員が真ん中を一列で進むと、
-        // 近景で見たときに人の流れではなく点線に見える。
-        // 車道の外側になるよう、車線より外に置く。
-        const side = LANE_OFFSET_M + 1.2 + ((id >> 1) % 3) * 0.7;
-        this.pos.set(
-          this.tmp.x + this.laneOffsetX(this.tmp.heading, side),
-          groundY,
-          this.tmp.z + this.laneOffsetZ(this.tmp.heading, side),
-        );
-        this.mat.compose(this.pos, this.quat, this.scl);
-        this.pedestrians.setMatrixAt(ped, this.mat);
-        // 服の色を人ごとに散らす。自転車は目立つ色にして見分けられるようにする。
-        if (mode === Mode.Bike) {
-          this.color.setHex(0xe08a3a);
-        } else {
-          const h = (id * 2654435761) >>> 0;
-          this.color.setHSL(((h >>> 8) % 360) / 360, 0.28, 0.52 + ((h >>> 20) % 24) / 100);
-        }
-        this.pedestrians.setColorAt(ped, this.color);
-        ped++;
+        const h = (id * 2654435761) >>> 0;
+        this.color.setHSL(((h >>> 8) % 360) / 360, 0.28, 0.52 + ((h >>> 20) % 24) / 100);
       }
+      this.pedestrians.setColorAt(ped, this.color);
+      ped++;
     }
 
-    // --- 滞在中の市民 ---
-    // 移動中の人だけを描くと、街が空っぽに見える。トリップは数分で終わるので、
-    // どの瞬間を切り取っても移動中の人はごく一部しかいないため。
-    // 勤務中・買い物中・在宅の市民も、その建物の敷地に立たせて描く。
+    // --- 立ち寄り中の市民 ---
+    // 屋外に出すのは買い物中とレジャー中だけ。
+    //
+    // 以前は在宅・勤務中・通学中まで建物の玄関前に立たせていたが、位置が ID の
+    // ハッシュで固定なので、同じ人が同じ場所に一日じゅう立ち尽くす街になっていた。
+    // 買い物とレジャーは滞在が 2 時間程度で終わるので、時間とともに入れ替わる。
     if (drawPedestrians && ped < MAX_VISIBLE_AGENTS) {
       const b = sim.buildings;
       for (let id = 0; id < c.high && ped < MAX_VISIBLE_AGENTS; id++) {
         if (!c.isAlive(id)) continue;
         const st = c.state[id]!;
-        // 就寝中と経路待ちは屋内にいる扱い
-        if (st === Activity.Sleeping || st === Activity.Traveling || st === Activity.WaitingForRoute) continue;
-        // 在宅の人は一部だけ外に出す（全員が庭に立っていると不自然）
-        if (st === Activity.AtHome && id % 4 !== 0) continue;
+        if (st !== Activity.Shopping && st !== Activity.Leisure) continue;
 
         const tile = c.currentTile[id]!;
         // 建物のタイル中心に置くと、人が家の中に埋まって見えない。
@@ -260,9 +347,11 @@ export class AgentLayer {
       }
     }
 
+    const drawn = this.drawVehicles(sim, camX, camZ, vehDist2, tick, car);
+    car = drawn.cars;
+    const truck = drawn.trucks;
     car = this.drawParkedCars(sim, camX, camZ, camDistance, pedDist2, car);
     const train = this.drawTrains(sim, camX, camZ, trainDist2, tick);
-    const truck = this.drawTrucks(sim, camX, camZ, vehDist2, tick);
 
     this.pedestrians.count = ped;
     this.cars.count = car;
@@ -327,15 +416,17 @@ export class AgentLayer {
       if (access < 0) continue;
 
       // 同じ接道タイルに何台も重ねない
-      const used = this.parkSlots.get(access) ?? 0;
-      if (used >= PARKED_CARS_PER_TILE) continue;
-      this.parkSlots.set(access, used + 1);
-
       const wx = (tileX(access) + 0.5) * TILE_M;
       const wz = (tileY(access) + 0.5) * TILE_M;
       const dx = wx - camX;
       const dz = wz - camZ;
+      // 距離の判定を駐車枠の確保より先に置く。逆にすると、視野の外にいて
+      // 描かない車が枠を潰し、境界のタイルに本来より少ない台数しか並ばない。
       if (dx * dx + dz * dz > maxDist2) continue;
+
+      const used = this.parkSlots.get(access) ?? 0;
+      if (used >= PARKED_CARS_PER_TILE) continue;
+      this.parkSlots.set(access, used + 1);
 
       // 道路の走っている向きに沿って縦列駐車させる。
       // 向きを見ずに置くと、車が道路を跨いで横向きに刺さる。
@@ -389,61 +480,137 @@ export class AgentLayer {
           const dz = this.railPose.z - camZ;
           if (dx * dx + dz * dz > maxDist2) continue;
           this.quat.setFromAxisAngle(this.axisY, this.railPose.heading);
-          // 線路は地面より一段高い扱い（軌道敷ぶん）
+          // 車両の原点は台車の上端（＝レール面）。線路レイヤのバラストと枕木の上に
+          // 台車が載るよう、その厚みぶんだけ持ち上げる。
           this.pos.set(
             this.railPose.x,
-            this.groundAt(sim, this.railPose.x, this.railPose.z) + 0.6,
+            this.groundAt(sim, this.railPose.x, this.railPose.z) + RAIL_TOP_M,
             this.railPose.z,
           );
           this.mat.compose(this.pos, this.quat, this.scl);
           this.trains.setMatrixAt(n, this.mat);
           this.color.setHex(carIdx === 0 ? TRAIN_HEAD_COLOR : TRAIN_BODY_COLOR);
           this.trains.setColorAt(n, this.color);
+          if (this.night) this.trainLamps.setMatrixAt(n, this.mat);
           n++;
         }
       }
     }
+    this.trainLamps.count = this.night ? n : 0;
     return n;
   }
 
-  /** トラック（物流）。積荷の色で塗り分ける。 */
-  private drawTrucks(sim: Simulation, camX: number, camZ: number, maxDist2: number, tick: number): number {
-    let n = 0;
-    const t = sim.freight.trucks;
-    for (let i = 0; i < t.high && n < MAX_VISIBLE_TRUCKS; i++) {
-      if (t.alive[i] !== 1) continue;
-      const path = t.path[i];
-      if (!path) continue;
-      const depart = t.departTick[i]!;
-      const arrive = t.arriveTick[i]!;
-      const total = Math.max(1, arrive - depart);
-      const returning = t.state[i] === TruckState.Returning;
-      let f = Math.max(0, Math.min(1, (tick - depart) / total));
-      // 帰路は経路を逆向きに進む
-      if (returning) f = 1 - f;
-      if (!pathPosition(sim.graph, path, f, this.tmp)) continue;
-      // 位置だけ反転して向きを反転しないと、トラックがバックで帰る
-      const heading = returning ? this.tmp.heading + Math.PI : this.tmp.heading;
+  /**
+   * 走行中の車両（自家用車とトラック）。
+   *
+   * 位置は交通流シミュレーションが持っている。信号待ちの車は停止線の手前に
+   * 車列 1 台ぶんずつ下がって並ぶので、そのまま描けば行列に見える。
+   * 経路長からの補間ではないので、詰まっている車は本当に止まって見える。
+   */
+  /**
+   * 曲がり角で向きがスナップするのを抑える。
+   *
+   * 進行方向はリンクの両端から出しているので、交差点を曲がると 90 度が 1 フレームで入れ替わる。
+   * 直前の向きから少しずつ寄せる。車両スロットは使い回されるので、
+   * 出発 tick が変わっていたら別の車とみなして即座に合わせる（古い向きを引き継がない）。
+   */
+  private smoothHeading(vehicle: number, departTick: number, target: number): number {
+    if (vehicle >= this.headingOf.length) {
+      const n = Math.max(vehicle + 1, this.headingOf.length * 2, 1024);
+      const h = new Float32Array(n);
+      h.set(this.headingOf);
+      this.headingOf = h;
+      const g = new Int32Array(n).fill(-1);
+      g.set(this.headingTag);
+      this.headingTag = g;
+    }
+    let next = target;
+    if (this.headingTag[vehicle] === departTick) {
+      const cur = this.headingOf[vehicle]!;
+      // -π..π に畳んでから寄せる。畳まないと 359 度回る。
+      let d = target - cur;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      next = cur + d * HEADING_SMOOTHING;
+    }
+    this.headingOf[vehicle] = next;
+    this.headingTag[vehicle] = departTick;
+    return next;
+  }
 
+  private drawVehicles(
+    sim: Simulation,
+    camX: number,
+    camZ: number,
+    maxDist2: number,
+    tick: number,
+    fromCar: number,
+  ): { cars: number; trucks: number } {
+    let car = fromCar;
+    let truck = 0;
+    let bus = 0;
+    const tr = sim.traffic;
+    const nowSec = tick * 60;
+    const t = sim.freight.trucks;
+    tr.forEachVehicle((v) => {
+      const kind = tr.kind[v]!;
+      const isTruck = kind === VehicleKind.Truck;
+      const isBus = kind === VehicleKind.Bus;
+      if (isTruck && truck >= MAX_VISIBLE_TRUCKS) return;
+      if (isBus && bus >= MAX_VISIBLE_BUSES) return;
+      if (!isTruck && !isBus && car >= MAX_VISIBLE_VEHICLES) return;
+      if (!tr.pose(sim.graph, v, nowSec, this.tmp)) return;
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
-      if (dx * dx + dz * dz > maxDist2) continue;
+      if (dx * dx + dz * dz > maxDist2) return;
+
+      const heading = this.smoothHeading(v, tr.departTick[v]!, this.tmp.heading);
       this.quat.setFromAxisAngle(this.axisY, heading);
+      // 左側通行。対向車が別の車線を流れる
       const ox = this.laneOffsetX(heading, LANE_OFFSET_M);
       const oz = this.laneOffsetZ(heading, LANE_OFFSET_M);
       this.pos.set(this.tmp.x + ox, this.groundAt(sim, this.tmp.x + ox, this.tmp.z + oz) + 0.05, this.tmp.z + oz);
       this.mat.compose(this.pos, this.quat, this.scl);
-      this.trucks.setMatrixAt(n, this.mat);
-      // 帰路は空車なので無地。往路は積荷の色。
-      this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[i]!] ?? CARGO_COLORS[0]!);
-      this.trucks.setColorAt(n, this.color);
-      n++;
-    }
-    return n;
+
+      const owner = tr.owner[v]!;
+      if (isTruck) {
+        this.trucks.setMatrixAt(truck, this.mat);
+        // 帰路は空車なので無地。往路は積荷の色。
+        const returning = t.alive[owner] === 1 && t.state[owner] === TruckState.Returning;
+        this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[owner]!] ?? CARGO_COLORS[0]!);
+        this.trucks.setColorAt(truck, this.color);
+        if (this.night) this.truckLamps.setMatrixAt(truck, this.mat);
+        truck++;
+      } else if (isBus) {
+        // 車体は路線の色。路線一覧の色と揃えてあるので、
+        // 「いま目の前を通ったのがどの系統か」が地図の上で分かる。
+        this.buses.setMatrixAt(bus, this.mat);
+        this.color.setHex(lineColor(sim.transit.lineOfBus(owner)));
+        this.buses.setColorAt(bus, this.color);
+        if (this.night) this.busLamps.setMatrixAt(bus, this.mat);
+        bus++;
+      } else {
+        this.cars.setMatrixAt(car, this.mat);
+        this.color.setHex(carColor((owner * 2654435761) >>> 0));
+        this.cars.setColorAt(car, this.color);
+        if (this.night) this.carLamps.setMatrixAt(car, this.mat);
+        car++;
+      }
+    });
+    this.buses.count = bus;
+    // 灯りは走行中の車両にだけ点ける。この後ろに続く路上駐車は消灯したまま。
+    this.carLamps.count = this.night ? car : 0;
+    this.busLamps.count = this.night ? bus : 0;
+    this.truckLamps.count = this.night ? truck : 0;
+    return { cars: car, trucks: truck };
   }
 
   dispose(): void {
-    for (const m of this.meshes) m.dispose();
+    // InstancedMesh.dispose() はジオメトリを解放しない。明示的に捨てる。
+    for (const m of this.meshes) {
+      m.geometry.dispose();
+      m.dispose();
+    }
     for (const m of this.materials) m.dispose();
   }
 }

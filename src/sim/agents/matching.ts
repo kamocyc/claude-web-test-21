@@ -6,7 +6,7 @@ import { handleSlot } from '@sim/buildings/buildings';
 import type { Rng } from '@sim/core/rng';
 import { valueOfTime } from '@sim/network/modeChoice';
 import type { TazMatrix } from '@sim/network/tazMatrix';
-import { tazOf } from '@sim/world/tiles';
+import { tazOf, tileDistanceM } from '@sim/world/tiles';
 import { CitizenFlag, type CitizenStore } from './citizens';
 
 /**
@@ -122,7 +122,12 @@ export function seekJob(
       const s = taz.costBetweenTiles(homeTile, jobTile, m as Mode);
       if (s < bestSec) bestSec = s;
     }
-    if (!Number.isFinite(bestSec)) continue;
+    if (!Number.isFinite(bestSec)) {
+      // TAZ 行列がまだ埋まっていない（空マップ開始直後や、道路を敷いた直後）。
+      // ここで黙って候補を捨てると採用が一切成立せず、就業者が 0 のままになる。
+      // 移動側（ActivitySystem.fillTimes）と同じく直線距離で概算する。
+      bestSec = (tileDistanceM(homeTile, jobTile) / 8.3) * 1.35;
+    }
     const wage = wageOf(buildings, slot, skill);
     const vot = valueOfTime(wage);
     // 往復 × 月 20 日の通勤コストを賃金から差し引く
@@ -139,7 +144,7 @@ export function seekJob(
   citizens.workBuilding[id] = buildings.handleOf(best);
   citizens.incomeYenMo[id] = wageOf(buildings, best, skill);
   citizens.set(id, CitizenFlag.Employed, true);
-  // 通勤定期は鉄道アクセスが良い人が持つ
+  // 通勤定期の付与は lifecycle 側でまとめてやる（住まいと職場が決まってからでないと決められない）。
   return true;
 }
 

@@ -62,7 +62,10 @@ export const SCHEDULES: ScheduleTemplate[] = [
     kind: ScheduleKind.OfficeWorker,
     steps: [
       step(Activity.AtWork, Purpose.Commute, H(8, 0), 45),
-      step(Activity.Shopping, Purpose.Shopping, H(18, 30), 40, 0.55),
+      // 外回り。行って戻るので昼の街に人と車が出る。
+      step(Activity.Business, Purpose.Business, H(13, 0), 50, 0.55),
+      step(Activity.AtWork, Purpose.Business, H(14, 30), 45),
+      step(Activity.Shopping, Purpose.Shopping, H(18, 30), 40, 0.4),
       step(Activity.Leisure, Purpose.Leisure, H(19, 30), 40, 0.75),
       step(Activity.AtHome, Purpose.Home, H(20, 30), 50),
       step(Activity.Sleeping, Purpose.Home, H(23, 30), 40),
@@ -127,11 +130,20 @@ export const SCHEDULES: ScheduleTemplate[] = [
 ];
 
 /** 年齢・就業状態から生活パターンを決める。 */
-export function pickSchedule(age: number, employed: boolean, retired: boolean, nightShift: boolean): ScheduleKind {
+export function pickSchedule(
+  age: number,
+  employed: boolean,
+  retired: boolean,
+  nightShift: boolean,
+  shiftWork = false,
+): ScheduleKind {
   if (age < 6) return ScheduleKind.Homemaker; // 未就学児は保護者と同じリズム
   if (age < 22 && !employed) return ScheduleKind.Student;
   if (retired) return ScheduleKind.Retired;
   if (!employed) return ScheduleKind.Unemployed;
   if (nightShift) return ScheduleKind.NightShift;
+  // 早番。6:30 出勤・17:00 退勤の波を作る。
+  // テンプレートは前からあったのに、ここに分岐が無くて一度も使われていなかった。
+  if (shiftWork) return ScheduleKind.ShiftWorker;
   return ScheduleKind.OfficeWorker;
 }

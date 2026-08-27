@@ -52,6 +52,25 @@ export interface Archetype {
    * 開幕からタワーマンションが林立すると、街が育った実感が消えてしまう。
    */
   minCityPopulation: number;
+  /**
+   * 発電容量 (kW)。0 なら発電しない。
+   * 供給は道路網の連結成分を伝わるので、接道していない発電所は誰にも電気を送れない。
+   */
+  powerKw: number;
+  /** 浄水容量 (m3/日)。0 なら浄水しない。 */
+  waterM3: number;
+  /**
+   * 下水処理容量 (m3/日)。連結成分ごとの発生量に足りないぶんは、
+   * 未処理のまま公害として街に返る（`utilities.ts` の `sewagePollutionOf`）。
+   */
+  sewageM3: number;
+  /**
+   * 取水できる水辺の近くにしか建てられないか。
+   * `world.waterAccess` は淡水（河川・湖）までの距離しか持たないので、海岸は該当しない。
+   * 日本の上水はほぼ河川・ダム由来で、海水淡水化は離島くらいにしか無いため、
+   * この割り切りは実情ともずれていない。
+   */
+  needsWaterAccess: boolean;
   /** 描画に使う形状キー。 */
   mesh: string;
 }
@@ -76,6 +95,10 @@ function def(a: Partial<Archetype> & { id: number; nameJa: string; zone: Zone; m
     landValueEffect: 0,
     provides: 0,
     serviceRadius: 0,
+    powerKw: 0,
+    waterM3: 0,
+    sewageM3: 0,
+    needsWaterAccess: false,
     leisureAppeal: 0,
     playerPlaced: false,
     minCityPopulation: 0,
@@ -114,6 +137,15 @@ export const Arch = {
   Park: 22,
   Shrine: 23,
   CityHall: 24,
+  // --- 住宅（追加分）---
+  // Arch の値はセーブデータに入るので、途中に挿入せず末尾に足す。
+  MidRiseApartment: 25,
+  SmallMansion: 26,
+  // --- 電気・水道（プレイヤ設置）---
+  ThermalPowerPlant: 27,
+  SolarFarm: 28,
+  WaterWorks: 29,
+  SewagePlant: 30,
 } as const;
 
 export const ARCHETYPES: Archetype[] = [
@@ -486,6 +518,121 @@ export const ARCHETYPES: Archetype[] = [
     landValueEffect: 10,
     playerPlaced: true,
   }),
+
+  // ---------------- 住宅（中密度の隙間を埋める） ----------------
+  // 中高層住居ゾーンには 2×2 の建物しか無かったので、6×6 の街区の内側 5×5 に
+  // マンションが 4 棟しか入らず、L 字の 9 タイルが永久に空いていた。
+  // 「中密度を密集させた」のに実際には密にならない、という食い違いを直す。
+  def({
+    id: Arch.MidRiseApartment,
+    nameJa: '中層アパート',
+    zone: Zone.ResidentialMid,
+    mesh: 'apartment',
+    w: 1,
+    h: 2,
+    minLevel: 2,
+    maxLevel: 4,
+    households: 14,
+    noise: 10,
+    landValueEffect: 2,
+    minCityPopulation: 400,
+  }),
+  def({
+    id: Arch.SmallMansion,
+    nameJa: '小規模マンション',
+    zone: Zone.ResidentialMid,
+    mesh: 'mansion',
+    minLevel: 2,
+    maxLevel: 4,
+    households: 8,
+    noise: 9,
+    landValueEffect: 2,
+    minCityPopulation: 600,
+  }),
+
+  // ---------------- 電気・水道（プレイヤ設置） ----------------
+  // 容量の基準は「人口 7000 の街」。世帯 2800 × 1.2kW ＋ 雇用 3500 × 2.4kW ≒ 12,000kW、
+  // 上水は 2800 × 0.7 ＋ 3500 × 0.4 ≒ 3,400 m3/日 になる。
+  // どの施設も「1 基で街の 7〜8 割」に収めてあるのは、1 基で永久に足りてしまうと
+  // インフラの意思決定が開幕の 1 回で終わってしまうため。街が育つたびに増設が要る刻みにする。
+  def({
+    id: Arch.ThermalPowerPlant,
+    nameJa: '火力発電所',
+    zone: Zone.None,
+    mesh: 'powerplant',
+    w: 3,
+    h: 3,
+    jobs: 60,
+    // 病院（3200 万・維持 160 万）より重い。序盤に建てると維持費だけで赤字になるので、
+    // 太陽光で凌いでから切り替える、という順序が自然に出る。
+    upkeep: 2_400_000,
+    buildCost: 60_000_000,
+    powerKw: 9600,
+    // 工場（45）の 2 倍。工業地域の風下に置かないと必ず住宅地から苦情が出る量にした。
+    // これを工場並みにすると「街のどこに置いても大差ない」＝立地の判断が消える。
+    pollution: 90,
+    noise: 40,
+    landValueEffect: -30,
+    playerPlaced: true,
+  }),
+  def({
+    id: Arch.SolarFarm,
+    nameJa: '太陽光発電所',
+    zone: Zone.None,
+    mesh: 'solar',
+    // 2×2 = 300m 角 ≒ 9ha。実物のメガソーラーの設備利用率（13% 前後）を掛けると
+    // ちょうど 1MW 級になるので、この容量は実際の規模ともおおむね合っている。
+    w: 2,
+    h: 2,
+    jobs: 2,
+    upkeep: 180_000,
+    buildCost: 9_000_000,
+    powerKw: 1000,
+    // 火力との対比が設計の要点。
+    //   kW 単価: 太陽光 9,000 円 / 火力 6,250 円 → まとめ買いは火力が安い
+    //   kW あたり維持費: 太陽光 180 円 / 火力 250 円 → 燃料が要らないぶん太陽光が軽い
+    //   公害: 太陽光 0 / 火力 90
+    // 「安く始められて土地を食う」対「用地は小さいが公害と維持費が重い」になる。
+    landValueEffect: -2,
+    playerPlaced: true,
+  }),
+  def({
+    id: Arch.WaterWorks,
+    nameJa: '浄水場',
+    zone: Zone.None,
+    mesh: 'waterworks',
+    w: 2,
+    h: 2,
+    jobs: 18,
+    upkeep: 900_000,
+    buildCost: 20_000_000,
+    waterM3: 2400,
+    // 取水できる川沿いにしか建たない。これが「街をどこに広げるか」を地形に縛る唯一の制約で、
+    // 無くすと上水はただの資金チェックになり、置き場所を考える理由が消える。
+    needsWaterAccess: true,
+    landValueEffect: -4,
+    playerPlaced: true,
+  }),
+  def({
+    id: Arch.SewagePlant,
+    nameJa: '下水処理場',
+    zone: Zone.None,
+    mesh: 'sewage',
+    w: 2,
+    h: 2,
+    jobs: 22,
+    upkeep: 1_100_000,
+    buildCost: 24_000_000,
+    // 浄水場と同じ容量にしてある。使った水はそのまま下水になるので、
+    // 上水と下水は同じ本数だけ要る = 増設のタイミングが揃い、覚えることが 1 つ減る。
+    sewageM3: 2400,
+    // 製材所（22）と工場（45）の間。住宅地に置けば地価に響くが、
+    // 工業地の端なら気にならない — 「街外れに追いやる」判断が成立する量。
+    pollution: 30,
+    noise: 18,
+    landValueEffect: -14,
+    playerPlaced: true,
+  }),
 ];
 
 /** ゾーン種別 → そのゾーンで自然発生しうるアーキタイプ。 */
@@ -521,4 +668,10 @@ export function isProducer(id: number): boolean {
 /** 入力資源を消費する建物か。 */
 export function isConsumer(id: number): boolean {
   return ARCHETYPES[id]!.inputs.length > 0;
+}
+
+/** 電気・水道の供給施設か（発電・浄水・下水処理のいずれかの容量を持つ）。 */
+export function isUtilityPlant(id: number): boolean {
+  const a = ARCHETYPES[id]!;
+  return a.powerKw > 0 || a.waterM3 > 0 || a.sewageM3 > 0;
 }

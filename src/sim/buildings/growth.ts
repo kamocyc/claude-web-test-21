@@ -1,6 +1,7 @@
 import {
   ABANDON_PATIENCE_DAYS,
   CONSTRUCTION_LUMBER,
+  GROWTH_BUILD_RATE,
   GROWTH_SCAN_PER_TICK,
   TILE_COUNT,
   UPGRADE_PATIENCE_DAYS,
@@ -9,6 +10,7 @@ import { Service, Zone } from '@shared/enums';
 import type { Rng } from '@sim/core/rng';
 import { idx, inBounds, tileX, tileY } from '@sim/world/tiles';
 import type { World } from '@sim/world/world';
+import type { UtilitySystem } from '@sim/world/utilities';
 import { ZONE_ARCHETYPES, archetype } from './archetypes';
 import type { BuildingStore } from './buildings';
 import { type DemandState, demandKindOfZone, demandValue } from './demand';
@@ -27,6 +29,14 @@ export class GrowthSystem {
   /** ゾーン指定済みで空きのタイル。 */
   private candidates: number[] = [];
   private cursor = 0;
+
+  /** 走査位置。セーブ／ロードで復元しないと、読み込んだ街の成長順が変わる。 */
+  get scanCursor(): number {
+    return this.cursor;
+  }
+  set scanCursor(v: number) {
+    this.cursor = Math.max(0, Math.floor(v));
+  }
   private dirty = true;
   /** 建設待ちで木材が足りない件数（需要モデルへ返す）。 */
   lumberShortfall = 0;
@@ -127,6 +137,8 @@ export class GrowthSystem {
     /** 資源ごとの在庫と時間生産量。原料が地元で手に入るかの判定に使う。 */
     goodsStock?: Float64Array,
     goodsProduced?: Float64Array,
+    /** 電気・水道。供給が足りていない地区には新しい建物が建たない。 */
+    utilities?: UtilitySystem,
   ): { lumberUsed: number } {
     if (this.dirty) this.rebuildIndex(world);
     if (this.candidates.length === 0) return { lumberUsed: 0 };
@@ -152,11 +164,19 @@ export class GrowthSystem {
       const d = demandValue(demand, demandKindOfZone(zone));
       if (d <= 0) continue;
 
+      // 電気か水が足りていない地区には建てない。
+      //
+      // これが無いと、供給の上限を超えても街が伸び続け、不足がどこまでも広がって
+      // 街全体が機能停止する（放っておくと必ず崩壊する街になる）。
+      // 建設の側で止めれば、街は供給の天井で自然に伸び止まり、
+      // プレイヤが発電所を足した分だけまた伸びる — CS と同じ手触りになる。
+      if (utilities && !utilities.canGrowAt(tile)) continue;
+
       const s = this.desirability(world, tile, zone);
       if (s <= 0) continue;
 
       // 確率 = k * 需要 * S^2
-      const p = 0.02 * (d / 100) * s * s;
+      const p = GROWTH_BUILD_RATE * (d / 100) * s * s;
       if (!rng.chance(p)) continue;
 
       // 木材が要る（林業チェーンが街の成長速度を律速する）
@@ -197,7 +217,7 @@ export class GrowthSystem {
    * 日次の建物評価。レベルアップと廃墟化。
    * 全建物を毎日 1 回だけ見る（建物数は数千オーダーなので十分軽い）。
    */
-  dailyReview(world: World, buildings: BuildingStore): void {
+  dailyReview(world: World, buildings: BuildingStore, utilities?: UtilitySystem): void {
     for (const s of buildings.each()) {
       const a = archetype(buildings.archetypeId[s]!);
       if (a.playerPlaced) continue;
@@ -210,7 +230,10 @@ export class GrowthSystem {
       const lostAccess = buildings.accessTile[s]! < 0;
       const starved = buildings.stockoutDays[s]! > 0;
 
-      if (des > 0.62 && !lostAccess && !starved) {
+      // 停電・断水している建物はレベルアップしない（廃墟化はさせない —
+      // 一時的な停電で街が消えると、直す機会そのものが無くなる）。
+      const powered = !utilities || utilities.canGrowAt(tile);
+      if (des > 0.62 && !lostAccess && !starved && powered) {
         buildings.goodDays[s] = buildings.goodDays[s]! + 1;
         buildings.badDays[s] = 0;
         if (buildings.goodDays[s]! >= UPGRADE_PATIENCE_DAYS) {

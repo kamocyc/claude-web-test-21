@@ -1,20 +1,28 @@
 import {
+  BUS_STOP_COST,
   COST_SMOOTHING_LAMBDA,
+  ECONOMY_PERIODS_PER_DAY,
+  ECONOMY_PERIOD_TICKS,
   FREIGHT_DISPATCH_INTERVAL,
   LUMBER_IMPORT_YEN,
   NEUTRAL_TAX_PCT,
   RAIL_BUILD_COST,
   ROAD_ACCESS_RADIUS,
   STOCKOUT_ABANDON_DAYS,
+  DAYS_PER_MONTH,
+  MONTHS_PER_YEAR,
   TICKS_PER_DAY,
   TICKS_PER_HOUR,
-  VOLUME_DECAY,
+  CONGESTION_ALERT_COOLDOWN_TICKS,
+  CONGESTION_ALERT_LINKS,
+  LINK_TIME_RELAX_TICKS,
   MAP_H,
   MAP_W,
 } from '@shared/constants';
 import {
   DemandKind,
   Good,
+  TransitKind,
   Mode,
   ROAD_BUILD_COST,
   RoadClass,
@@ -22,11 +30,15 @@ import {
   Zone,
 } from '@shared/enums';
 import { ActivitySystem, newActivityStats } from '@sim/agents/activity';
-import { CitizenFlag, CitizenStore } from '@sim/agents/citizens';
+import { arrayMap, type SimSnapshot } from '@sim/persistence';
+import { CITIZEN_FIELDS, CitizenFlag, CitizenStore } from '@sim/agents/citizens';
 import { Destinations } from '@sim/agents/destinations';
-import { LifecycleSystem, createCitizen, newHouseholdId, resetHouseholdIds } from '@sim/agents/lifecycle';
+import {
+  LifecycleSystem,
+  createCitizen,
+} from '@sim/agents/lifecycle';
 import { Arch, archetype, isShop } from '@sim/buildings/archetypes';
-import { BuildingStore, handleSlot } from '@sim/buildings/buildings';
+import { BUILDING_FIELDS, BuildingStore, handleSlot } from '@sim/buildings/buildings';
 import { computeDemand, taxPenalty, type DemandState } from '@sim/buildings/demand';
 import { GrowthSystem } from '@sim/buildings/growth';
 import { Clock } from '@sim/core/clock';
@@ -34,15 +46,32 @@ import type { AlertKind } from '@sim/core/events';
 import { hashArrays } from '@sim/core/hash';
 import { Rng } from '@sim/core/rng';
 import { TimeWheel } from '@sim/core/timeWheel';
-import { Budget, type MonthlyReport } from '@sim/economy/budget';
+import { Budget, emptyAccrual, type Accrual, type MonthlyReport } from '@sim/economy/budget';
 import { FreightSystem } from '@sim/economy/freight';
 import { newProductionStats, runProduction, updateStockouts } from '@sim/economy/production';
 import { Graph } from '@sim/network/graph';
+import { TrafficSystem, VehicleKind } from '@sim/network/traffic';
+
+/** 交通流の集計値。 */
+export interface TrafficStats {
+  /** 走行中の車両数（自家用車＋トラック）。 */
+  running: number;
+  /** 信号待ち・渋滞で止まっている車両数。 */
+  waiting: number;
+  /** 収容いっぱいの道路リンク数と、その割合。 */
+  fullLinks: number;
+  congestedShare: number;
+  /** 自由流に対する所要時間の倍率（車両で重み付け）と、最悪値。 */
+  avgDelay: number;
+  worstDelay: number;
+}
 import { Router } from '@sim/network/router';
 import { TazMatrix } from '@sim/network/tazMatrix';
 import { updateLandValue, updatePollution, updateServiceCoverage, updateTransitAccess } from '@sim/world/fields';
 import { idx, tileX, tileY } from '@sim/world/tiles';
 import { World } from '@sim/world/world';
+import { UtilitySystem, canBuildUtility, type UtilityTotals } from '@sim/world/utilities';
+import { TransitSystem } from '@sim/network/transit';
 import type { Command } from './commands';
 import { CommandLog } from './commands';
 
@@ -62,11 +91,22 @@ export interface SimStats {
   tripsFailed: number;
   shoppingFailed: number;
   cash: number;
+  /** 今の収支（月換算）。決算を待たずに見える run-rate。 */
+  finance: Accrual;
+  /** 今月ここまでの建設・撤去・輸入。 */
+  capexThisMonth: number;
+  deficitMonths: number;
   lastReport: MonthlyReport | null;
   cacheHitRate: number;
   routeQueueDepth: number;
   searchesThisTick: number;
   trucksActive: number;
+  /** 交通流の様子。渋滞はここに出る。 */
+  traffic: TrafficStats;
+  /** 公共交通の運行。路線数・車両数・1 日の乗車回数。 */
+  transit: { lines: number; vehicles: number; busesRunning: number; boardingsToday: number };
+  /** 電気・水道の需給。 */
+  utilities: UtilityTotals;
   stockouts: number;
   goodsStock: Float64Array;
   goodsProduced: Float64Array;
@@ -87,6 +127,9 @@ export class Simulation {
   readonly graph = new Graph();
   readonly router = new Router();
   readonly taz = new TazMatrix();
+  readonly traffic = new TrafficSystem();
+  readonly transit = new TransitSystem();
+  readonly utilities = new UtilitySystem();
   readonly wheel = new TimeWheel();
   readonly clock = new Clock();
   readonly budget = new Budget();
@@ -101,6 +144,11 @@ export class Simulation {
   private readonly production = newProductionStats();
   private demand: DemandState = { residential: 0, commercial: 0, industrial: 0, agriculture: 0 };
   private lastReport: MonthlyReport | null = null;
+  /** 今の収支（月換算）。経済期ごとに取り直す。 */
+  private finance: Accrual = emptyAccrual();
+  /** 次に渋滞を通知してよい tick。 */
+  private congestionAlertAt = 0;
+  private outageAlertAt = -1 << 20;
   /**
    * 駅タイル。建物ストアから毎回導出する。
    * 並行配列として持つと「建物はあるのに交通ノードが無い駅」という
@@ -115,7 +163,6 @@ export class Simulation {
 
   constructor(seed = 42) {
     this.seed = seed;
-    resetHouseholdIds();
     this.world = new World(seed);
     this.rng = new Rng(seed).fork('sim');
     this.rebuildNetwork();
@@ -126,6 +173,17 @@ export class Simulation {
   /** コマンドを積む。適用は次の tick 境界。 */
   enqueue(cmd: Command): void {
     this.pendingCommands.push(cmd);
+  }
+
+  /**
+   * 溜まっているコマンドを今すぐ適用する。
+   *
+   * 一時停止中は tick が回らないので、道路を引いても何も起きず、課金もされず、
+   * 警告も出なかった。停止して街を作るのは普通の遊び方なので、
+   * 停止中はアプリ側から毎フレームこれを呼ぶ。
+   */
+  flushCommands(): void {
+    this.applyCommands();
   }
 
   private applyCommands(): void {
@@ -233,16 +291,18 @@ export class Simulation {
           this.onNetworkChanged();
           updateTransitAccess(this.world, this.stationTiles);
         }
-        updateServiceCoverage(this.world, this.buildings);
+        this.refreshFields();
         this.destinations.markDirty();
         this.growth.markDirty();
         break;
       }
       case 'bulldoze': {
         let networkChanged = false;
+        let removedBuilding = false;
         for (const tile of cmd.tiles) {
           if (this.clearBuildingAt(tile)) {
             this.destinations.markDirty();
+            removedBuilding = true;
           }
           if (this.world.road[tile] !== RoadClass.None) {
             this.world.setRoad(tile, RoadClass.None);
@@ -257,6 +317,7 @@ export class Simulation {
             this.growth.markDirty();
           }
         }
+        if (removedBuilding) this.refreshFields();
         if (networkChanged) this.onNetworkChanged();
         break;
       }
@@ -266,9 +327,75 @@ export class Simulation {
       case 'setSpeed':
         // 速度はプレゼンテーション層の関心事。ログには残すが sim は何もしない。
         break;
+      case 'setOneWay': {
+        let changed = 0;
+        for (const tile of cmd.tiles) {
+          if (this.world.setOneWay(tile, cmd.dir)) changed++;
+        }
+        if (changed > 0) this.onNetworkChanged();
+        break;
+      }
+      case 'createLine': {
+        // 停留所そのものの設置費だけを取る。運行費は毎月の維持費で効く。
+        const cost = cmd.kind === TransitKind.Bus ? BUS_STOP_COST * cmd.stops.length : 0;
+        if (cost > 0 && !this.budget.spend(cost)) {
+          this.notify('info', cmd.stops[0] ?? 0, '資金が足りません');
+          break;
+        }
+        const id = this.transit.createLine(cmd.kind, cmd.stops);
+        if (id < 0) {
+          this.notify('noPath', cmd.stops[0] ?? 0, '路線を引けませんでした（停留所が 2 つ以上必要です）');
+          break;
+        }
+        // プラットフォーム・ノードはグラフの一部なので、路線が増えたら作り直す。
+        this.onNetworkChanged();
+        break;
+      }
+      case 'deleteLine':
+        if (this.transit.removeLine(cmd.line)) this.onNetworkChanged();
+        break;
+      case 'setLineHeadway':
+        // 運行間隔はエッジのコストにしか効かないので、グラフを作り直す必要はない。
+        if (this.transit.setHeadway(cmd.line, cmd.headwayMin)) {
+          this.transit.updateCosts(this.graph, this.clock.tick);
+          this.router.cache.clear();
+        }
+        break;
       default:
         break;
     }
+  }
+
+  /**
+   * 地価とサービス圏を取り直す。
+   *
+   * どちらも全タイル走査＋ぼかしなので、経済期ごとに回すと 1 tick の処理時間が
+   * 倍になる（実測 0.12ms → 0.23ms）。普段は日次のままにして、プレイヤが
+   * 建てた・壊した瞬間だけここで取り直す。駅や公園を置いた効果は即座に出る。
+   */
+  private refreshFields(): void {
+    updateServiceCoverage(this.world, this.buildings);
+    updateLandValue(this.world, this.buildings);
+    // 建てた・壊した瞬間に電気と水も取り直す。ここを日次に任せると、
+    // 発電所を建てても翌日まで街が停電したままになる。
+    this.utilities.recompute(this.world, this.buildings);
+  }
+
+  /**
+   * 渋滞をプレイヤに知らせる。
+   *
+   * 交通量オーバーレイを開いていないと渋滞に気づけないので、
+   * ひどくなったときだけ場所つきで通知する。何度も出すと邪魔なのでクールダウンを置く。
+   */
+  private checkCongestion(tick: number): void {
+    if (tick < this.congestionAlertAt) return;
+    const t = this.traffic;
+    if (t.stats.fullLinks < CONGESTION_ALERT_LINKS) return;
+    const link = t.stats.worstLink;
+    if (link < 0) return;
+    const tile = this.graph.nodeTile[this.graph.edgeTo[link]!]!;
+    this.congestionAlertAt = tick + CONGESTION_ALERT_COOLDOWN_TICKS;
+    this.notify('congestion', tile, `${tileX(tile)},${tileY(tile)} 付近が渋滞しています`);
   }
 
   /** 操作が通らなかった理由をプレイヤに伝える。 */
@@ -289,7 +416,8 @@ export class Simulation {
         if (!this.world.canBuildStructure(idx(x, y))) return false;
       }
     }
-    return true;
+    // 浄水場のように立地条件がある建物を弾く。
+    return canBuildUtility(this.world, archId, tile);
   }
 
   /** タイル上の建物を撤去する（駅なら駅リストからも消す）。 */
@@ -337,10 +465,28 @@ export class Simulation {
 
   private rebuildNetwork(): void {
     this.refreshStations();
-    this.graph.build(this.world, this.stationTiles);
+    // グラフを作り直したら必ずバージョンを進める。
+    //
+    // networkVersion を増やすのは World.setRoad / setRail だけで、駅は「建物」なので
+    // 設置・撤去してもバージョンが動かなかった。その結果、駅を壊しても
+    //   - 描画側の線路キャッシュ（agentLayer.drawTrains）
+    //   - 経路キャッシュに残った、消えた駅を通る経路
+    //   - 走行中の再ルート判定
+    // が全部そのまま生き残り、駅の無い線路を電車が延々と往復していた。
+    this.world.networkVersion++;
+    // グラフの構築は路線システム経由で行う。プラットフォーム・ノードは
+    // 路線を知っていないと張れないし、線路から作る自動路線もここで同期される。
+    this.transit.rebuild(this.graph, this.world, this.stationTiles);
+    this.transit.updateCosts(this.graph, this.clock.tick);
+    // 走行中の車両は経路（節点 index の列）ごと無効になるので全部降ろす。
+    this.traffic.rebuild(this.graph);
+    this.drainTrafficEvents();
     this.taz.refreshRepresentatives(this.world, this.graph);
     // 建物の接道点を取り直す（ハンドルではなくスロットで保持しているので安全）
     for (const s of this.buildings.each()) this.buildings.refreshAccess(this.world, s);
+    // 電気・水道は道路の連結成分を伝わるので、接道を取り直した**あと**でないと
+    // 前の道路網での連結成分を見てしまう。
+    this.utilities.recompute(this.world, this.buildings);
   }
 
   // ---------------- tick ----------------
@@ -352,18 +498,7 @@ export class Simulation {
     const tick = this.clock.tick;
 
     // --- 市民の行動 ---
-    this.activity.tick({
-      world: this.world,
-      buildings: this.buildings,
-      citizens: this.citizens,
-      graph: this.graph,
-      router: this.router,
-      taz: this.taz,
-      wheel: this.wheel,
-      clock: this.clock,
-      rng: this.rng,
-      destinations: this.destinations,
-    });
+    this.activity.tick(this.activityContext());
 
     // --- 建物の成長 ---
     // 地元の木材に、資金で買える輸入分を上乗せしたものが建設可能量になる。
@@ -378,18 +513,31 @@ export class Simulation {
       this.production.unmetByGood,
       this.production.stock,
       this.production.produced,
+      this.utilities,
     );
     if (grow.lumberUsed > 0) this.spendLumber(grow.lumberUsed);
 
     // --- 物流 ---
     this.freight.update(this.buildings, tick);
     if (tick % FREIGHT_DISPATCH_INTERVAL === 0) {
-      this.freight.dispatch(this.buildings, this.graph, this.router, this.taz, this.rng, tick);
+      this.freight.dispatch(this.buildings, this.graph, this.router, this.taz, this.traffic, this.rng, tick);
     }
 
-    // --- 渋滞（10 分ごと。EMA 平滑化が発振を抑える） ---
-    if (tick % 10 === 0) {
-      this.graph.updateCongestion(COST_SMOOTHING_LAMBDA * 10, VOLUME_DECAY * 10);
+    // --- 公共交通の運行 ---
+    // バスは道路を走る車両として交通流に載るので、車と物流を出すのと同じ tick で出す。
+    this.transit.dispatchBuses(this.traffic, tick);
+
+    // --- 交通流（車両の追従・信号・spillback） ---
+    this.traffic.tick(this.graph, tick);
+    this.drainTrafficEvents();
+
+    // --- 実測のリンク所要時間を経路コストへ（EMA 平滑化が発振を抑える） ---
+    if (tick % LINK_TIME_RELAX_TICKS === 0) {
+      this.graph.relaxLinkTimes(tick, COST_SMOOTHING_LAMBDA * LINK_TIME_RELAX_TICKS);
+      this.checkCongestion(tick);
+      // バスの区間所要は道路の実測値から作るので、同じ周期で取り直す。
+      // ここが遅れると「渋滞しているのにバスだけ定時」という嘘になる。
+      this.transit.updateCosts(this.graph, tick);
     }
 
     // --- TAZ コスト行列のローリング更新 ---
@@ -397,24 +545,128 @@ export class Simulation {
 
     // --- 毎時 ---
     if (tick % TICKS_PER_HOUR === 0) {
-      runProduction(this.buildings, this.clock, this.production);
+      runProduction(this.buildings, this.clock, this.production, this.utilities);
       this.lumberPool = this.production.stock[Good.Lumber]!;
     }
+
+    // --- 経済期（2 シミュレーション時間） ---
+    if (tick > 0 && tick % ECONOMY_PERIOD_TICKS === 0) this.economyPass();
 
     // --- 毎日 ---
     if (tick > 0 && tick % TICKS_PER_DAY === 0) this.daily();
 
     // --- 毎月 ---
-    if (tick > 0 && tick % (TICKS_PER_DAY * 30) === 0) {
-      this.lastReport = this.budget.closeMonth(this.world, this.buildings, this.citizens, this.clock.month);
+    const monthTicks = TICKS_PER_DAY * DAYS_PER_MONTH;
+    if (tick > 0 && tick % monthTicks === 0) {
+      // 締めるのは「いま終わった月」。`clock.tick++` は tick() の最後なので、
+      // この時点の `clock.month` は既に翌月を指しており、そのまま渡すと
+      // 決算のラベルが 1 か月ずれる（1 月の決算が「2 月」として積まれていた）。
+      const endedMonth = ((tick / monthTicks - 1) % MONTHS_PER_YEAR) + 1;
+      this.lastReport = this.budget.closeMonth(this.world, this.buildings, this.citizens, endedMonth, this.transit.monthlyUpkeep());
     }
 
     this.clock.tick++;
   }
 
+  /**
+   * 経済期の処理。プレイヤの操作が街に返ってくる速さを決めているのはここ。
+   *
+   * 地価・サービス圏・労働市場・転入は元は日次だった。1 日が 32 実分になった今、
+   * 日次のままだと「駅を建てても 30 分何も起きない」「商店を建てても就業者が
+   * 0 のまま」になる。1 日の長さは変えずに、経済の時間だけデフォルメする。
+   */
+  private economyPass(): void {
+    const lctx = this.lifecycleContext();
+    this.lifecycle.updateLabourMarket(lctx);
+    this.cachedPopulation = this.citizens.count();
+    this.immigration(lctx, this.cachedPopulation);
+    // 転入した人を数に入れてから統計を確定させる。
+    // 先に数えて後から入れると、着いたばかりの失業者が 1 期ぶん表に出ず、
+    // 失業率が実際より低く見える（人口 1343 で失業 113 人を 4 人と表示していた）。
+    this.lifecycle.refreshCounts(lctx);
+    // 建物が増減していれば需要も変わる。経済期ごとに取り直す。
+    this.utilities.recompute(this.world, this.buildings);
+    this.finance = this.budget.accrue(this.world, this.buildings, this.citizens, this.transit.monthlyUpkeep());
+  }
+
+  /**
+   * 交通流から上がってきた到着・打ち切りを、市民と物流に配る。
+   *
+   * 車の到着時刻は予測しない。着いたときが到着時刻になるので、
+   * 通知はここを通って初めて街に反映される。
+   */
+  private drainTrafficEvents(): void {
+    const ev = this.traffic.events;
+    if (ev.length === 0) return;
+    const actx = this.activityContext();
+    for (const e of ev) {
+      if (e.kind === VehicleKind.Car) this.activity.onCarEvent(actx, e.owner, e.aborted);
+      else if (e.kind === VehicleKind.Bus) this.transit.onVehicleEvent(e.owner, e.aborted);
+      else this.freight.onTruckEvent(this.buildings, this.graph, this.traffic, e.owner, e.aborted, this.clock.tick);
+    }
+    ev.length = 0;
+  }
+
+  /** 市民システムに渡す文脈。テストからも使う。 */
+  activityContext(): Parameters<ActivitySystem['tick']>[0] {
+    return {
+      world: this.world,
+      buildings: this.buildings,
+      citizens: this.citizens,
+      graph: this.graph,
+      router: this.router,
+      taz: this.taz,
+      wheel: this.wheel,
+      clock: this.clock,
+      rng: this.rng,
+      destinations: this.destinations,
+      traffic: this.traffic,
+      transit: this.transit,
+    };
+  }
+
+  private lifecycleContext(): Parameters<LifecycleSystem['daily']>[0] {
+    return {
+      world: this.world,
+      buildings: this.buildings,
+      citizens: this.citizens,
+      taz: this.taz,
+      clock: this.clock,
+      rng: this.rng,
+      wheel: this.wheel,
+      activity: this.activity,
+      utilities: this.utilities,
+    };
+  }
+
+  /**
+   * 停電・断水を場所つきで知らせる。
+   *
+   * 数字だけ出しても「どこが」が分からないので、供給の足りていない
+   * 連結成分の代表タイルを添える（プレイヤはクリックでそこへ飛べる）。
+   */
+  private checkOutages(): void {
+    if (this.clock.tick - this.outageAlertAt < CONGESTION_ALERT_COOLDOWN_TICKS) return;
+    for (const info of this.utilities.componentInfos()) {
+      const noPower = info.powerDemandKw > info.powerSupplyKw;
+      const noWater = info.waterDemand > info.waterSupply;
+      if (!noPower && !noWater) continue;
+      // 供給が 1 も無い地区は建物 1 棟でも知らせる（開拓直後にここで詰まるため）。
+      const nothing = info.powerSupplyKw === 0 || info.waterSupply === 0;
+      if (!nothing && info.buildings < 3) continue;
+      this.outageAlertAt = this.clock.tick;
+      const what = noPower && noWater ? '電気と水' : noPower ? '電気' : '水';
+      this.notify('outage', info.sampleTile, `${what}が足りていません（${info.buildings} 棟）`);
+      return;
+    }
+  }
+
   private daily(): void {
+    // 電気・水道の連続停止日数を進める。場の更新より先に呼ぶ —
+    // 未処理下水の公害は、この判定の結果を使って公害の場に積むため。
+    this.utilities.dailyReview(this.buildings);
     // 場の更新（重いのでまとめて 1 日 1 回）
-    updatePollution(this.world, this.buildings);
+    updatePollution(this.world, this.buildings, this.utilities);
     updateLandValue(this.world, this.buildings);
     updateServiceCoverage(this.world, this.buildings);
 
@@ -469,19 +721,10 @@ export class Simulation {
     }
 
     // 建物のレベルアップ・廃墟化
-    this.growth.dailyReview(this.world, this.buildings);
+    this.growth.dailyReview(this.world, this.buildings, this.utilities);
 
     // ライフサイクル
-    const lctx = {
-      world: this.world,
-      buildings: this.buildings,
-      citizens: this.citizens,
-      taz: this.taz,
-      clock: this.clock,
-      rng: this.rng,
-      wheel: this.wheel,
-      activity: this.activity,
-    };
+    const lctx = this.lifecycleContext();
     this.lifecycle.daily(lctx);
 
     // 需要の再計算
@@ -509,11 +752,13 @@ export class Simulation {
       taxPct: this.budget.taxPct,
     });
 
-    this.immigration(lctx, pop);
+    // 転入は経済期ごとに回す（economyPass）
 
     // 日次統計を確定させてリセット
     this.dailyStats = { ...stats, modeCounts: [...stats.modeCounts] as [number, number, number, number] };
     this.activity.resetDailyStats();
+    this.transit.resetDailyStats();
+    this.checkOutages();
     this.freight.resetPeriodStats();
     this.router.cache.resetStats();
     this.destinations.rebuild(this.buildings);
@@ -559,7 +804,10 @@ export class Simulation {
 
     // 小さいうちは流入を厚くする。人口比だけで決めると、街を作り始めた直後は
     // 1 日数人しか来ず、家だけが並んで誰も住んでいない状態が延々と続く。
-    const base = pop < 400 ? 70 : Math.max(12, pop * 0.03);
+    //
+    // 1 日分の枠を経済期の数で割って少しずつ入れる。日の境界でまとめて入れると、
+    // 人口が 32 実分に 1 回だけ跳ねる階段になり「家を建てても誰も来ない」に見える。
+    const base = (pop < 400 ? 70 : Math.max(12, pop * 0.03)) / ECONOMY_PERIODS_PER_DAY;
     const wanted = Math.ceil(appeal * Math.min(base, vacant));
     if (wanted > 0) this.lifecycle.immigrate(lctx, Math.min(120, wanted));
   }
@@ -607,23 +855,185 @@ export class Simulation {
   bootstrap(): void {
     updateServiceCoverage(this.world, this.buildings);
     updateLandValue(this.world, this.buildings);
+    // TAZ 行列を先に全部埋める。ローリング更新は 1 周 200 tick かかるので、
+    // これが無いと最初の数分は行列が Infinity のままで、求職も行き先選びも
+    // 概算にすら乗らない（シナリオ側は buildScenario で既にこれをやっている）。
+    this.taz.computeAll(this.graph);
     // 初期需要。ここが 0 だと最初の 1 軒が永久に建たない。
     this.demand = { residential: 70, commercial: 25, industrial: 40, agriculture: 55 };
   }
 
-  /** テスト・ヘッドレス用: 指定した数の市民を空き住戸に流し込む。 */
-  seedPopulation(count: number): number {
-    const lctx = {
-      world: this.world,
-      buildings: this.buildings,
-      citizens: this.citizens,
-      taz: this.taz,
-      clock: this.clock,
-      rng: this.rng,
-      wheel: this.wheel,
-      activity: this.activity,
+  // ---------------- セーブ / ロード ----------------
+
+  /**
+   * 保存すべき状態を取り出す。バイト列への変換は `sim/persistence.ts` の仕事。
+   *
+   * 地形はシードから再生成するので保存しない。交通グラフ・TAZ 行列・経路キャッシュ・
+   * タイミングホイールも、ここにある状態から作り直せるので保存しない。
+   */
+  snapshot(): SimSnapshot {
+    const c = this.citizens;
+    const b = this.buildings;
+    return {
+      seed: this.seed,
+      head: {
+        tick: this.clock.tick,
+        startYear: this.clock.startYear,
+        citizenHigh: c.high,
+        buildingHigh: b.high,
+        householdIdCounter: this.lifecycle.householdIdCounter(),
+        rng: this.rng.getState(),
+        cash: this.budget.cash,
+        taxPct: { ...this.budget.taxPct },
+        capexMonth: this.budget.capexMonth,
+        deficitMonths: this.budget.deficitMonths,
+        budgetHistory: this.budget.history,
+        demand: this.demand,
+        lastReport: this.lastReport,
+        lumberPool: this.lumberPool,
+        importedLumber: this.importedLumber,
+        stockoutCount: this.stockoutCount,
+        foodShortfall: this.foodShortfall,
+        cachedPopulation: this.cachedPopulation,
+        totalDispatched: this.freight.totalDispatched,
+        totalDelivered: this.freight.totalDelivered,
+        dailyStats: { ...this.dailyStats, modeCounts: [...this.dailyStats.modeCounts] },
+        // 各システムの走査カーソル。「1 日 1/7 ずつ」「一巡させる」式の処理は
+        // どこまで進んだかで次の 1 tick の中身が変わるので、これを保存しないと
+        // 「保存して読み込んだ街」と「そのまま進めた街」が別の街になる。
+        transit: this.transit.toJSON(),
+        cursors: {
+          growth: this.growth.scanCursor,
+          freight: this.freight.scanCursor,
+          taz: this.taz.scanCursor,
+          lifecycle: this.lifecycle.cursors,
+        },
+      },
+      arrays: [
+        { name: 'world.zone', data: this.world.zone },
+        { name: 'world.road', data: this.world.road },
+        { name: 'world.oneWay', data: this.world.oneWay },
+        { name: 'world.rail', data: this.world.rail },
+        { name: 'world.buildingRef', data: this.world.buildingRef },
+        { name: 'world.landValue', data: this.world.landValue },
+        { name: 'world.pollution', data: this.world.pollution },
+        { name: 'world.noise', data: this.world.noise },
+        { name: 'world.svcMask', data: this.world.svcMask },
+        { name: 'world.transitAccess', data: this.world.transitAccess },
+        ...BUILDING_FIELDS.map((f) => ({ name: `b.${f}`, data: b[f].subarray(0, b.high) })),
+        ...CITIZEN_FIELDS.map((f) => ({ name: `c.${f}`, data: c[f].subarray(0, c.high) })),
+        // 電気・水道は連続停止日数だけ保存する（連結成分と需給は道路と建物から作り直せる）。
+        ...this.utilities.saveArrays(b.high),
+      ],
     };
-    return this.lifecycle.immigrate(lctx, count);
+  }
+
+  /**
+   * セーブデータを流し込む。**シードが同じシミュレーションに対してのみ**呼ぶこと
+   * （地形はシードから再生成されるので、違うシードだと海の上に街が乗る）。
+   */
+  restoreSnapshot(snap: SimSnapshot): void {
+    if (snap.seed !== this.seed) throw new Error('シードが違うシミュレーションには読み込めません');
+    const head = snap.head as Record<string, number & Record<string, number>>;
+    const src = arrayMap(snap.arrays);
+    const c = this.citizens;
+    const b = this.buildings;
+    const citizenHigh = Number(head.citizenHigh ?? 0);
+    const buildingHigh = Number(head.buildingHigh ?? 0);
+    c.ensureCapacity(citizenHigh);
+    b.ensureCapacity(buildingHigh);
+
+    const copy = (name: string, dst: { set(a: never, o: number): void }): void => {
+      const v = src.get(name);
+      if (v) dst.set(v as never, 0);
+    };
+    for (const name of [
+      'zone',
+      'road',
+      'oneWay',
+      'rail',
+      'buildingRef',
+      'landValue',
+      'pollution',
+      'noise',
+      'svcMask',
+      'transitAccess',
+    ] as const) {
+      copy(`world.${name}`, this.world[name]);
+    }
+    for (const f of BUILDING_FIELDS) copy(`b.${f}`, b[f]);
+    for (const f of CITIZEN_FIELDS) copy(`c.${f}`, c[f]);
+    b.rebuildFreeList(buildingHigh);
+    c.rebuildFreeList(citizenHigh);
+    for (let i = 0; i < c.capacity; i++) c.tripPath[i] = null;
+
+    this.clock.tick = Number(head.tick ?? 0);
+    this.lifecycle.setHouseholdIdCounter(Number(head.householdIdCounter ?? 1));
+    this.rng.setState((head.rng as unknown as number[]) ?? [1, 2, 3, 4]);
+    this.budget.cash = Number(head.cash ?? 0);
+    for (const [k, v] of Object.entries(head.taxPct ?? {})) this.budget.taxPct[Number(k)] = Number(v);
+    this.budget.capexMonth = Number(head.capexMonth ?? 0);
+    this.budget.deficitMonths = Number(head.deficitMonths ?? 0);
+    this.budget.history = (head.budgetHistory as unknown as MonthlyReport[]) ?? [];
+    this.demand = (head.demand as unknown as DemandState) ?? this.demand;
+    this.lastReport = (head.lastReport as unknown as MonthlyReport | null) ?? null;
+    this.lumberPool = Number(head.lumberPool ?? 0);
+    this.importedLumber = Number(head.importedLumber ?? 0);
+    this.stockoutCount = Number(head.stockoutCount ?? 0);
+    this.foodShortfall = Number(head.foodShortfall ?? 0);
+    this.cachedPopulation = Number(head.cachedPopulation ?? 0);
+    this.freight.totalDispatched = Number(head.totalDispatched ?? 0);
+    this.freight.totalDelivered = Number(head.totalDelivered ?? 0);
+    if (head.dailyStats) this.dailyStats = { ...(head.dailyStats as unknown as typeof this.dailyStats) };
+
+    // --- 保存していないものを作り直す ---
+    this.pendingCommands.length = 0;
+    this.freight.reset();
+    this.traffic.reset();
+    // 路線はネットワークを作り直す前に入れる。プラットフォーム・ノードは
+    // 路線を知らないと張れないので、順番を逆にすると路線が消えた街になる。
+    this.transit.loadJSON(head.transit);
+    this.utilities.restoreArrays(src, buildingHigh);
+    this.rebuildNetwork();
+    updateTransitAccess(this.world, this.stationTiles);
+    this.taz.computeAll(this.graph);
+    this.router.cache.clear();
+    this.growth.markDirty();
+    this.destinations.markDirty();
+    this.destinations.rebuild(this.buildings);
+    this.activity.rehydrate(this.activityContext());
+    this.lifecycle.refreshCounts(this.lifecycleContext());
+    // 当日ぶんの移動集計。読み込み先が使い回しの Simulation だと、
+    // ここを消さないと前の街のトリップ数が翌日の日次集計まで持ち越される。
+    this.activity.resetDailyStats();
+    this.finance = this.budget.accrue(this.world, this.buildings, this.citizens, this.transit.monthlyUpkeep());
+
+    // 走査カーソルは freight.reset() などで 0 に戻るので、作り直しの**後**に入れる。
+    const cursors = (head.cursors ?? {}) as {
+      growth?: number;
+      freight?: number;
+      taz?: number;
+      lifecycle?: [number, number];
+    };
+    this.growth.scanCursor = Number(cursors.growth ?? 0);
+    this.freight.scanCursor = Number(cursors.freight ?? 0);
+    this.taz.scanCursor = Number(cursors.taz ?? 0);
+    this.lifecycle.cursors = cursors.lifecycle ?? [0, 0];
+  }
+
+  /**
+   * テスト・ヘッドレス用: 指定した数の市民を空き住戸に流し込む。
+   *
+   * 通常の転入と違って経済期の外から入れるので、最後に統計を数え直す。
+   * これをしないと、シナリオ生成の直後は「着いたばかりの失業者」が
+   * 次の経済期まで表に出ず、失業率が実際よりずっと低く表示される。
+   */
+  seedPopulation(count: number): number {
+    const lctx = this.lifecycleContext();
+    const placed = this.lifecycle.immigrate(lctx, count);
+    this.cachedPopulation = this.citizens.count();
+    this.lifecycle.refreshCounts(lctx);
+    return placed;
   }
 
   /** 世帯を 1 つ手動で作る（テスト用）。 */
@@ -638,22 +1048,8 @@ export class Simulation {
       wheel: this.wheel,
       activity: this.activity,
     };
-    const id = createCitizen(lctx, age, homeHandle, newHouseholdId());
-    this.activity.initCitizen(
-      {
-        world: this.world,
-        buildings: this.buildings,
-        citizens: this.citizens,
-        graph: this.graph,
-        router: this.router,
-        taz: this.taz,
-        wheel: this.wheel,
-        clock: this.clock,
-        rng: this.rng,
-        destinations: this.destinations,
-      },
-      id,
-    );
+    const id = createCitizen(lctx, age, homeHandle, this.lifecycle.newHouseholdId());
+    this.activity.initCitizen(this.activityContext(), id);
     return id;
   }
 
@@ -687,11 +1083,30 @@ export class Simulation {
       tripsFailed: s.tripsFailed,
       shoppingFailed: s.shoppingFailed,
       cash: this.budget.cash,
+      finance: this.finance,
+      capexThisMonth: this.budget.capexMonth,
+      deficitMonths: this.budget.deficitMonths,
       lastReport: this.lastReport,
       cacheHitRate: this.router.cache.hitRate,
       routeQueueDepth: this.activity.waitingCount,
       searchesThisTick: this.router.searchesThisTick,
       trucksActive: this.freight.stats.active,
+      traffic: {
+        running: this.traffic.stats.running,
+        waiting: this.traffic.stats.waiting,
+        fullLinks: this.traffic.stats.fullLinks,
+        congestedShare: this.traffic.roadLinks > 0 ? this.traffic.stats.fullLinks / this.traffic.roadLinks : 0,
+        avgDelay: this.traffic.stats.avgDelay,
+        worstDelay: this.traffic.stats.worstDelay,
+      },
+      transit: {
+        lines: this.transit.stats.lines,
+        vehicles: this.transit.stats.vehicles,
+        busesRunning: this.transit.stats.busesRunning,
+        // 日が変わった直後は当日ぶんが 0 なので、その場合だけ前日の値を出す。
+        boardingsToday: this.transit.stats.boardingsToday || this.transit.stats.boardingsYesterday,
+      },
+      utilities: this.utilities.cityTotals(),
       stockouts: this.stockoutCount,
       goodsStock: this.production.stock,
       goodsProduced: this.production.produced,

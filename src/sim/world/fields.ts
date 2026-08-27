@@ -4,6 +4,7 @@ import { archetype } from '@sim/buildings/archetypes';
 import type { BuildingStore } from '@sim/buildings/buildings';
 import { idx, inBounds, tileX, tileY } from './tiles';
 import type { World } from './world';
+import type { UtilitySystem } from './utilities';
 
 /**
  * 地価・公害・騒音・サービス到達といったスカラー場の更新。
@@ -15,8 +16,21 @@ import type { World } from './world';
 
 const scratchA = new Float32Array(TILE_COUNT);
 const scratchB = new Float32Array(TILE_COUNT);
+/**
+ * ブラーの横パス専用の中間バッファ。
+ *
+ * 以前は横パスの出力先が `scratchB` だった。呼び出し側は 3 か所とも
+ * `boxBlur(scratchA, scratchB, r)` と書いていて出力先も `scratchB` なので、
+ * **縦パスが自分の出力を入力として読み直していた**。
+ * スライディングウィンドウから抜ける行 `y - r` は既に上書き済みなので、
+ * ぼけが +Y 方向へ尾を引き、総和も保存されない
+ * （8×8・半径 2・中央に 100 で検証: 正 `4,4,4,4,4,0,0` に対し
+ * 誤 `4,4,4,3.2,2.4,1.6,0.96`、総和 100.8）。
+ * 地価・公害・騒音のすべてが南に歪んでいた。
+ */
+const blurTmp = new Float32Array(TILE_COUNT);
 
-/** 分離可能ボックスブラー。半径 r、2 パス。 */
+/** 分離可能ボックスブラー。半径 r、2 パス。`dst` は `src` と同じでも構わない。 */
 function boxBlur(src: Float32Array, dst: Float32Array, r: number): void {
   const inv = 1 / (2 * r + 1);
   // 横
@@ -25,7 +39,7 @@ function boxBlur(src: Float32Array, dst: Float32Array, r: number): void {
     let sum = 0;
     for (let x = -r; x <= r; x++) sum += src[row + Math.min(MAP_W - 1, Math.max(0, x))]!;
     for (let x = 0; x < MAP_W; x++) {
-      scratchB[row + x] = sum * inv;
+      blurTmp[row + x] = sum * inv;
       const out = row + Math.min(MAP_W - 1, Math.max(0, x - r));
       const inn = row + Math.min(MAP_W - 1, Math.max(0, x + r + 1));
       sum += src[inn]! - src[out]!;
@@ -34,23 +48,32 @@ function boxBlur(src: Float32Array, dst: Float32Array, r: number): void {
   // 縦
   for (let x = 0; x < MAP_W; x++) {
     let sum = 0;
-    for (let y = -r; y <= r; y++) sum += scratchB[Math.min(MAP_H - 1, Math.max(0, y)) * MAP_W + x]!;
+    for (let y = -r; y <= r; y++) sum += blurTmp[Math.min(MAP_H - 1, Math.max(0, y)) * MAP_W + x]!;
     for (let y = 0; y < MAP_H; y++) {
       dst[y * MAP_W + x] = sum * inv;
       const out = Math.min(MAP_H - 1, Math.max(0, y - r)) * MAP_W + x;
       const inn = Math.min(MAP_H - 1, Math.max(0, y + r + 1)) * MAP_W + x;
-      sum += scratchB[inn]! - scratchB[out]!;
+      sum += blurTmp[inn]! - blurTmp[out]!;
     }
   }
 }
 
-/** 公害と騒音を建物から拡散させる。 */
-export function updatePollution(world: World, buildings: BuildingStore): void {
+/**
+ * 公害と騒音を建物から拡散させる。
+ *
+ * 下水処理が足りていない地区は、その分だけ建物 1 棟ずつが公害源になる
+ * （`utilities.sewagePollutionOf` の単位は `pollution × level` と揃えてある）。
+ * 住宅は `pollution === 0` なので、**未処理下水を足すのは早期 continue より前**。
+ * 順番を逆にすると、住宅地の下水があふれても公害が 1 も出ない。
+ */
+export function updatePollution(world: World, buildings: BuildingStore, utilities?: UtilitySystem): void {
   scratchA.fill(0);
   for (const s of buildings.each()) {
     const a = archetype(buildings.archetypeId[s]!);
-    if (a.pollution === 0) continue;
-    scratchA[buildings.originTile[s]!] = (scratchA[buildings.originTile[s]!] ?? 0) + a.pollution * buildings.level[s]!;
+    const sewage = utilities ? utilities.sewagePollutionOf(s) : 0;
+    const own = a.pollution * buildings.level[s]!;
+    if (own === 0 && sewage === 0) continue;
+    scratchA[buildings.originTile[s]!] = (scratchA[buildings.originTile[s]!] ?? 0) + own + sewage;
   }
   boxBlur(scratchA, scratchB, 6);
   for (let i = 0; i < TILE_COUNT; i++) {
@@ -106,7 +129,8 @@ export function updateTransitAccess(world: World, stationTiles: readonly number[
     world.epochs.overlay++;
     return;
   }
-  // 徒歩速度 4.8km/h → 1 タイル (8m) = 0.1 分。整数分で持つため 10 タイル = 1 分に丸める。
+  // 徒歩速度 4.8km/h、1 タイル = TILE_SPAN_M(150m) なので 1 タイル ≒ 1.9 分。
+  // BFS はタイル数で数え、最後に分へ換算する。
   const queue = new Int32Array(TILE_COUNT);
   let qh = 0;
   let qt = 0;
@@ -115,6 +139,18 @@ export function updateTransitAccess(world: World, stationTiles: readonly number[
     dist[st] = 0;
     queue[qt++] = st;
   }
+  // 探索を打ち切る距離（タイル）。
+  //
+  // `* 10` は 1 タイル = 8m・10 タイル = 1 分だった頃の名残で、実距離スケール
+  // （1 タイル 150m）にした今は駅の徒歩圏が半径 12km になっている。
+  // `STATION_WALK_RADIUS` 単体（8 タイル = 1.2km ≒ 徒歩 15 分）が本来の意図で、
+  // そう直すと transitAccess が本当に駅の近くだけになり、
+  // 鉄道の可用性ゲート（activity.ts）が初めて効くようになる。
+  //
+  // ただし今そう直すと、駅から 1.2km より遠い住民は公共交通を一切選べなくなる。
+  // バス路線が入って駅までのフィーダーができるまでは、この広い圏が
+  // 「自転車や送迎で駅へ出る」ぶんを肩代わりしている。路線を実装するときに
+  // 徒歩圏とフィーダーを分けて数え直す。
   const maxTiles = STATION_WALK_RADIUS * 10;
   while (qh < qt) {
     const i = queue[qh++]!;
