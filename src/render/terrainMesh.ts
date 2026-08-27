@@ -1,4 +1,5 @@
-import { BufferAttribute, BufferGeometry, Mesh, MeshLambertMaterial, Object3D } from 'three';
+import { BufferAttribute, BufferGeometry, Mesh, Object3D } from 'three';
+import { surface } from './materials';
 import { CHUNK, CHUNKS_X, CHUNK_COUNT, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
 import { Overlay, RoadClass, Terrain, Zone } from '@shared/enums';
 import type { Simulation } from '@sim/simulation';
@@ -16,7 +17,8 @@ export class TerrainMesh {
   readonly group = new Object3D();
   private readonly meshes: Mesh[] = [];
   private readonly seenEpoch = new Uint32Array(CHUNK_COUNT);
-  private readonly material = new MeshLambertMaterial({ vertexColors: true });
+  // 地面は粗い拡散面。わずかに反射を残すと、朝夕の低い日射で路面が光る。
+  private readonly material = surface({ vertexColors: true, roughness: 0.94, metalness: 0.02 });
   /** 現在表示中のオーバーレイ。変わったら全チャンクを作り直す。 */
   private overlay: Overlay = Overlay.None;
   private lastSeason = -1;
@@ -41,7 +43,7 @@ export class TerrainMesh {
       }
       geom.setIndex(new BufferAttribute(index, 1));
       const mesh = new Mesh(geom, this.material);
-      mesh.receiveShadow = false;
+      mesh.receiveShadow = true;
       mesh.frustumCulled = true;
       this.meshes.push(mesh);
       this.group.add(mesh);
