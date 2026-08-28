@@ -29,7 +29,7 @@ import {
   TRAIN_DRAW_DISTANCE_M,
   VEHICLE_DRAW_DISTANCE_M,
 } from '@shared/constants';
-import { Activity, Mode, ModeBit, RoadClass, Zone } from '@shared/enums';
+import { Activity, Good, Mode, ModeBit, RoadClass, Zone } from '@shared/enums';
 import { idx, tileX, tileY } from '@sim/world/tiles';
 import { citizenPosition } from '@sim/agents/activity';
 import { CitizenFlag } from '@sim/agents/citizens';
@@ -203,6 +203,39 @@ const PARK_CHANCE_PCT: Record<number, number> = {
  * 車どうしがめり込むことがある。描画側で最後に間隔を強制する。
  */
 const MIN_HEADWAY_RATIO = 0.25;
+/**
+ * 車間の下限 (m)。比率だけだと、全長 3.4m の軽で 85cm しか空かない。
+ * 目線の高さで車列を真後ろから見ると、1m を切った隙間は路面が一切見えず
+ * 「1 本の長い塊」に潰れてしまう。停止時の実際の車間もこのくらいある。
+ */
+const MIN_HEADWAY_M = 1.3;
+
+/**
+ * 車間を空けるために 1 台を後ろへ下げてよい最大量 (m)。
+ *
+ * 車間の強制には落とし穴がある。交通流が同じ地点に 60 台を積み上げていると
+ * （貨物の発着地でよく起きる）、後ろの車を順に押し下げる規則がそのまま連鎖して、
+ * **本来は 1 か所の団子だったものが数百 m の車列に化ける**。
+ * 「消失点まで隙間なく同じ車が一列」は、詰まりそのものではなく
+ * この連鎖が作っていた。
+ *
+ * そこで、押し下げがこの量を超える車は**描かない**。詰まりの実体は
+ * 見えているぶんの数台で十分に伝わるし、街路に置ける台数には限りがあるので、
+ * 積み上がったぶんを全部並べる意味がそもそも無い。
+ */
+const MAX_PUSHBACK_M = 12;
+
+/**
+ * 1 台ごとの寸法のばらつき。
+ *
+ * 同じ車種・同じ塗色が隣り合うこと自体は現実にもあるが、**寸法まで
+ * 1mm 違わない**のは複製にしか見えない。とくにトラックは 1 種類しか
+ * 形が無いので、目線のカットで 60 台が並ぶと定規で引いたような列になる。
+ * インスタンス行列の拡大率を数 % 振るだけなら、ジオメトリもドローコールも
+ * 増えないまま、シルエットの繰り返しが崩れる。
+ */
+const SIZE_JITTER_XZ = 0.055;
+const SIZE_JITTER_Y = 0.05;
 
 /**
  * 路肩の車の向きの揺らぎ (rad)。±1.5°。
@@ -211,6 +244,9 @@ const MIN_HEADWAY_RATIO = 0.25;
  */
 const PARK_YAW_JITTER = 0.052;
 const DRIVE_YAW_JITTER = 0.02;
+
+/** 路肩の枠のうち、はじめから空けておく割合 (%)。理由は `tryShoulder` の注記に。 */
+const EMPTY_SLOT_PCT = 27;
 
 /**
  * 接地影を描く距離 (m) と枚数の上限。
@@ -234,6 +270,17 @@ const MAX_SHADOWS = 2600;
 const CONTACT_DETAIL_M = 300;
 
 /**
+ * 接地影だけを描き続けるカメラ距離 (m)。
+ *
+ * 光の円錐は「空中に伸びる光」なので引いたら要らないが、接地影は違う。
+ * 街区を見下ろす画でも、車が路面に**接している**ことは影でしか示せない
+ *（影マップは normalBias で足元の数十 cm を必ず外す）。1 台 3px の点でも、
+ * 下に 1px の陰があるかどうかで「路面の上の車」と「浮いた点」が分かれる。
+ * メッシュは 1 本きりなので、伸ばしても増える call は 2 つだけ。
+ */
+const SHADOW_DETAIL_M = 430;
+
+/**
  * これより引いたら、自家用車を 1 車種に畳む (m)。
  *
  * 俯瞰では車は 2〜3px にしかならず、軽とワゴンの区別は物理的に付かない。
@@ -244,14 +291,30 @@ const CONTACT_DETAIL_M = 300;
 const CAR_KIND_LOD_M = 520;
 
 /**
+ * これより引いたら、電車を中間車 1 種類に畳む (m)。
+ *
+ * 先頭車・中間車・最後尾を分けているのは「顔と幌が付くと 3 両が 1 本の編成に
+ * 見える」ためだが、それが読めるのは駅の近くまで寄った画だけ。街区を見下ろす
+ * 距離では編成そのものが 1 本の棒にしかならないのに、本体 3 + 灯り 3 で
+ * 6 ドローコールを使い続けていた。中間車に畳めば 2 で済む。
+ */
+const TRAIN_FACE_LOD_M = 640;
+
+/**
  * 夜、路肩の飾りの車のうち灯りを点けている割合 (%)。
  *
  * 「夜に無灯火の車列」は物理的にありえない。とはいえ全部を点けると
- * 駐車場が滑走路になるので、3 割ほどを「停車中でエンジンをかけている車」
+ * 駐車場が滑走路になるので、一部を「停車中でエンジンをかけている車」
  * として点灯させる。これだけで列の中に光の点が散り、
  * 残りの消灯した車も「暗いだけの車」として読めるようになる。
+ *
+ * 3 割では足りなかった。夜の目線のカットに映るのはほぼ全部が停まっている車
+ *（20 時台に走っている車はシミュレーション上ほとんどいない）なので、
+ * 3 割だと 10 台に 3 台、しかも尾灯が見えるのは片側の列だけになり、
+ * 画面の中に赤が 1 つも入らないことがある。4 割強まで上げると、
+ * どちらの列にも必ず灯りが混ざる。
  */
-const PARKED_LIT_PCT = 30;
+const PARKED_LIT_PCT = 42;
 
 /** タイプごとのインスタンス群（本体と、夜の灯り）。 */
 interface Fleet {
@@ -330,6 +393,8 @@ export class AgentLayer {
   private conesOn = true;
   /** 今フレーム、車種を 1 つに畳むか（俯瞰の LOD）。 */
   private carLod = false;
+  /** 今フレーム、電車を中間車 1 種類に畳むか（俯瞰の LOD）。 */
+  private trainLod = false;
   /** 車種ごとの光の板・円錐・尾灯の照り返しの置き方（車体の座標系での相対行列）。 */
   private readonly carBeamLocal: Matrix4[] = [];
   private readonly carConeLocal: Matrix4[] = [];
@@ -423,11 +488,17 @@ export class AgentLayer {
   private vehX = new Float32Array(0);
   private vehZ = new Float32Array(0);
   private vehHeading = new Float32Array(0);
+  /** 車間を空けきれず、今フレームは描かないことにした車の印（0 = 描かない）。 */
+  private vehDrawn = new Int32Array(0);
   private readonly vehOrder: number[] = [];
 
   /** 今フレームで書き込んだ人の数（putPerson が進める）。 */
   private animCount = 0;
   private simpleCount = 0;
+
+  /** 直近に置いた車体の寸法のばらつき（接地影の大きさに反映する）。 */
+  private jitterW = 1;
+  private jitterL = 1;
 
   /** 直近フレームで描いた数（デバッグ表示用）。 */
   visiblePedestrians = 0;
@@ -461,13 +532,22 @@ export class AgentLayer {
     // インスタンスは 1 台 1 つなので、1 車種 1 ドローコールのままでいられる。
     // 長辺は必ず +Z 側（heading をそのまま Y 回転に使うため）。
     //
-    // 塗装は「粗さ低め・金属度中くらい」に置く。1 つの材質で窓もタイヤも
-    // 兼ねるので極端な値にはできないが、環境マップ（空）の映り込みが乗るだけで、
-    // 同じ形でもプラスチックの塊から塗装された金属に見え方が変わる。
+    // 塗装は「粗さ低め・**金属度は低め**」に置く。
+    //
+    // 以前は金属度 0.34・環境マップ 1.35 だったが、それだと**上を向いた面が
+    // 空をそのまま映して真っ白に飛ぶ**。屋根とボンネットが白く抜けるので、
+    // 紺の車も赤の車も上半分は同じ白になり、目線のカットで並ぶと
+    // 「白い屋根の箱」の列にしか見えなかった（塗色を 13 色に増やしても、
+    // 見えているのは腰から下だけということになる）。
+    // 車の塗装はクリア層を持つ**誘電体**で、金属ではない。金属度を下げると
+    // 映り込みは色に染まらない白いハイライトとして残り、面の色は塗色のまま出る。
+    // ただし下げすぎると拡散反射が増えて、今度は**夜の車が浮くほど明るく**なる
+    //（夜の主光源は半球ライトの拡散なので）。0.26 は、屋根が白く飛ばず、
+    // かつ夜に明るくなりすぎない折り合いの点。
     for (let k = 0; k < CAR_KIND_COUNT; k++) {
       const kind = k as CarKind;
       this.cars.push({
-        body: this.makeMesh(carGeometry(kind), MAX_VISIBLE_VEHICLES, 0.34, 0.34, 1.35, true),
+        body: this.makeMesh(carGeometry(kind), MAX_VISIBLE_VEHICLES, 0.3, 0.26, 0.9, true),
         lamps: this.makeLamps(carLampGeometry(kind), MAX_VISIBLE_VEHICLES),
         count: 0,
         lit: 0,
@@ -477,13 +557,13 @@ export class AgentLayer {
       this.carPoolLocal.push(poolLocal(carConeSpec(kind)));
     }
     this.trucks = {
-      body: this.makeMesh(truckGeometry(), MAX_VISIBLE_TRUCKS, 0.42, 0.24, 1.25, true),
+      body: this.makeMesh(truckGeometry(), MAX_VISIBLE_TRUCKS, 0.42, 0.2, 0.85, true),
       lamps: this.makeLamps(truckLampGeometry(), MAX_VISIBLE_TRUCKS),
       count: 0,
       lit: 0,
     };
     this.buses = {
-      body: this.makeMesh(busGeometry(), MAX_VISIBLE_BUSES, 0.36, 0.3, 1.3, true),
+      body: this.makeMesh(busGeometry(), MAX_VISIBLE_BUSES, 0.36, 0.24, 0.9, true),
       lamps: this.makeLamps(busLampGeometry(), MAX_VISIBLE_BUSES),
       count: 0,
       lit: 0,
@@ -491,7 +571,7 @@ export class AgentLayer {
     // 先頭車 → 中間車 → 最後尾。最後尾は先頭車の顔を後ろ向きに付けたもの。
     for (const face of [1, 0, -1] as const) {
       this.trains.push({
-        body: this.makeMesh(trainGeometry(face), MAX_VISIBLE_TRAIN_CARS, 0.34, 0.3, 1.3, true),
+        body: this.makeMesh(trainGeometry(face), MAX_VISIBLE_TRAIN_CARS, 0.34, 0.26, 1.0, true),
         lamps: this.makeLamps(trainLampGeometry(face), MAX_VISIBLE_TRAIN_CARS),
         count: 0,
         lit: 0,
@@ -615,7 +695,13 @@ export class AgentLayer {
     // 灯りの明るさそのものを大気に合わせて上げ下げする。
     // 真偽値で切り替えると、日没の 1 分間に街じゅうの灯りが一斉に点いて不自然になる。
     const on = Math.max(0, Math.min(1, (this.nightAmount - LAMP_ON) / (1 - LAMP_ON)));
-    for (const m of this.lampMaterials) m.color.setScalar(0.25 + on * 0.75);
+    // **1 を超えさせる**のが肝。ブルームのしきい値は夜でも 1.03 前後にあり、
+    // 灯りのジオメトリはいちばん明るい前照灯でも焼いた色が 1.0 で頭打ちなので、
+    // これまで滲みを 1 度も越えていなかった（＝夜の車が「小さな白い長方形を
+    // 貼った箱」にしかならなかった）。トーンマッピングを通さない材質なので、
+    // ここで 1.6 まで持ち上げれば前照灯と尾灯だけが確実にブルームに拾われる。
+    // 室内灯は焼いた色が暗い（0x6a5230）ので、持ち上げてもしきい値は越えない。
+    for (const m of this.lampMaterials) m.color.setScalar(0.28 + on * 1.32);
     this.beamMaterial.opacity = on * 0.3;
     this.coneMaterial.opacity = on * 0.1;
     // 夜の車体・人が真っ黒なシルエットに潰れるのを、街灯を拾っている想定の
@@ -625,7 +711,11 @@ export class AgentLayer {
     // ガラスが映す 3 段の色。時刻とともに変わるので毎フレーム配る。
     // 路面の照り返しは地面からの回り込みをさらに落としたもの
     // （アスファルトは空の 1/3 も返さない）。
-    this.glassSky.copy(atmo.zenith).multiplyScalar(1.15);
+    // 天頂の色をそのまま映すと、ガラスの上端が**原色の青**になって
+    // 「青いグラデーションに塗った板」に見える。実際に窓が映すのは
+    // 頭上の空そのものではなく、斜め上の霞んだ空なので、地平の色を 4 割
+    // 混ぜて彩度を落とす。階調は残したまま、色が暴れなくなる。
+    this.glassSky.copy(atmo.zenith).lerp(atmo.horizon, 0.4).multiplyScalar(1.05);
     this.glassHorizon.copy(atmo.horizon);
     this.glassGround.copy(atmo.groundLight).multiplyScalar(0.35);
     for (const s of this.surfaces) {
@@ -669,12 +759,14 @@ export class AgentLayer {
     // 接地影の距離しきい値。カメラの引き具合に連動させる。
     // 引いた画では丸ごと切る（1px 未満の影にドローコールは払えない）。
     const closeUp = camDistance < CONTACT_DETAIL_M;
-    const shadowRadius = closeUp ? Math.min(SHADOW_DISTANCE_M, Math.max(90, camDistance * 1.9)) : 0;
+    const shadowRadius =
+      camDistance < SHADOW_DETAIL_M ? Math.min(SHADOW_DISTANCE_M, Math.max(90, camDistance * 1.9)) : 0;
     this.shadowFar2 = shadowRadius * shadowRadius;
     this.shadowNear2 = (shadowRadius * SHADOW_FADE_FROM) ** 2;
     this.conesOn = closeUp;
     // 俯瞰では車種を 1 つに畳む（`CAR_KIND_LOD_M` の注記を参照）。
     this.carLod = camDistance >= CAR_KIND_LOD_M;
+    this.trainLod = camDistance >= TRAIN_FACE_LOD_M;
     for (const f of this.cars) f.count = f.lit = 0;
     this.trucks.count = this.trucks.lit = 0;
     this.buses.count = this.buses.lit = 0;
@@ -981,10 +1073,32 @@ export class AgentLayer {
       this.pos.y + 0.02,
       this.pos.z,
       heading,
-      width * 1.1,
-      length * 1.05,
+      width * 1.1 * this.jitterW,
+      length * 1.05 * this.jitterL,
       this.shadowStrength(d2),
     );
+  }
+
+  /**
+   * 1 台ぶんの寸法のばらつきを `this.scl` に入れる（`SIZE_JITTER_*` の注記を参照）。
+   *
+   * `this.scl` は人・電車と共有している使い回しのベクタなので、行列を組んだら
+   * すぐ 1 に戻す。倍率のほうは接地影の大きさにも要るので、別に覚えておく。
+   */
+  private setVehicleScale(hash: number): void {
+    const a = ((hash >>> 9) % 64) / 64 - 0.5;
+    const b = ((hash >>> 15) % 64) / 64 - 0.5;
+    const c = ((hash >>> 21) % 64) / 64 - 0.5;
+    this.jitterW = 1 + a * SIZE_JITTER_XZ;
+    this.jitterL = 1 + c * SIZE_JITTER_XZ * 1.6;
+    this.scl.set(this.jitterW, 1 + b * SIZE_JITTER_Y, this.jitterL);
+  }
+
+  /** 寸法のばらつきを解いて、共有のベクタを 1 に戻す。 */
+  private clearVehicleScale(): void {
+    this.jitterW = 1;
+    this.jitterL = 1;
+    this.scl.set(1, 1, 1);
   }
 
   /**
@@ -1091,6 +1205,18 @@ export class AgentLayer {
     const used = this.parkSlots.get(tile) ?? 0;
     const bit = side > 0 ? 2 : 1;
     if (used & bit) return false;
+    // **枠のうち一定割合は最初から潰しておく。**
+    //
+    // 1 タイル 1 側 1 台にしても、市街地では自宅と職場の車で枠がほぼ全部埋まる。
+    // タイルは 10m 間隔の格子なので、埋まりきると「10m ごとに 1 台」という
+    // 寸分違わぬリズムの列になり、隙間が車 1 台ぶんも空かない。
+    // 実際の路肩には車庫の出入口・交差点の隅切り・バス停・消火栓があって、
+    // 4 枠に 1 つは必ず空いている。空き枠をタイルのハッシュで決めておけば、
+    // 列に不規則な切れ目が入って「並べた」感じが消える（描く台数も 1/4 減る）。
+    if (tileHash(tile, side > 0 ? 31 : 32) % 100 < EMPTY_SLOT_PCT) {
+      this.parkSlots.set(tile, used | bit);
+      return false;
+    }
     this.parkSlots.set(tile, used | bit);
     return true;
   }
@@ -1119,7 +1245,9 @@ export class AgentLayer {
     const fleet = this.cars[kind]!;
     const h = tileHash(tile, side > 0 ? 21 : 22);
     // タイル内での前後の揺らぎ。同じタイル・同じ側なら毎フレーム同じ値になる。
-    const along = (((h >>> 6) % 64) / 64 - 0.5) * 3.2;
+    // 幅は ±1.9m。枠の 27% を空けたぶん前後に余裕ができたので、±1.6m から
+    // 広げてある。等間隔の列がそのぶん強く崩れる。
+    const along = (((h >>> 6) % 64) / 64 - 0.5) * 3.8;
     const curb = side * (shoulderOffset(cls, kind) + (((h >>> 12) % 16) / 16 - 0.5) * 0.24);
     const ox = alongZ ? curb : along;
     const oz = alongZ ? along : curb;
@@ -1128,7 +1256,9 @@ export class AgentLayer {
     const yaw = parkHeading(alongZ, side) + (((h >>> 18) % 64) / 64 - 0.5) * PARK_YAW_JITTER;
     this.quat.setFromAxisAngle(this.axisY, yaw);
     this.pos.set(wx + ox, this.groundAt(sim, wx + ox, wz + oz) + ROAD_SURFACE_M, wz + oz);
+    this.setVehicleScale(hash);
     this.mat.compose(this.pos, this.quat, this.scl);
+    this.scl.set(1, 1, 1);
     fleet.body.setMatrixAt(fleet.count, this.mat);
     jitterColor(carPaint(hash), hash >>> 11, 0.045, this.color);
     fleet.body.setColorAt(fleet.count, this.color);
@@ -1140,6 +1270,7 @@ export class AgentLayer {
     if (this.nightAmount > LAMP_ON && (hash >>> 3) % 100 < PARKED_LIT_PCT) {
       this.addLamps(fleet, MAX_VISIBLE_VEHICLES);
     }
+    this.clearVehicleScale();
   }
 
   /**
@@ -1323,7 +1454,8 @@ export class AgentLayer {
           const dz = this.railPose.z - camZ;
           if (dx * dx + dz * dz > maxDist2) continue;
           // 0 = 先頭車、TRAIN_CARS-1 = 最後尾、それ以外は中間車。
-          const slot = carIdx === 0 ? 0 : carIdx === TRAIN_CARS - 1 ? 2 : 1;
+          // 引いた画では顔も幌も読めないので、中間車 1 種類に畳む。
+          const slot = this.trainLod ? 1 : carIdx === 0 ? 0 : carIdx === TRAIN_CARS - 1 ? 2 : 1;
           const fleet = this.trains[slot]!;
           if (fleet.count >= MAX_VISIBLE_TRAIN_CARS) continue;
           this.quat.setFromAxisAngle(this.axisY, this.railPose.heading);
@@ -1339,7 +1471,8 @@ export class AgentLayer {
           this.color.setHex(TRAIN_BODY_COLOR);
           fleet.body.setColorAt(fleet.count, this.color);
           this.addLamps(fleet, MAX_VISIBLE_TRAIN_CARS);
-          if (slot === 0) this.addBeam(this.trainBeamLocal, this.trainConeLocal, this.trainPoolLocal);
+          // 前照灯は「編成の先頭かどうか」で決める。畳んだときも点いたままにする。
+          if (carIdx === 0) this.addBeam(this.trainBeamLocal, this.trainConeLocal, this.trainPoolLocal);
           fleet.count++;
           total++;
         }
@@ -1454,16 +1587,27 @@ export class AgentLayer {
       if (lane !== curLane) {
         curLane = lane;
       } else {
-        const gap = MIN_HEADWAY_RATIO * Math.max(len, prevLen);
+        const gap = Math.max(MIN_HEADWAY_M, MIN_HEADWAY_RATIO * Math.max(len, prevLen));
         const limit = prevAlong - prevLen / 2 - gap - len / 2;
-        if (this.vehAlong[i]! > limit) this.vehAlong[i] = limit;
+        if (this.vehAlong[i]! > limit) {
+          // 押し下げ量が過ぎるものは描かない（`MAX_PUSHBACK_M` の注記を参照）。
+          // 基準は前の車のまま据え置く。そうしないと、落とした車の位置から
+          // 数えて次の車がさらに後ろへ流れていく。
+          if (this.vehAlong[i]! - limit > MAX_PUSHBACK_M) {
+            this.vehDrawn[i] = 0;
+            continue;
+          }
+          this.vehAlong[i] = limit;
+        }
       }
+      this.vehDrawn[i] = 1;
       prevAlong = this.vehAlong[i]!;
       prevLen = len;
     }
 
     // --- 3 巡目: 実際に置く ---
     for (let i = 0; i < this.vehCount; i++) {
+      if (this.vehDrawn[i] === 0) continue;
       const v = this.vehSlot[i]!;
       const kind = tr.kind[v]!;
       const isTruck = kind === VehicleKind.Truck;
@@ -1487,24 +1631,36 @@ export class AgentLayer {
       const ox = this.laneOffsetX(heading, LANE_OFFSET_M);
       const oz = this.laneOffsetZ(heading, LANE_OFFSET_M);
       this.pos.set(px + ox, this.groundAt(sim, px + ox, pz + oz) + ROAD_SURFACE_M, pz + oz);
+      const owner = tr.owner[v]!;
+      // 寸法を数 % 振る。とくにトラックは形が 1 種類しか無いので、
+      // これが無いと目線のカットで同じ箱が定規のように並ぶ。
+      this.setVehicleScale(Math.imul(owner + 1, 2654435761) ^ (kind * 0x9e3779b9));
       this.mat.compose(this.pos, this.quat, this.scl);
+      this.scl.set(1, 1, 1);
       this.markLane(px + ox, pz + oz, heading, ox, oz, isTruck || isBus);
       const dx = px - camX;
       const dz = pz - camZ;
       const d2 = dx * dx + dz * dz;
 
-      const owner = tr.owner[v]!;
       if (isTruck) {
         const f = this.trucks;
         f.body.setMatrixAt(f.count, this.mat);
         // 積荷があれば積荷の色、空車（帰路）なら事業者の塗色。
         // 帰りの車をすべて同じ灰色にしていたので、走っているトラックの
         // 過半数が「同じ形・同じ色」で並び、そこがいちばん機械的に見えていた。
-        const returning = t.alive[owner] === 1 && t.state[owner] === TruckState.Returning;
-        const base = returning
+        // 積荷が無い車（帰路、または積んでいない車）は事業者の塗色。
+        // `Good.None` を積荷の色として拾うと、同じ灰色が延々と並ぶ。
+        const good = t.good[owner]!;
+        const empty =
+          t.alive[owner] !== 1 || t.state[owner] === TruckState.Returning || good === Good.None;
+        const base = empty
           ? truckLivery((owner * 2654435761) >>> 0)
-          : (CARGO_COLORS[t.good[owner]!] ?? CARGO_COLORS[0]!);
-        jitterColor(base, (owner * 40503) >>> 0, 0.05, this.color);
+          : (CARGO_COLORS[good] ?? CARGO_COLORS[Good.None]!);
+        // ばらつきを 0.05 → 0.13 に広げる。トラックは形が 1 種類しか無く、
+        // 積荷の色も 7 通りしか無いので、同じ品目の車が続くとそこだけ
+        // 「同じ色の箱の列」になる。同じ品目でも 1 台ずつ濃さが違えば、
+        // 何を積んでいるかは読めたまま列がばらける。
+        jitterColor(base, (owner * 40503) >>> 0, 0.13, this.color);
         f.body.setColorAt(f.count, this.color);
         this.addLamps(f, MAX_VISIBLE_TRUCKS);
         this.addBeam(this.truckBeamLocal, this.truckConeLocal, this.truckPoolLocal);
@@ -1534,6 +1690,7 @@ export class AgentLayer {
         this.addVehicleShadow(heading, carHalfWidth(kindIdx) * 2, carLength(kindIdx), d2);
         f.count++;
       }
+      this.clearVehicleScale();
     }
   }
 
@@ -1562,6 +1719,7 @@ export class AgentLayer {
         return out;
       };
       this.vehSlot = grow32(this.vehSlot);
+      this.vehDrawn = grow32(this.vehDrawn);
       this.vehLane = grow32(this.vehLane);
       this.vehAlongZ = grow32(this.vehAlongZ);
       this.vehSign = grow32(this.vehSign);
@@ -1573,6 +1731,7 @@ export class AgentLayer {
     }
     const i = this.vehCount++;
     this.vehSlot[i] = slot;
+    this.vehDrawn[i] = 1;
     this.vehLane[i] = lane;
     this.vehAlong[i] = along;
     this.vehLength[i] = length;

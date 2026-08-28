@@ -32,8 +32,15 @@ import { boxes, prism, strut, wheel, type BoxSpec } from './parts';
 
 /** 窓ガラス。白い車体なら明るい灰、黒い車体ならほぼ黒になる。 */
 const GLASS = 0x474f58;
-/** タイヤ。どんな車体色でもほぼ黒になる。 */
-const TYRE = 0x212327;
+/**
+ * タイヤ。
+ *
+ * 変調色なので、暗い車体では自動的にさらに暗くなる。0x21 まで落とすと
+ * 白い車でも真っ黒な塊になり、円柱に彫った角が 1 つも読めない
+ *（＝「黒い短い柱」に見える正体）。日向のタイヤは写真では中間の灰色まで
+ * 明るく写るので、そこまで上げて、暗さは下端の AO と接地影に任せる。
+ */
+const TYRE = 0x35383d;
 /** ホイール（金属）。 */
 const HUB = 0xa9aeb4;
 /** 下回り・シャシー・幌。 */
@@ -105,19 +112,28 @@ export function carKind(hash: number): CarKind {
  * 白・銀・黒で 8 割という実際の分布は守りつつ、**同じ「白」の中に階調を作る**
  * ことで単調さを消す。パール白・アイボリー・シャンパンは離れて見れば同じ白系だが、
  * 隣り合うと確かに違う車に見える。
+ *
+ * ただし、正午の直射に環境マップ（空）の映り込みが乗ると、明度 0.9 を超える
+ * 塗装は 1.0 に張り付いて **どれも同じ真っ白**になる。せっかく 3 種類置いた
+ * 白の差が全部飛ぶうえ、シルバーまで白に合流して「街じゅうが白い車」になる。
+ * そこで明るい側の 4 色は 1 段落として、色の差がトーンマッピング後にも
+ * 残る範囲に収めてある。合わせて有彩色の比率を 26% → 42% に上げた
+ * （日本の保有比率としてはやや多いが、絵として車列が読めることを優先する）。
  */
 const CAR_PAINTS: { upTo: number; color: number }[] = [
-  { upTo: 18, color: 0xe9e9e6 }, // ソリッド白
-  { upTo: 30, color: 0xdfdcd3 }, // パール白（わずかに温かい）
-  { upTo: 38, color: 0xcfd2cf }, // アイボリー寄りの白
-  { upTo: 52, color: 0xa9aeb3 }, // シルバー
-  { upTo: 60, color: 0x7c8288 }, // ガンメタ
-  { upTo: 74, color: 0x2b2e33 }, // 黒
-  { upTo: 81, color: 0x36506f }, // 紺
-  { upTo: 86, color: 0x6d8faa }, // 水色
-  { upTo: 91, color: 0x8c3a35 }, // 赤
-  { upTo: 95, color: 0x3d5a44 }, // 深緑
-  { upTo: 100, color: 0xb3a184 }, // ベージュ／シャンパン
+  { upTo: 14, color: 0xdedcd6 }, // ソリッド白
+  { upTo: 22, color: 0xd5cfc3 }, // パール白（わずかに温かい）
+  { upTo: 27, color: 0xc6cac7 }, // アイボリー寄りの白
+  { upTo: 38, color: 0x9fa4aa }, // シルバー
+  { upTo: 45, color: 0x74797f }, // ガンメタ
+  { upTo: 58, color: 0x2a2d32 }, // 黒
+  { upTo: 66, color: 0x33496a }, // 紺
+  { upTo: 72, color: 0x6d8faa }, // 水色
+  { upTo: 79, color: 0x8c3a35 }, // 赤
+  { upTo: 85, color: 0x3d5a44 }, // 深緑
+  { upTo: 91, color: 0xb3a184 }, // ベージュ／シャンパン
+  { upTo: 96, color: 0x486b74 }, // 青緑
+  { upTo: 100, color: 0x6f4f3c }, // 焦茶
 ];
 
 /** ハッシュから車体色を引く。 */
@@ -292,11 +308,34 @@ function curveGlass(g: BufferGeometry, mark: Float32Array): void {
   // 車体半幅 0.85m ぶんで法線が 0.6 ぶん傾く＝半径 1.4m 前後の湾曲。
   const CURVE = 0.6;
   const HALF = 0.85;
+  /**
+   * 上下の反り。
+   *
+   * 左右に反らせるだけでは **側面窓**（法線が ±X）がまったく変わらない。
+   * 反射ベクトルの向きは面内で一定のままなので、窓の帯が上から下まで
+   * 同じ明るさの一色に塗られる ―― これが「白く塗った板」の残り半分だった。
+   * 実車の側面窓もドアの外板に沿って上下に膨らんでいて、**上端は空、
+   * 下端は路面**を映す。上を向かせ下を向かせるだけで、1 枚の窓に
+   * 空 → 地平 → 路面の 3 段が縦に並ぶ。
+   */
+  const CURVE_V = 0.36;
+  // 上下の基準はガラス全体の上端・下端から取る（部品ごとの中心は分からない）。
+  let yMin = Infinity;
+  let yMax = -Infinity;
+  for (let i = 0; i < pos.count; i++) {
+    if (mark[i] !== 1) continue;
+    const y = pos.getY(i);
+    if (y < yMin) yMin = y;
+    if (y > yMax) yMax = y;
+  }
+  const yMid = (yMin + yMax) / 2;
+  const yHalf = Math.max(0.05, (yMax - yMin) / 2);
   for (let i = 0; i < pos.count; i++) {
     if (mark[i] !== 1) continue;
     const t = Math.max(-1, Math.min(1, pos.getX(i) / HALF));
+    const u = Math.max(-1, Math.min(1, (pos.getY(i) - yMid) / yHalf));
     let nx = nor.getX(i) + CURVE * t;
-    let ny = nor.getY(i);
+    let ny = nor.getY(i) + CURVE_V * u;
     let nz = nor.getZ(i);
     const len = Math.hypot(nx, ny, nz) || 1;
     nx /= len;

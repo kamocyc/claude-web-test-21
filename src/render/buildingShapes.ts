@@ -263,6 +263,11 @@ function rooftop(
     const sx = x + (r1 - 0.5) * (w - sw) * 0.7;
     const sz = z + (r2 - 0.5) * (d - sd) * 0.7;
     tmpB.copy(ctx.wall).multiplyScalar(0.9);
+    // 接地の暗がり。塔屋は屋上でいちばん大きな構築物なのに、
+    // 影マップの解像度では屋上に落ちる影がほとんど出ず「貼り付いて」見えていた。
+    // 一回り広い暗い薄板を 1 枚敷く。太陽の向きはここまで届いていないので、
+    // ずらさずに回り込みの暗がりとして置く（向きを間違えるより読み違えが少ない）。
+    e.box(sx, topY + 0.01, sz, sw + 1.1, 0.02, sd + 1.1, 0x44463f, 0.98, 0.0);
     e.box(sx, topY, sz, sw, sh, sd, tmpB, 0.88, 0.04);
     // 塔屋の屋根の縁
     e.box(sx, topY + sh, sz, sw + 0.3, 0.16, sd + 0.3, tmpA, 0.9, 0.03);
@@ -274,10 +279,12 @@ function rooftop(
   if (r1 < 0.6) {
     const tw = Math.min(w * 0.26, 3.4) * vary(r4);
     const mat = rnd(hash, salt + 92);
-    const col = mat < 0.4 ? 0xc2c8ca : mat < 0.78 ? 0xd8d3c2 : 0xa8aca6;
-    // ステンレス（磨いた面）/ FRP（つや消しの白）/ 塗装鋼板
-    const rough = mat < 0.4 ? 0.26 : mat < 0.78 ? 0.86 : 0.6;
-    const metal = mat < 0.4 ? 0.88 : mat < 0.78 ? 0.02 : 0.3;
+    // ステンレス（磨いた面）/ FRP（つや消しの生成り）/ 塗装鋼板（灰）/ 塗装鋼板（青灰）。
+    // 明るい色だけで揃えると、俯瞰した屋上が「同じ淡いグレーの塊」に戻る。
+    // 濃い塗装のタンクが混ざって初めて、機器ごとの材質の違いが読める。
+    const col = mat < 0.34 ? 0xb8c1c5 : mat < 0.62 ? 0xd4cebb : mat < 0.85 ? 0x969c98 : 0x7c8c96;
+    const rough = mat < 0.34 ? 0.24 : mat < 0.62 ? 0.86 : 0.62;
+    const metal = mat < 0.34 ? 0.9 : mat < 0.62 ? 0.02 : 0.32;
     e.tank(px(r2), topY, pz(1 - r0), tw, Math.max(1.8, tw * 1.05), tw * 0.78, col, rough, metal);
   }
   // 空調室外機の列。列そのものの長さと高さを散らす。
@@ -287,12 +294,14 @@ function rooftop(
     const rz = rnd(hash, salt + 20 + i);
     const s = vary(rnd(hash, salt + 30 + i));
     // 経年で色が振れる。全部が同じ白だと、大きさを散らしても列が揃って見える。
-    const age = 0.82 + rnd(hash, salt + 70 + i) * 0.3;
+    // 経年の幅を広く取る。0.8〜1.1 では「明るい灰」しか出ず、
+    // 屋上を俯瞰したときに全機が同じ色の粒に見えてしまう。
+    const age = 0.62 + rnd(hash, salt + 70 + i) * 0.52;
     const mat = rnd(hash, salt + 93 + i);
     // 塗装鋼板（新しい）／ステンレス／屋外で焼けた古い機。
     if (mat < 0.5) tmpC.setRGB(age, age * 0.99, age * 0.95);
-    else if (mat < 0.78) tmpC.setRGB(age * 0.92, age * 0.95, age * 0.98);
-    else tmpC.setRGB(age * 0.86, age * 0.82, age * 0.74);
+    else if (mat < 0.78) tmpC.setRGB(age * 0.88, age * 0.93, age * 0.99);
+    else tmpC.setRGB(age * 0.84, age * 0.76, age * 0.64);
     e.acRow(
       px(rx),
       topY,
@@ -509,14 +518,25 @@ function balconies(
   floorH: number,
   sides: readonly number[] = [-1, 1],
 ): void {
-  const { e } = ctx;
+  const { e, hash } = ctx;
   const floors = Math.max(1, Math.round(h / floorH));
   if (floors < 2 || Math.min(w, d) < 5.5) return;
   const alongX = w >= d;
   const len = (alongX ? w : d) * 0.96;
   const dist = (alongX ? d : w) / 2;
-  const depth = Math.min(1.5, Math.max(w, d) * 0.12);
-  tmpA.copy(ctx.wall).multiplyScalar(0.96);
+  // 出も棟ごとに散らす。全棟が同じ出だと、街区に並んだときに
+  // 水平の影の帯が同じ幅で揃い、それ自体が反復として読めてしまう。
+  const depth = Math.min(1.6, Math.max(w, d) * 0.12) * (0.82 + rnd(hash, 402) * 0.42);
+  // 手すりの作りを棟ごとに 3 通りから引く。
+  // 日本の集合住宅の立面はここでほとんど決まるので、全棟が同じ白い腰壁だと、
+  // どれだけ量塊を散らしても「白い水平帯を積んだバウムクーヘン」が並ぶ。
+  // 0=コンクリートの腰壁 / 1=アルミの手すり（透ける）/ 2=濃色パネルの低い腰壁。
+  const kind = Math.floor(rnd(hash, 401) * 3);
+  tmpA.copy(ctx.wall).multiplyScalar(0.92);
+  // 腰壁の色は躯体から引く。純白の板を回すと、その帯だけが日を受けて
+  // 建物の中でいちばん明るくなり、階の繰り返しがかえって強調される。
+  tmpB.copy(ctx.wall).multiplyScalar(kind === 2 ? 0.52 : 0.86);
+  const railH = kind === 2 ? 0.78 : 1.05;
   for (let i = 1; i < floors; i++) {
     const y = baseY + floorH * i;
     for (const s of sides) {
@@ -525,10 +545,15 @@ function balconies(
       const pz = z + (alongX ? off : 0);
       // 床スラブ。小口の線と、その下に落ちる影が「階」を読ませる。
       e.box(px, y - 0.17, pz, alongX ? len : depth, 0.17, alongX ? depth : len, tmpA, 0.9, 0.03);
-      // 手すり壁（外側の立ち上がり）
       const rx = x + (alongX ? 0 : s * (dist + depth - 0.06));
       const rz = z + (alongX ? s * (dist + depth - 0.06) : 0);
-      e.box(rx, y, rz, alongX ? len : 0.12, 1.05, alongX ? 0.12 : len, 0xb6bcbe, 0.78, 0.10);
+      if (kind === 1) {
+        // アルミの手すり。透けるぶん水平帯が細くなり、
+        // 同じ階数でも腰壁の棟より軽い立面に見える。インスタンス数は腰壁と同じ。
+        e.railFrame(rx, y, rz, len, 1.05, alongX ? 0 : Math.PI / 2);
+      } else {
+        e.box(rx, y, rz, alongX ? len : 0.12, railH, alongX ? 0.12 : len, tmpB, 0.8, 0.08);
+      }
     }
   }
 }
@@ -667,6 +692,18 @@ function placeBlocks(ctx: BuildCtx, blocks: Block[], facade: number, frontKind =
     );
     if (facade === Facade.Residential) {
       balconies(ctx, cx + b.x, cz + b.z, b.w, b.d, gy, b.h, style.floorH);
+    }
+    // 1 階と 2 階の境に回す水切り（見切り縁）。
+    //
+    // シェーダで陰影を描くだけでは、日陰の面と逆光の面でこの線が消える。
+    // 0.12m 前に出した実体を 1 本回すと、どの向きの面にも必ず影が落ちて、
+    // 目線の高さで「ここまでが 1 階」が読める。基壇にだけ付けるので
+    // 1 棟あたり 1 インスタンス、ドローコールは増えない。
+    if (i === 0 && b.h > gh + 0.6) {
+      tmpB.copy(ctx.wall).multiplyScalar(1.06);
+      // 天端は階高より 2cm 下げる。バルコニーの床スラブと面が一致すると、
+      // 重なった帯で Z ファイトの縞が出る。
+      e.box(cx + b.x, gy + gh - 0.20, cz + b.z, b.w + 0.24, 0.18, b.d + 0.24, tmpB, 0.86, 0.05);
     }
     if (style.roofKind === RoofKind.Flat) {
       rooftop(ctx, cx + b.x, cz + b.z, gy + b.h, b.w, b.d, 30 + i * 5, {

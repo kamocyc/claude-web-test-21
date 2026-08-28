@@ -56,18 +56,25 @@ function shadowGeometry(): BufferGeometry {
     col.push(1, 1, 1, 1);
     nor.push(0, 1, 0);
   };
+  // 三角形の頂点は **k+1 → k の順**に積む。
+  //
+  // 板は XZ 平面に寝ているので、角度の増える向き（cos t, 0, sin t）に
+  // 並べると (v1-v0)×(v2-v0) が **-Y** を向く。WebGL の表裏は法線属性ではなく
+  // 巻き方向で決まるので、素直に積むと影の板は全部「裏向き」になり、
+  // 既定の `FrontSide` では 1 枚残らず背面カリングで消える
+  // （置いた数だけ行列は書いているのに、画面には一切出ない）。
   for (let k = 0; k < SEGMENTS; k++) {
     // 中心 → 内側リング
     center();
-    push(INNER_R, INNER_A, k);
     push(INNER_R, INNER_A, k + 1);
+    push(INNER_R, INNER_A, k);
     // 内側リング → 外周（外周のアルファ 0 でぼかす）
     push(INNER_R, INNER_A, k);
+    push(1, 0, k + 1);
     push(1, 0, k);
-    push(1, 0, k + 1);
     push(INNER_R, INNER_A, k);
-    push(1, 0, k + 1);
     push(INNER_R, INNER_A, k + 1);
+    push(1, 0, k + 1);
   }
   const g = new BufferGeometry();
   g.setAttribute('position', new BufferAttribute(new Float32Array(pos), 3));

@@ -241,6 +241,12 @@ vec3 fakeSky(vec3 R) {
   // ここを黒に寄せると、見下ろした窓がすべて黒い板になって元に戻ってしまう。
   vec3 grd = mix(uSkyGround, uSkyHorizon, smoothstep(-0.55, -0.01, t));
   vec3 c = (t > 0.0) ? sky : grd;
+  // 地平のすぐ上下に映るのは「向かいの建物」。街路でガラスを斜めに見たとき、
+  // 反射ベクトルはほぼ水平になるので、ここを明るい地平色のままにすると
+  // グレージング角の窓が一様な白い板になる — 拡大したときの「平板」の正体はこれ。
+  // 向かいの壁のぶんだけ確実に落とす。
+  float town = 1.0 - smoothstep(0.02, 0.22, abs(t));
+  c = mix(c, uSkyGround * 1.1, town * 0.68);
   // 太陽のギラつき。窓が 1 枚だけ白く光る瞬間があると、一気にガラスになる。
   float s = max(dot(R, uSunDir), 0.0);
   c += uSunTint * pow(s, 180.0) * 2.6;
@@ -258,7 +264,7 @@ float fresnelAt(vec3 V, vec3 N) {
   // 指数は物理値（5）より寝かせてある。ガラスの反射率は 45 度でまだ 5% しかなく、
   // 物理どおりに落とすと、街を歩く距離で見る窓がほとんど反射しない＝板に戻る。
   // 絵として「ガラスに見える」ことを優先して、立ち上がりを早くしてある。
-  return pow(1.0 - clamp(dot(-V, N), 0.0, 1.0), 2.6);
+  return pow(1.0 - clamp(dot(-V, N), 0.0, 1.0), 3.0);
 }
 
 float h21(vec2 p) {
@@ -828,6 +834,9 @@ void facadeShade(vec3 base) {
   float glassRough = 0.16, glassMetal = 0.80;
   float wallRough = 0.88, wallMetal = 0.03;
   float extra = 0.0;      // 壁面に足す明暗（庇・スラブ・リブ）
+  // 窓の灯りとは別に足す自発光（1 階の常夜灯など）。
+  // gEmis は下で部屋の灯りに一度上書きされるので、ここへ溜めて最後に足す。
+  vec3 extraEmis = vec3(0.0);
   float glow = 1.0;       // 灯りの強さ
   float pier = 0.0;       // テナントの境の柱（ここで窓と灯りを切る）
   float band = 0.0;       // 店舗の看板帯
@@ -969,6 +978,87 @@ void facadeShade(vec3 base) {
     extra = -bandAA(y, 0.0, 0.55, fwidth(y)) * 0.24;
   }
 
+  // ---- 1 階の作り分け（店構えのキットが載らない面）----
+  //
+  // キットは接道した 1 面にしか載らない。残りの面まで上階と同じ窓帯のままだと、
+  // 街路を歩いて横を向いた瞬間に「1 階が無地の壁」へ戻ってしまう。
+  // レビューで「1 階が全部ただの壁か、上階と同じ窓帯」と言われたのは、
+  // キットの有無ではなく**壁のシェーダに 1 階という概念が無かった**ことが本体。
+  // ジオメトリを 1 三角形も増やさずに、足元の石張り・境の水切り・
+  // 用途ごとの設備の 3 つで、1 階を上階から切り離す。
+  if (ground && !hasFront) {
+    // 足元の石張り（腰壁）。日本のビルはほぼ必ず 0.4〜0.9m を磨いた石か
+    // タイルで巻いている。ここに境が 1 本できるだけで、壁が地面に「立つ」。
+    float plinthH = min(0.66, gH * 0.24);
+    float plinth = bandAA(y, -1.0, plinthH, fwidth(y));
+    extra -= plinth * 0.34;
+    // 石張りの天端の見切り。明るい線を 1 本入れると、腰壁が
+    // 「壁の下半分を暗く塗ったもの」ではなく「張った石の帯」になる。
+    extra += bandAA(y, plinthH, plinthH + 0.05, fwidth(y)) * 0.20;
+    // 石の目地。1 本入るだけで「塗った腰」ではなく「張った石」になる。
+    extra -= plinth * bandAA(fract(y / 0.33), 0.0, 0.07, fwidth(y / 0.33)) * 0.14;
+    // 1 階と 2 階の境の水切り。見付を明るく、その下を落とす。
+    // 目線の高さでいちばん効く 1 本で、これがあると「1 階」が数えられる。
+    extra += bandAA(y, gH - 0.28, gH - 0.10, fwidth(y)) * 0.18;
+    extra -= bandAA(y, gH - 0.66, gH - 0.28, fwidth(y)) * 0.13;
+    // 窓は上階より小さく、位置も上げる（1 階は防犯上どの用途でもこうなる）。
+    if (x0 < 1.5) {
+      float mx = (x0 + x1) * 0.5;
+      float hx = (x1 - x0) * 0.34;
+      x0 = mx - hx; x1 = mx + hx;
+      y0 = max(y0, plinthH / gH + 0.08);
+      y1 = min(max(y1, y0 + 0.14), 0.76);
+    }
+    // 通用口。どの用途のビルにも「人が出入りする穴」が 1 か所はある。
+    // 目線の高さで 1 階が「歩ける」に見えるかは、庇より先にこれで決まる。
+    // 割付のどこに開くかは面ごとのハッシュで引く。
+    // 3 階以上の棟にだけ開ける。戸建ては正面に玄関ポーチのキットが載るので、
+    // ここでもう 1 枚扉を描くと、同じ面に扉が 2 つ並んでしまう。
+    float bays = max(floor(wallLen / bay), 1.0);
+    float dBay = floor(h21(vec2(3.0, 11.0) + sideSeed) * bays);
+    float onBay = (1.0 - step(0.5, abs(fxi - dBay)))
+                * step(gH + floorH * 1.5, vScaleM.y);
+    float door = onBay * bandAA(tx, 0.32, 0.68, wx) * bandAA(y, -1.0, 2.1, fwidth(y));
+    // 枠（左右と上のアルミ）を残して、内側だけを落とす。
+    float dInner = onBay * bandAA(tx, 0.36, 0.64, wx) * bandAA(y, -1.0, 1.98, fwidth(y));
+    extra += door * 0.10 - dInner * 0.52;
+    // 扉の入る割付には窓を描かない。重ねると、暗い入口の真ん中に
+    // 明るいガラスが浮いて、扉にも窓にも見えなくなる。
+    if (onBay > 0.5) { x0 = 2.0; x1 = 2.0; litRate = 0.0; }
+    // 夜は扉の脇の常夜灯だけが点く。街路が真っ暗にならない最小の灯り。
+    extraEmis += vec3(1.0, 0.90, 0.70) * onBay
+           * bandAA(tx, 0.70, 0.76, wx) * bandAA(y, 1.9, 2.15, fwidth(y))
+           * (0.05 + uNight * 1.1);
+
+    if (style < 1.5) {
+      // 集合住宅：メーターボックスと通風ガラリの並び。
+      // 上階と同じ掃き出し窓を 1 階にも流すと「歩道に面したベランダ」になる。
+      // 3 スパンに 1 つほど。全スパンに付けると、足元が縞の帯になってしまう。
+      float mb = step(0.64, h21(vec2(fxi, 31.0) + sideSeed))
+               * bandAA(tx, 0.70, 0.93, wx) * bandAA(y, 0.72, 1.92, fwidth(y));
+      extra -= mb * 0.24;
+      extra -= mb * bandAA(fract(y / 0.15), 0.0, 0.5, fwidth(y / 0.15)) * 0.13;
+    } else if (style > 1.5 && style < 2.5) {
+      // 事務所：上階のカーテンウォールを受ける柱型（ピラスター）。
+      extra += bandAA(tx, 0.0, 0.16, wx) * 0.12;
+    } else if (style > 4.5) {
+      // 学校・庁舎：1 階は腰の高い連窓と、割付ごとの柱型。
+      extra += bandAA(tx, 0.0, 0.12, wx) * 0.10;
+    }
+  }
+
+  // 竪樋（雨樋の縦管）。壁の両端から 0.45m のところに 1 本ずつ通す。
+  // 近景で「平らな面」が「建物の外壁」に変わる最も安い手掛かりで、
+  // 遠景でも箱の角に縦の線が 1 本出るぶん、稜線が読みやすくなる。
+  {
+    // 1 画素が 0.25m を超えたら消す。幅 0.1m の線を遠景まで描くと、
+    // 建物の角で 1 画素の縦線がちらついて、街全体がざらつく。
+    float pw = max(fwidth(u), 1e-4);
+    float pipe = (1.0 - smoothstep(0.05, 0.11 + pw, abs(abs(u) - (wallLen * 0.5 - 0.45))))
+               * (1.0 - clamp(pw * 4.0, 0.0, 1.0));
+    extra -= pipe * 0.20;
+  }
+
   // 遠景の「平均的な壁」。窓 1 つが 1 画素に満たなくなったら、
   // 格子を描いても被覆率に潰れるだけなので、この平均へ寄せていく。
   //
@@ -990,7 +1080,7 @@ void facadeShade(vec3 base) {
     // 街が霞の中でただの灰色の塊に潰れるのを防げる。
     vec3 V = normalize(vWorldPos - cameraPosition);
     vec3 Nw = normalize(vWorldN);
-    gRefl = fakeSky(reflect(V, Nw)) * (0.06 + 0.5 * fresnelAt(V, Nw)) * cov;
+    gRefl = fakeSky(reflect(V, Nw)) * (0.03 + 0.5 * fresnelAt(V, Nw)) * cov;
     return;
   }
 
@@ -1061,12 +1151,23 @@ void facadeShade(vec3 base) {
     float fres = fresnelAt(V, Nw);
     // ガラスは 4% から始まり、グレージング角で 9 割近くまで上がる。
     // カーテンの下りた窓は拡散面なので、反射は控えめにする。
-    float amt = mix(0.18, 0.94, fres) * mix(1.0, 0.34, hasCurtain);
+    // 正面から見た窓には、ほとんど空を映さない。
+    // ここに一律の下駄を履かせると、街を俯瞰したときに全部の窓が
+    // 同じ空色で塗られ、街区が乳白色に霞む（レビューの「一様なグレーブルーの
+    // 平板」は、映り込みが足りないのではなく**一様**なのが正体）。
+    // 深いグレージング角だけを強く光らせると、同じ 1 枚の中に
+    // 暗いガラスと空の映り込みが同居して、初めて板から抜ける。
+    float amt = mix(0.05, 0.80, fres) * mix(1.0, 0.34, hasCurtain);
     // 壁にはほとんど映さない。ここを上げると、グレージング角の壁が
     // 一様に空の色でかぶり、棟ごとに散らしたクリーム色や茶色の外壁が
     // すべて同じ青白い面になってしまう（散らした意味が消える）。
     float wallAmt = fres * 0.035;
-    gRefl = fakeSky(reflect(V, Nw)) * mix(wallAmt, amt, winMat);
+    // 向かいの建物の映り込みのむら。グレージング角ほど強く効かせる。
+    // 反射そのものは fakeSky が返すが、それは方向だけの関数なので、
+    // 1 枚のガラスの中では滑らかにしか変わらない。窓の割りぶんの
+    // 低い周波数のむらを 1 枚重ねて、「何かが映っている」ことを読ませる。
+    float mir = 0.80 + 0.34 * sin(u * 0.52 + seed * 23.0) * sin(y * 0.40 + 1.7);
+    gRefl = fakeSky(reflect(V, Nw)) * mix(wallAmt, amt * mix(1.0, mir, fres), winMat);
   }
   gTint = mix(vec3(1.0 + extra), glassCol / max(base, vec3(0.02)), win);
   gTint *= 1.0 + max(frame, 0.0) * 0.08 + sill * 0.22 - slabLine * 0.10;
@@ -1153,6 +1254,7 @@ void facadeShade(vec3 base) {
   gEmis += litCol * band * (0.08 + uNight * litI * 0.5);
   // 店の売り場は昼でも中が明るい。ガラス面が黒く沈むと閉店した街に見える。
   if (style > 2.5 && style < 3.5 && ground) gEmis += litCol * win * 0.10;
+  gEmis += extraEmis;
 
   // 遠景の平均にも階調ぶんの目減りを反映する（近景と遠景で明るさが跳ねない）。
   avgEmis *= 0.72;
@@ -1489,7 +1591,9 @@ function acRowGeometry(): BufferGeometry {
   for (let i = -1; i <= 1; i++) {
     const x = i * 0.335;
     // 本体
-    parts.push({ geom: ao, matrix: place(x, 0.07, 0, 0.30, 0.83, 0.68), color: 0xdadcd8 });
+    // 本体の地色は少し落としてある。ここを純白に近く焼くと、
+    // 呼び出し側で色を散らしても全機が明るい灰に張り付いてしまう。
+    parts.push({ geom: ao, matrix: place(x, 0.07, 0, 0.30, 0.83, 0.68), color: 0xc3c6c0 });
     // ファンのガード（正面の凹んだ丸枠のつもり。暗く落として穴に見せる）
     parts.push({ geom: box, matrix: place(x, 0.28, 0.345, 0.22, 0.42, 0.02), color: 0x44484a });
     // 天端のルーバー

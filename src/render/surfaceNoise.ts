@@ -32,6 +32,33 @@ export interface SurfaceNoiseOptions {
   bump?: number;
   /** ここまでの距離でディテールが消える (m)。 */
   fade?: number;
+  /**
+   * 間接反射（空の映り込み）の掛け率。1 で素のまま、0.2 でほぼ消す。
+   *
+   * **目線の高さで路面が白い板になる原因はここ**だった。環境マップは
+   * 「空を丸ごと見渡せる場所」の probe を 1 つだけ焼いたもので、遮蔽を持たない。
+   * ところが街路の路面が実際に見ている空は、両側のビルに挟まれた細い帯でしかない。
+   * さらに視線が水平に近づくほどフレネル反射が 1 に近づくので、
+   * 過大な probe がそのまま乗って、albedo 3% のアスファルトが
+   * 27% の明るさで描かれていた（実測）。加算で乗る光は**比を潰す**ので、
+   * 白線も轍もマンホールも骨材のムラも、全部その中に沈んで消える。
+   * 路面が「一色の板」に見えていた最大の原因はこれ。
+   *
+   * 正しくは probe に遮蔽を持たせるべきだが、街路 1 本ごとに probe は焼けない。
+   * 上を向いた面の間接**鏡面**だけを落とすのが、いちばん安くて外さない近似。
+   * 間接拡散（空のフィル光）は残すので、日陰の路面が黒く潰れることはない。
+   */
+  specular?: number;
+  /**
+   * 舗装の目地・継ぎ目。世界座標の格子に沿った、わずかに暗く粗い帯。
+   *
+   * `spacing` が間隔 (m)、`width` が帯の幅 (m)、`darken` が暗くする割合。
+   * 道路も歩道も軸に平行なので、世界座標の XZ 格子がそのまま
+   * 「舗装の打ち継ぎ」「平板の目地」の向きに一致する。
+   * 線を 1px の細さで描くと遠くでちらつくので、実寸の帯として
+   * ぼかしたまま置き、距離で早めに消す。
+   */
+  seam?: { spacing: number; width: number; darken: number };
 }
 
 /** 差し込むノイズ関数。値ノイズ 2 オクターブ。安いほうを優先する。 */
@@ -70,11 +97,20 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
     opts.bump ?? 0.03,
   );
   const fade = opts.fade ?? 260;
-  const key = `sn:${params.x},${params.y},${params.z},${params.w},${fade}`;
+  const specular = opts.specular ?? 1;
+  // 目地は [間隔, 帯の半幅, 暗くする割合]。無効なら間隔 0 で分岐ごと落とす。
+  const seam = new Vector4(
+    opts.seam ? Math.max(0.05, opts.seam.spacing) : 0,
+    opts.seam ? Math.max(0.005, opts.seam.width) * 0.5 : 0,
+    opts.seam ? opts.seam.darken : 0,
+    0,
+  );
+  const key = `sn:${params.x},${params.y},${params.z},${params.w},${fade},${specular},${seam.x},${seam.y},${seam.z}`;
 
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uSurfNoise = { value: params };
     shader.uniforms.uSurfFade = { value: fade };
+    shader.uniforms.uSurfSeam = { value: seam };
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vSurfPos;')
@@ -94,6 +130,7 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
         `#include <common>
         varying vec3 vSurfPos;
         uniform vec4 uSurfNoise;
+        uniform vec4 uSurfSeam;
         uniform float uSurfFade;
         ${NOISE_GLSL}`,
       )
@@ -106,7 +143,19 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
         float surfNx = snFbm(surfUv + vec2(0.16, 0.0)) - 0.5;
         float surfNz = snFbm(surfUv + vec2(0.0, 0.16)) - 0.5;
         #include <map_fragment>
-        diffuseColor.rgb *= 1.0 + surfN * uSurfNoise.y * 2.0 * surfFade;`,
+        diffuseColor.rgb *= 1.0 + surfN * uSurfNoise.y * 2.0 * surfFade;
+        // 目地。格子までの距離を実寸で測り、帯の中だけ暗くする。
+        // 位相をノイズでわずかに曲げてあるのは、定規で引いた線に見せないため。
+        // ここでは値を作るだけで、当てるのは法線が出てから（上向きの面に限る）。
+        float surfSeam = 0.0;
+        if (uSurfSeam.x > 0.0) {
+          vec2 seamP = (vSurfPos.xz + surfN * 0.16) / uSurfSeam.x;
+          vec2 seamD = abs(fract(seamP + 0.5) - 0.5) * uSurfSeam.x;
+          float seamNear = min(seamD.x, seamD.y);
+          // 目地は近景専用。ノイズより早く（半分の距離で）消す。
+          float seamFade = 1.0 - smoothstep(uSurfFade * 0.16, uSurfFade * 0.42, distance(cameraPosition, vSurfPos));
+          surfSeam = (1.0 - smoothstep(uSurfSeam.y * 0.35, uSurfSeam.y, seamNear)) * seamFade;
+        }`,
       )
       .replace(
         '#include <roughnessmap_fragment>',
@@ -122,8 +171,31 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
         vec3 surfWorldN = normal * mat3(viewMatrix);
         float surfUp = smoothstep(0.55, 0.9, surfWorldN.y);
         vec3 surfBump = vec3(surfNx - surfN, 0.0, surfNz - surfN) * uSurfNoise.w * 13.0;
-        normal = normalize(normal + mat3(viewMatrix) * surfBump * surfFade * surfUp);`,
+        normal = normalize(normal + mat3(viewMatrix) * surfBump * surfFade * surfUp);
+        // 目地を当てるのはここ。上向きの面だけに限るのが肝で、世界座標の
+        // 格子をそのまま掛けると、縁石の立ち上がり（x が一定の縦面）が
+        // 格子の線に当たったときに**面まるごと 1 本の縞**になる。
+        // 目地は砂と土が詰まっているので、色だけでなく粗さも上げる。
+        // 暗いだけの線は「描いた線」に見えるが、粗さが変わると溝に見える。
+        float surfSeamUp = surfSeam * surfUp;
+        diffuseColor.rgb *= 1.0 - surfSeamUp * uSurfSeam.z;
+        roughnessFactor = clamp(roughnessFactor + surfSeamUp * 0.22, 0.04, 1.0);`,
       );
+
+    if (specular < 1) {
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+        // 空の映り込みを上向きの面だけ弱める（SurfaceNoiseOptions.specular を参照）。
+        // 壁や縁石の立ち上がりまで落とすと、こんどは陰の面が死ぬので、
+        // 法線の上向き成分で重み付けする。
+        {
+          vec3 specWorldN = normal * mat3(viewMatrix);
+          float specUp = smoothstep(0.3, 0.85, specWorldN.y);
+          reflectedLight.indirectSpecular *= mix(1.0, ${specular.toFixed(3)}, specUp);
+        }`,
+      );
+    }
   };
   mat.customProgramCacheKey = () => key;
   mat.needsUpdate = true;

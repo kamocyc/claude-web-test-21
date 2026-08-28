@@ -17,6 +17,7 @@ import {
   groundColor,
   terrainNoise,
   terrainNoise2,
+  valueNoise,
 } from './groundPalette';
 import { applySurfaceNoise } from './surfaceNoise';
 import {
@@ -115,10 +116,15 @@ export class TerrainMesh {
     // 世界座標のノイズを材質に差し込んで、1〜2m の粒を近くだけ重ねる。
     applySurfaceNoise(this.material, {
       scale: 2.8,
-      color: 0.09,
+      color: 0.11,
       roughness: 0.06,
       bump: 0.035,
       fade: 220,
+      // 地面も上を向いた広い面なので、遮蔽の無い環境マップの鏡面が
+      // 視線が寝るほど乗ってくる。引きの画で郊外一面が「白っぽい単色の
+      // オリーブ」に見えていたのは、素材の差がこの映り込みで潰れていたから。
+      // 草地は実際にもほとんど鏡面反射を持たない。
+      specular: 0.3,
     });
     for (let c = 0; c < CHUNK_COUNT; c++) {
       const geom = new BufferGeometry();
@@ -335,13 +341,28 @@ export class TerrainMesh {
             }
             // 角の座標で引いた連続ノイズ。隣のタイルは同じ角の値を共有するので、
             // ばらつきが市松にならずに、まだらな地面になる。
-            // 明度だけでなく緑と赤の比も少し動かす。明度だけだと
-            // 「同じ色の濃淡」にしかならず、草地の情報量が増えない。
+            // 明度だけでなく色相も動かす。明度だけだと「同じ色の濃淡」に
+            // しかならず、草地の情報量が増えない。
+            //
+            // 動かす向きが肝で、**明るいところほど暖色（枯れて乾いた側）**に
+            // 寄せる。以前は逆に青を足していたので、明るいところが青白く
+            // なり「褪せた 1 色」に見えていた。実際の草地は、日の当たる乾いた
+            // 場所ほど明るく黄土色に、水の残る日陰ほど暗く青緑になる。
+            // 明度と色相が同じ向きに動くと、霞の掛かる遠景でも差が残る。
             const nz = terrainNoise(ox + cxl, oy + cyl);
-            const m = 1 + nz * 0.26;
-            r *= m * (1 - nz * 0.05);
+            // 中周波のむら（1 周期 5 タイル ＝ 50m）を 1 本足す。
+            // `terrainNoise` は 300m と 90m の 2 本しか持っておらず、
+            // 俯瞰の 1 カットに入るのはせいぜい 1〜2 山。実測すると
+            // 郊外の草地は端から端まで**単調なグラデーション 1 枚**で、
+            // 「起伏も色の差も無い単一のオリーブ」と読まれたのはこれが原因だった。
+            // 50m は俯瞰でも 30〜40px あるのでちらつかず、
+            // 「田や原の区切りくらいの色ムラ」として読める。
+            const nm = valueNoise((ox + cxl) * 0.2 + 41.5, (oy + cyl) * 0.2 - 17.9) - 0.5;
+            const nt = nz + nm * 0.62;
+            const m = 1 + nt * 0.28;
+            r *= m * (1 + nt * 0.075);
             g *= m;
-            bl *= m * (1 + nz * 0.06);
+            bl *= m * (1 - nt * 0.095);
           }
           C[b] = r;
           C[b + 1] = g;
@@ -496,16 +517,31 @@ export class TerrainMesh {
     const built = world.buildingRef[t] !== 0;
     const urban = built || (zone >= Zone.ResidentialLow && zone <= Zone.IndustrialHeavy);
     if (urban) {
-      const hh = (t * 2654435761) >>> 0;
-      // 商業・工業の敷地はほぼ全面が舗装。低層住居は庭が残る。
+      // 商業・工業の構内はほぼ全面が舗装、低層住居は土と庭が残る。
+      // 素材を用途で切り替えるのが肝。同じ土色で明度だけ変えていたときは、
+      // 市街地が丸ごと 1 枚の茶色い厚紙に見えていた。
       const paved = zone >= Zone.CommercialLocal && zone <= Zone.IndustrialHeavy;
-      const base = built ? (paved ? 0.78 : 0.62) : paved ? 0.5 : 0.32;
-      c.lerp(TMP.setHex(GROUND.lotBare), base + ((hh >>> 11) % 26) / 100);
-      // 建物際は建物自身に遮られて暗いので、一段落としておく。
-      c.multiplyScalar((built ? 0.82 : 0.92) + ((hh >>> 19) % 22) / 100);
+      const base = built ? (paved ? 0.82 : 0.66) : paved ? 0.56 : 0.34;
+      c.lerp(TMP.setHex(paved ? GROUND.lotPaved : GROUND.lotBare), base);
+
+      /**
+       * 敷地ごとのばらつき。
+       *
+       * ここはタイルのハッシュ（`t * 2654435761`）でやってはいけなかった。
+       * 地面の頂点カラーは**角で 4 タイルを平均している**ので、
+       * 1 タイルごとに独立した値はその平均でほぼ打ち消し合い、
+       * 街区全体が平らな 1 色に均されてしまう（実際そうなっていた）。
+       * 連続ノイズなら隣同士が相関しているので平均しても生き残り、
+       * 「敷地ごとに舗装の打ち替え時期が違う」ムラとして読める。
+       */
+      const nx = tx * 0.42;
+      const ny = ty * 0.42;
+      const lot = terrainNoise2(nx, ny);
+      c.lerp(TMP.setHex(GROUND.lotStain), Math.max(0, lot) * 0.34);
+      c.multiplyScalar((built ? 0.86 : 0.95) + terrainNoise(nx + 51.7, ny - 8.3) * 0.14);
     } else if (zone === Zone.None && this.nextToBuilt(world, t)) {
-      const hh = (t * 2654435761) >>> 0;
-      c.lerp(TMP.setHex(GROUND.lotBare), 0.24 + ((hh >>> 13) % 18) / 100);
+      // 敷地の裏の空き地。草のままだと建物際に緑の帯が走るので、土に寄せる。
+      c.lerp(TMP.setHex(GROUND.lotBare), 0.3);
     }
     return c;
   }

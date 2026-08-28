@@ -86,13 +86,20 @@ const POLE_COLOR = 0x9aa0a6;
  * `instanceColor` で描き分ければ、ドローコールを 1 つも増やさずに
  * 「太さの変化」と「金属の色味」が出る。
  */
-const WIRE_MESSENGER = 0x9a9288;
-const WIRE_CONTACT = 0xb08a5e;
-const WIRE_HANGER = 0x8a8377;
-/** 断面の太さの倍率（基準半径 4.5cm に対して）。 */
-const R_MESSENGER = 1.2;
-const R_CONTACT = 0.78;
-const R_HANGER = 0.42;
+const WIRE_MESSENGER = 0xb3ab9e;
+const WIRE_CONTACT = 0xc79a63;
+const WIRE_HANGER = 0x726c63;
+/**
+ * 断面の太さの倍率（基準半径 4.5cm に対して）。
+ *
+ * 3 本の差を「1.2 : 0.78 : 0.42」から広げてある。1 本が画面上 1〜2px しか
+ * ないところで 1.5 倍の差を付けても、両方 1px に丸められて差が消える。
+ * 太いほうを 2px 側へ、細いほうを 1px 側へ押し出して初めて
+ * 「太い線と細い線が張ってある」と読める。
+ */
+const R_MESSENGER = 1.45;
+const R_CONTACT = 0.72;
+const R_HANGER = 0.4;
 const PLATFORM_COLOR = 0xc8c4bc;
 
 /** 架線柱。高さと、線路中心からの張り出し。 */
@@ -349,9 +356,13 @@ export class RailLayer {
     this.deck = this.makeMesh(deckGeometry(), MAX_DECK, 0.88, 0.04);
     this.pole = this.makeMesh(poleGeometry(), MAX_POLES, 0.55, 0.55);
     // 架線は金属だが、細い円柱に強い鏡面を乗せると 1px の線の上でハイライトが
-    // 明滅して、かえってちらつく。粗さは残しつつ金属度だけ上げて、
-    // 磨かれたトロリ線が空の明るさを少し拾うようにする。
-    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.55, 0.6, 1.2);
+    // 明滅して、かえってちらつく。粗さは残しつつ、**金属度は下げる**。
+    //
+    // 金属度 0.6 では拡散反射が 6 割削られるので、せっかく色を分けても
+    // 線が沈んで「どれも黒い糸」に見えていた（環境マップの映り込みは
+    // 1〜2px の線ではほとんど効かない）。金属度を下げて色そのものを残し、
+    // 空の映り込みは倍率のほうで足す。
+    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.44, 0.28, 1.8);
     this.crossing = this.makeMesh(crossingGeometry(), MAX_CROSSING, 0.7, 0.1);
     this.platform = this.makeMesh(platformGeometry(), MAX_PLATFORM, 0.85, 0.04);
   }
@@ -486,10 +497,27 @@ export class RailLayer {
         (railNS0 && (roadConn0 & 0b0101) !== 0 && !railEW0) ||
         (railEW0 && (roadConn0 & 0b1010) !== 0 && !railNS0);
       if (bits >= 2 && along % POLE_PERIOD === 0 && !roadParallel && poles < MAX_POLES) {
-        const side = ((along / POLE_PERIOD) | 0) % 2 === 0 ? 1 : -1;
+        const railNS = railNS0 && !railEW0;
         // 柱は軌道に直交する向きに張り出す。南北の線路なら東西へ。
-        const base = railNS0 && !railEW0 ? 0 : Math.PI / 2;
-        this.place(this.pole, poles++, cx, gy, cz, base + (side > 0 ? 0 : Math.PI));
+        const base = railNS ? 0 : Math.PI / 2;
+        // 立てたい側と、その反対側。
+        //
+        // 柱は線路中心から 3.3m、腕金はさらに軌道の上へ伸びる。隣のタイルが
+        // 建物なら、その庇や外階段が線路側へ張り出しているぶんと重なって
+        // **柱が建物の面を突き抜けて生える**。交互に立てるだけの規則では
+        // それを避けられないので、建物のある側は選ばない
+        //（両側とも建物なら、その 1 本は立てずに飛ばす。3 タイルに 1 本なので
+        //  1 本抜けても架線は繋がったままに見える）。
+        const want = ((along / POLE_PERIOD) | 0) % 2 === 0 ? 1 : -1;
+        let side = 0;
+        for (const cand of [want, -want] as const) {
+          const d = railNS ? (cand > 0 ? 1 : 3) : cand > 0 ? 0 : 2;
+          const nb = neighbor(i, d);
+          if (nb >= 0 && world.buildingRef[nb] !== 0) continue;
+          side = cand;
+          break;
+        }
+        if (side !== 0) this.place(this.pole, poles++, cx, gy, cz, base + (side > 0 ? 0 : Math.PI));
       }
 
       // --- 踏切の警報機・遮断機 ---

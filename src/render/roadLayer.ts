@@ -21,6 +21,7 @@ import { applySurfaceNoise } from './surfaceNoise';
 import { InstancePool } from './instancePool';
 import { atmosphereAt } from './sky';
 import {
+  CROWN_COLOR,
   LAMP_COOL,
   LAMP_WARM,
   LINE_WHITE,
@@ -302,7 +303,10 @@ export class RoadLayer {
     // 0.3 のままだと **空がそのまま路面に映って、車道が歩道と同じ明るさの
     // 白っぽい板になる**（実際にそうなった）。乾いたアスファルトは
     // ほとんど鏡面反射を持たないので、下げるのが物理的にも正しい。
-    const asphaltMat = surface({ roughness: 0.74, metalness: 0.05, envMapIntensity: 0.14 });
+    // 粗さを 0.74 から上げてある。目線の高さで路面を見ると視線はほぼ水平で、
+    // そこでは鏡面ローブが視線方向に伸びて空をまとめて拾う。
+    // 粗いほどローブが広く薄くなり、ぬらりとした「濡れた板」感が消える。
+    const asphaltMat = surface({ roughness: 0.86, metalness: 0.05, envMapIntensity: 0.14 });
     // 板が地形と同じ高さに来たときの縞を止める。高さのオフセットと二段構えにする。
     asphaltMat.polygonOffset = true;
     asphaltMat.polygonOffsetFactor = -3;
@@ -310,7 +314,21 @@ export class RoadLayer {
     // 骨材の粗さを世界座標のノイズで焼く。目線の高さでは画面の 3〜4 割が路面で、
     // そこが継ぎ目も色ムラも無い一色だとカット全体が未完成に見える。
     // 板ごとに倍率の違う UV は使えないので、シェーダに差し込む（surfaceNoise.ts）。
-    applySurfaceNoise(asphaltMat, { scale: 3.4, color: 0.075, roughness: 0.15, bump: 0.03, fade: 240 });
+    applySurfaceNoise(asphaltMat, {
+      scale: 3.4,
+      // 振れ幅を 0.075 から上げた。空の映り込みを削ったぶん路面が暗くなり、
+      // 同じ振れ幅では見えなくなる（暗い面の 7% は 1 階調も動かない）。
+      color: 0.14,
+      roughness: 0.2,
+      bump: 0.05,
+      fade: 240,
+      // 舗装の打ち継ぎ。4.6m は 1 車線ぶんの敷き幅で、実際の街路も
+      // だいたいこの間隔で継ぎ目が走っている。
+      seam: { spacing: 4.6, width: 0.17, darken: 0.13 },
+      // 路面がファサードより明るいという上下関係の逆転を止める要。
+      // 詳しくは surfaceNoise.ts の specular の説明。
+      specular: 0.2,
+    });
     this.materials.push(asphaltMat);
 
     const plane = new PlaneGeometry(1, 1);
@@ -325,15 +343,25 @@ export class RoadLayer {
     // 舗装より 0.12 だけ粗さを落とし、環境反射は舗装と同じに揃える。
     // ここを 0.5 / 0.42 にしていたときは、轍が車道の大半を覆うぶん
     // 空の映り込みで路面全体が白く飛んだ。
-    const wearMat = surface({ roughness: 0.62, metalness: 0.05, envMapIntensity: 0.16 });
+    const wearMat = surface({ roughness: 0.74, metalness: 0.05, envMapIntensity: 0.14 });
     wearMat.polygonOffset = true;
     wearMat.polygonOffsetFactor = -5;
     wearMat.polygonOffsetUnits = -5;
-    applySurfaceNoise(wearMat, { scale: 2.2, color: 0.07, roughness: 0.16, bump: 0.02, fade: 200 });
+    applySurfaceNoise(wearMat, {
+      scale: 2.2,
+      color: 0.12,
+      roughness: 0.16,
+      bump: 0.02,
+      fade: 200,
+      specular: 0.2,
+    });
     this.materials.push(wearMat);
     this.wear = this.pool(plane.clone(), wearMat, true, 4096);
     // 蓋は鋳鉄。粗さを下げて金属度を上げると、朝夕の低い日射で 1 個だけ光る。
-    const manholeMat = surface({ roughness: 0.5, metalness: 0.45, envMapIntensity: 0.28 });
+    // ただし金属の見えは間接鏡面がほぼすべてなので、遮蔽の無い環境マップだと
+    // 視線が寝たとたんに真っ白な円板になる。舗装を暗くしたぶん目立つので、
+    // 金属度と映り込みを一段落として「錆びた鋳鉄」の側に寄せる。
+    const manholeMat = surface({ roughness: 0.62, metalness: 0.32, envMapIntensity: 0.16 });
     manholeMat.polygonOffset = true;
     manholeMat.polygonOffsetFactor = -7;
     manholeMat.polygonOffsetUnits = -7;
@@ -343,10 +371,24 @@ export class RoadLayer {
     this.manhole = this.pool(disc, manholeMat, true, 2048);
 
     // --- 歩道（縁石・側溝を含む断面）---
-    const walkMat = surface({ roughness: 0.88, metalness: 0.02, vertexColors: true, envMapIntensity: 0.28 });
-    // 歩道も一色の板だった。平板の目地までは作らないが、
-    // 汚れと退色の大きなむらがあるだけで「敷かれた面」に見える。
-    applySurfaceNoise(walkMat, { scale: 2.6, color: 0.07, roughness: 0.1, bump: 0.02, fade: 200 });
+    const walkMat = surface({ roughness: 0.9, metalness: 0.02, vertexColors: true, envMapIntensity: 0.2 });
+    // 歩道も一色の板だった。汚れと退色の大きなむらに加えて、
+    // **平板の目地**を入れる。日本の歩道はほぼインターロッキングか
+    // 30〜60cm の平板で、目線の高さではその目地が真っ先に目に入る
+    // （「歩道も一色」と読まれた最大の理由がこれ）。
+    // 目地は世界座標の格子で引くので、歩道をどう分割して敷いても連続する。
+    applySurfaceNoise(walkMat, {
+      scale: 2.6,
+      color: 0.1,
+      roughness: 0.1,
+      bump: 0.02,
+      fade: 200,
+      seam: { spacing: 0.6, width: 0.06, darken: 0.22 },
+      // 歩道は路面ほど暗くない（コンクリートの反射率は 35% 前後）ので、
+      // 映り込みを削る量も控えめでよい。それでも素のままだと
+      // 目線の高さでファサードより白く飛ぶ。
+      specular: 0.38,
+    });
     this.materials.push(walkMat);
     this.walkway = this.pool(walkwaySectionGeometry(), walkMat, false, 8192);
     this.corner = this.pool(walkwayCornerGeometry(), walkMat, false, 4096);
@@ -362,7 +404,16 @@ export class RoadLayer {
     // 塗料の擦れ。真っ白で均一な標示は、施工直後の数週間しか存在しない。
     // 細かいノイズで濃淡を付けると、横断歩道が「印刷した縞」から
     // 「踏まれて減った塗料」になる。振れ幅は舗装より大きく取る。
-    applySurfaceNoise(markMat, { scale: 1.1, color: 0.19, roughness: 0.06, bump: 0.0, fade: 210 });
+    applySurfaceNoise(markMat, {
+      scale: 1.1,
+      color: 0.22,
+      roughness: 0.06,
+      bump: 0.0,
+      fade: 210,
+      // 標示も路面と同じだけ映り込みを削る。ここだけ素のままにすると、
+      // 舗装を暗くしたぶん白線が相対的に飛んで、擦れの階調が全部潰れる。
+      specular: 0.2,
+    });
     this.materials.push(markMat);
     this.marking = this.pool(plane.clone(), markMat, true, 16384);
     // 俯瞰用の代替（横断歩道 1 か所 = 1 枚）。同じ材質を共有するので描画は 1 増えるだけ。
@@ -562,9 +613,11 @@ export class RoadLayer {
     // 交差点では車の軌跡が散るので敷かない（実物も交差点内に轍は出ない）。
     if (straightNS || straightEW) {
       const alongX = straightEW;
-      // 帯の幅は「中心から 2.2m の車輪跡が車道からはみ出さない」上限で決める。
-      // 生活道路（半幅 3.1m）では 1.8m しか取れない。
-      const width = Math.min(2.3, Math.max(0.8, (half - 2.2) * 2));
+      // 帯の幅。以前は最大 2.3m を 2 本敷いていたが、生活道路（半幅 3.1m、
+      // 車道の全幅 6.2m）だと**車道の 3/4 が轍**になり、轍ではなく
+      // 「舗装より少し明るい別の材質の板」が路面全体を覆っていた。
+      // 実物の轍は車輪の当たる 1m 弱の帯なので、そこまで絞る。
+      const width = Math.min(1.25, Math.max(0.7, (half - 2.2) * 2));
       this.color.setHex(RUT_COLOR);
       for (let k = -1; k <= 1; k += 2) {
         const off = k * 2.2;
@@ -579,6 +632,30 @@ export class RoadLayer {
           this.color,
         );
       }
+
+      /**
+       * 轍と轍のあいだの「クラウン」。
+       *
+       * 車輪が通らない中央の帯には、砂と細かい砂利が吹き寄せられて溜まる。
+       * 轍とは逆に、周りより**明るく粗い**のが実物の見え方。
+       *
+       * ここを足したのは絵の都合が半分ある。目線のカットでは、車道の両側は
+       * 走っている車と停まっている車で埋まっていて、**画面に映る路面は
+       * 中央の帯だけ**になる。轍もマンホールも車輪の位置に置いてあるので、
+       * いちばん見える場所にだけ何も無い、という状態になっていた。
+       */
+      const crown = Math.min(2.0, Math.max(0.6, 4.4 - width * 2));
+      this.color.setHex(CROWN_COLOR).multiplyScalar(0.94 + ((h >>> 5) % 13) / 100);
+      this.place(
+        this.wear,
+        cx,
+        y,
+        cz,
+        alongX ? TILE_M : crown,
+        alongX ? crown : TILE_M,
+        0,
+        this.color,
+      );
     }
 
     // --- 補修跡 ---
@@ -598,7 +675,14 @@ export class RoadLayer {
     // タイルのハッシュで位相を散らす。
     if ((h >>> 3) % 3 === 1) {
       const side = (h >>> 9) % 2 === 0 ? 1 : -1;
-      const lat = Math.min(half - 0.7, 1.5 + ((h >>> 13) % 14) / 10);
+      // 3 個に 1 個はセンターライン上に置く。日本の生活道路の下水本管は
+      // 道路の中心を通っていることが多く、蓋も中央に並ぶ。
+      // 絵の都合もあって、目線の高さで見えている路面は中央の帯だけなので、
+      // 全部を路肩寄りに置くと蓋が 1 枚も画面に入らない。
+      const centred = (h >>> 27) % 3 === 0;
+      const lat = centred
+        ? ((h >>> 13) % 7) / 20
+        : Math.min(half - 0.7, 1.5 + ((h >>> 13) % 14) / 10);
       const alongOff = ((((h >>> 15) % 100) / 100 - 0.5) * TILE_M * 0.7);
       const vertical = straightNS || (!straightEW && degree >= JUNCTION_DEGREE);
       const size = 0.62 + ((h >>> 19) % 10) / 40;
