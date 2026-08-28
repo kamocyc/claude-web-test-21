@@ -180,7 +180,11 @@ void facadeShade(vec3 base) {
       // 陸屋根の面は、壁の色に関係なく防水シートの灰緑に固定する。
       // 壁色をそのまま薄くすると、俯瞰したときに街が「白い板の集合」に見える。
       vec3 deck = vec3(0.108, 0.115, 0.108) * (0.88 + 0.24 * h21(floor(vLocalM.xz * 0.35) + 3.0));
-      gTint = deck / max(base, vec3(0.05));
+      // 防水シートの継ぎ目。屋上は俯瞰でいちばん長く見える面なので、
+      // 薄い格子が 1 枚入るだけで「塗りつぶした板」から抜けられる。
+      vec2 gp = vLocalM.xz / 1.9;
+      float joint = max(bandAA(fract(gp.x), 0.0, 0.05, fwidth(gp.x)), bandAA(fract(gp.y), 0.0, 0.05, fwidth(gp.y)));
+      gTint = deck * (1.0 - joint * 0.16) / max(base, vec3(0.05));
     } else {
       gTint = vec3(0.38);
     }
@@ -222,6 +226,9 @@ void facadeShade(vec3 base) {
 
   float cell = h21(vec2(fxi, fyi) + sideSeed);
   float cell2 = h21(vec2(fxi, fyi) + sideSeed + 57.0);
+  // 1 セルが 1 画素より小さくなったら、部屋ごとのばらつきは平均に寄せる。
+  // 寄せずに step のまま描くと、隣り合う画素が別の部屋を引いて画面が砂嵐になる。
+  float cellFade = clamp(max(wx, wy) * 1.6 - 0.2, 0.0, 1.0);
 
   float x0 = 0.18, x1 = 0.82, y0 = 0.26, y1 = 0.78;
   // 灯りの範囲。窓と別に持つ（バルコニーの手すりの裏は光らない）。
@@ -275,7 +282,7 @@ void facadeShade(vec3 base) {
       // 1 階は全面ガラスの売り場。夜はここが一番強く光る。
       x0 = 0.04; x1 = 0.96; y0 = 0.10; y1 = 0.86;
       lx0 = 0.08; lx1 = 0.92; ly0 = 0.16; ly1 = 0.72;
-      litRate = 0.9; glow = 1.7;
+      litRate = 0.9; glow = 1.35;
       litCol = vec3(1.0, 0.92, 0.74);
       glassCol = vec3(0.26, 0.28, 0.30);
       glassRough = 0.07; glassMetal = 0.55;
@@ -347,9 +354,10 @@ void facadeShade(vec3 base) {
   // 部屋ごとにカーテンの有無を散らす。全部が同じ暗いガラスだと
   // 「黒い板がびっしり貼られた壁」に見えて、人の住んでいる気配が出ない。
   vec3 curtain = mix(vec3(0.46, 0.44, 0.40), vec3(0.30, 0.31, 0.33), step(0.5, cell2));
-  glassCol = mix(glassCol, curtain, step(cell2, 0.38));
+  float hasCurtain = mix(step(cell2, 0.38), 0.38, cellFade);
+  glassCol = mix(glassCol, curtain, hasCurtain);
   gRough = mix(wallRough, glassRough, win);
-  gMetal = mix(wallMetal, mix(glassMetal, glassMetal * 0.4, step(cell2, 0.38)), win);
+  gMetal = mix(wallMetal, mix(glassMetal, glassMetal * 0.4, hasCurtain), win);
   gTint = mix(vec3(1.0 + extra), glassCol / max(base, vec3(0.02)), win);
   gTint *= 1.0 + max(frame, 0.0) * 0.12 + sill * 0.14 - slabLine * 0.10;
   gTint *= 1.0 - reveal * 0.34;
@@ -363,8 +371,6 @@ void facadeShade(vec3 base) {
   //
   // 遠景では 1 セルが 1 画素より小さくなる。そこで step のまま描くと
   // 点いた窓・消えた窓がカメラの僅かな動きで入れ替わり、街全体がちらつく。
-  // セルが潰れるほど「平均の点灯率」に寄せると、遠くは滑らかな光の面になる。
-  float cellFade = clamp(max(wx, wy) * 1.6 - 0.2, 0.0, 1.0);
   float lit = mix(step(cell, litRate), litRate, cellFade) * uNight;
   // 部屋ごとに明るさを散らす。全部同じ輝度だと LED パネルに見える。
   lit *= 0.45 + 0.9 * h21(vec2(fxi, fyi) + sideSeed + 91.0);

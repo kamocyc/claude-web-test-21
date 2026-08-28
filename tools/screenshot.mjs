@@ -87,7 +87,7 @@ try {
   await page.goto(base + '?start=sample&seed=42&fx=high', { waitUntil: 'load' });
   await page.waitForFunction(() => window.__game != null, null, { timeout: 180000 });
   // 街の生成直後は建物・車のインスタンスがまだ 1 フレームも書かれていない
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(4000);
 
   for (const shot of SHOTS) {
     if (only && !only.split(',').includes(shot.name.replace(/^\d+-/, '')) && !only.split(',').includes(shot.name)) continue;
@@ -104,8 +104,11 @@ try {
       g.sim.clock.tick += ((want - cur) + perDay) % perDay;
     }, shot);
     // 数フレーム回して補間・インスタンス更新を落ち着かせる
-    await page.waitForTimeout(900);
-    await page.screenshot({ path: resolve(outDir, shot.name + '.png') });
+    // ソフトウェア描画（CI やコンテナ）では 1 フレーム 1 秒近くかかる。
+    // 待ちと撮影のタイムアウトを実測より十分長く取っておかないと、
+    // ポストエフェクトの掛かっていない途中の絵が撮れてしまう。
+    await page.waitForTimeout(3000);
+    await page.screenshot({ path: resolve(outDir, shot.name + '.png'), timeout: 180000 });
     const stats = await page.evaluate(() => ({
       drawCalls: window.__game.renderer.drawCalls,
       tris: undefined,

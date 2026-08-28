@@ -135,7 +135,7 @@ function rooftop(
   const inner = 0.5 - Math.min(0.18, 2.2 / Math.max(w, d));
 
   // 塔屋（階段室）。高さのある建物ほど確実に載る。
-  if (r0 < 0.75) {
+  if (r0 < 0.82) {
     const sw = Math.min(w * 0.34, 5.2);
     const sd = Math.min(d * 0.34, 4.4);
     const sx = x + (r1 - 0.5) * (w - sw) * 0.7;
@@ -159,7 +159,7 @@ function rooftop(
     );
   }
   // 空調室外機。小さいものを何台か並べると、それらしい雑然さが出る。
-  const units = 1 + Math.floor(r2 * 2);
+  const units = 2 + Math.floor(r2 * 2);
   for (let i = 0; i < units; i++) {
     const rx = rnd(hash, salt + 10 + i);
     const rz = rnd(hash, salt + 20 + i);
@@ -565,7 +565,7 @@ function konbini(ctx: BuildCtx): void {
   // 軒先の看板帯。まわりの建物より一段明るく光らせる。
   const sx = cx + FX[f]! * (dist + 0.12);
   const sz = cz + FZ[f]! * (dist + 0.12);
-  e.sign(sx, gy + H - 1.2, sz, f % 2 === 0 ? len * 0.94 : 0.3, 0.95, f % 2 === 0 ? 0.3 : len * 0.94, 0x2f8f4f, 0.2, 3.0);
+  e.sign(sx, gy + H - 1.2, sz, f % 2 === 0 ? len * 0.94 : 0.3, 0.95, f % 2 === 0 ? 0.3 : len * 0.94, 0x2f8f4f, 0.2, 2.3);
   // パラペットと庇
   rooftop(ctx, cx, cz, gy + H, w, d, 60, { parapet: 0.75, clutter: 1 });
   awning(ctx, gy + H - 2.4, 1.5, 0xe8e8e4, 0.98);
@@ -588,7 +588,7 @@ function konbini(ctx: BuildCtx): void {
   const lx = cx + FX[f]! * (dist + 7.2) + (f % 2 === 0 ? len * 0.4 : 0);
   const lz = cz + FZ[f]! * (dist + 7.2) + (f % 2 === 0 ? 0 : len * 0.4);
   e.box(lx, gy, lz, 0.18, 5.4, 0.18, 0xb4b8ba, 0.4, 0.6);
-  e.sign(lx, gy + 5.4, lz, 1.9, 1.2, 0.3, 0xffffff, 0.25, 3.2, faceRot(f));
+  e.sign(lx, gy + 5.4, lz, 1.9, 1.2, 0.3, 0xffffff, 0.25, 2.4, faceRot(f));
 }
 
 /** 商店街。間口の狭い店が軒を連ね、通りに面してアーケードの庇と幟が並ぶ。 */
