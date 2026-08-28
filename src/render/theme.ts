@@ -168,12 +168,54 @@ const style = (o: Partial<MeshStyle> & { walls: number[] }): MeshStyle => ({
   ...o,
 });
 
-/** 日本の住宅でよく見る外壁（サイディング・モルタル）の色。 */
-const HOUSE_WALLS = [0xd8ccb0, 0xc9c0a4, 0xbfbcb0, 0xd4c39c, 0xb0bcc0, 0xc6b294, 0xdcd6c4, 0xa89c88, 0xbfa88c];
-/** 瓦・スレートの色。 */
-const HOUSE_ROOFS = [0x5a6670, 0x4b555e, 0x6b5f4e, 0x3e4952, 0x776a58, 0x8a6a52];
+/**
+ * 日本の住宅でよく見る外壁（サイディング・モルタル）の色。
+ *
+ * 候補は多いほどよい。ここから 1 つ選んだあと `buildingLayer` が
+ * 色相 ±8°・明度 ±12%・彩度 ±20% を棟ハッシュで散らすので、
+ * 実際に街に出る色は候補数 × ハッシュのぶんだけある。
+ * 候補が数個しかないと、散らしても「元の色のグループ」が目で読めてしまう。
+ */
+const HOUSE_WALLS = [
+  0xd8ccb0, 0xc9c0a4, 0xbfbcb0, 0xd4c39c, 0xb0bcc0, 0xc6b294, 0xdcd6c4, 0xa89c88, 0xbfa88c,
+  0xe0dcd2, 0xc8ccc2, 0xb8a898, 0xd0b8a0, 0xa8b09c, 0xcfc0b4, 0xbcae9e, 0xd6cec0, 0x9aa4a2,
+  // 濃いサイディング（灰・こげ茶・紺鼠）。明るい色ばかりだと住宅地が
+  // 「白い箱の反復」に見える。全体の 2 割ほど濃い壁が混ざるだけで密度が出る。
+  0x8f8a80, 0x9c8f7c, 0x7f8a8e, 0x8a7f74,
+];
+/**
+ * 屋根の色。
+ *
+ * 青灰のスレートだけにすると、住宅地を拡大したときに
+ * 「青灰色の切妻＋白い壁」がグリッド上に反復しているのが露骨に読める。
+ * 日本の屋根は実際には 4 系統が混ざっているので、それぞれを候補に入れる。
+ * 先頭 8 つがスレート（約 57%）、以降がセメント瓦・和瓦・トタンで各 14% 前後。
+ */
+const HOUSE_ROOFS = [
+  // 化粧スレート（青灰〜灰）
+  0x5a6670, 0x4e5459, 0x3e4952, 0x546069, 0x646e78, 0x49535c, 0x5f6a6e, 0x464b4d,
+  // セメント瓦（茶灰）
+  0x6b5f4e, 0x776a58,
+  // 和瓦（銀黒・いぶし）
+  0x3a3e44, 0x2f333a,
+  // トタン（緑・赤錆）
+  0x4a6b52, 0x7a4f3e,
+];
+
+/**
+ * 金属葺き（トタン）の屋根色。
+ * 瓦やスレートより光るので、粗さと金属度を分けて渡す。
+ * 同じ形の切妻でも、鈍く光る屋根が 1 割混ざるだけで街のざらつきが変わる。
+ */
+export const TIN_ROOFS = new Set([0x4a6b52, 0x7a4f3e]);
 /** コンクリート・タイル貼りの中高層。 */
-const RC_WALLS = [0xc6bca4, 0xb6ae9c, 0xcfc9ba, 0xa8b0b0, 0xbdae92, 0xc8c4bc, 0x9c968a, 0xb8a894];
+const RC_WALLS = [
+  0xc6bca4, 0xb6ae9c, 0xcfc9ba, 0xa8b0b0, 0xbdae92, 0xc8c4bc, 0x9c968a, 0xb8a894,
+  0xd2ccc0, 0xaeb6b8, 0xc0b09a, 0xd6d0c4, 0xa4a09a, 0xbec6c6, 0xcab89e, 0xb0a08e,
+  // 濃いタイル貼り。明るいコンクリートばかりだと、中層の街区が
+  // 「淡青灰とクリームの 2 色」に見えてしまう。
+  0x8f8b82, 0x7f8a90, 0x9a8a76, 0x8a9490,
+];
 
 export const MESH_STYLES: Record<string, MeshStyle> = {
   // ---- 住宅 ----
@@ -190,7 +232,11 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     variants: 4,
   }),
   apartment: style({
-    walls: [0xd2c8ac, 0xc4ba9c, 0xd8d2c0, 0xb6bcb8, 0xc8b494, 0xbaa88c],
+    walls: [
+      0xd2c8ac, 0xc4ba9c, 0xd8d2c0, 0xb6bcb8, 0xc8b494, 0xbaa88c,
+      0xdcd8cc, 0xaeb4ae, 0xcbb8a4, 0xc0c4c0, 0xd4c0a8, 0xa8a094,
+      0x9c968c, 0x8fa0a4, 0x9a8f80,
+    ],
     roofs: HOUSE_ROOFS,
     facade: Facade.Residential,
     floorH: 2.85,
@@ -214,7 +260,7 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     variants: 3,
   }),
   tower: style({
-    walls: [0xc8ccd2, 0xbfc6ce, 0xd2d6da],
+    walls: [0xc8ccd2, 0xbfc6ce, 0xd2d6da, 0xb4bcc6, 0xdcdee0, 0xc0c8c4, 0xcac4ba],
     roofs: [0x9aa0a8],
     facade: Facade.Curtain,
     floorH: 3.2,
@@ -239,7 +285,10 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     variants: 2,
   }),
   shotengai: style({
-    walls: [0xdcc4a0, 0xcfbca4, 0xe0d4bc, 0xc2b096, 0xd4bd94, 0xb8a894],
+    walls: [
+      0xdcc4a0, 0xcfbca4, 0xe0d4bc, 0xc2b096, 0xd4bd94, 0xb8a894,
+      0xc8b8a8, 0xd8cbb0, 0xb0a894, 0xcfc2ae, 0xc4a888, 0xe2dac8,
+    ],
     roofs: [0x9c6f56, 0x7d6a56, 0x5e6a72, 0x8a7a5e],
     facade: Facade.Shop,
     floorH: 3.1,
@@ -263,7 +312,10 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     variants: 2,
   }),
   zakkyo: style({
-    walls: [0xc4bcaa, 0xb0aa9c, 0xccc6b8, 0xa4aeb2, 0xbcac90, 0x94989a, 0xc0a88c],
+    walls: [
+      0xc4bcaa, 0xb0aa9c, 0xccc6b8, 0xa4aeb2, 0xbcac90, 0x94989a, 0xc0a88c,
+      0xd2ccbe, 0x9ea6a8, 0xb8b0a0, 0xc8bca8, 0xa89c8c, 0xbec4c2, 0xd0c0a8,
+    ],
     roofs: [0xa8a49b],
     facade: Facade.Shop,
     floorH: 3.3,
@@ -275,7 +327,9 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     variants: 3,
   }),
   office: style({
-    walls: [0xa9b4c0, 0xb4bcc4, 0x9ea8b2],
+    walls: [
+      0xa9b4c0, 0xb4bcc4, 0x9ea8b2, 0xc0c4c4, 0x8f9aa4, 0xb8b4ac, 0xa4aa9e, 0xcac6bc,
+    ],
     roofs: [0x99a3ad],
     facade: Facade.Curtain,
     floorH: 3.6,

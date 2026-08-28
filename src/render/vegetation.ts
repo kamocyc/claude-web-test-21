@@ -99,6 +99,28 @@ function blob(seed: number, radius = 1): BufferGeometry {
   return g;
 }
 
+/**
+ * 冬の落葉樹の「枝の塊」の色。
+ *
+ * 葉ではなく細枝の集合なので、緑でも茶でもない灰褐色になる。
+ * 幹（TRUNK_BROADLEAF / TRUNK_CONIFER）より彩度を落としてあるのが肝で、
+ * ここに赤みが残ると遠景で「赤い粒」に戻る。
+ *
+ * ただし**無彩色にすると朝夕にかえって赤くなる**。橙の日射（0xff9a5e）が
+ * そのまま乗るためで、灰色は光の色をいちばん素直に返してしまう。
+ * 針葉樹の樹冠が朝でも赤く見えないのは、緑の albedo が橙の R を
+ * 押し戻しているから。同じ理屈で、枝の塊にもわずかに緑を残して
+ * 明度を落としてある。冬の雑木林を遠くから見た色は実際にもこの辺り。
+ */
+const TWIG_MASS = 0x4a5040;
+
+/** 冬の枝の塊の [x, y, z, 半径]。夏の樹冠よりひと回り小さく、まばらに散らす。 */
+const WINTER_MASS: [number, number, number, number][] = [
+  [0, 0.68, 0, 0.3],
+  [0.15, 0.58, 0.06, 0.23],
+  [-0.12, 0.62, -0.1, 0.21],
+];
+
 /** 樹冠パレットから t (0..1) の色を取り出す。個体ごとの明暗差になる。 */
 function canopyColor(p: CanopyPalette, t: number): number {
   return mixHex(p.dark, p.light, t).getHex();
@@ -111,11 +133,13 @@ function canopyColor(p: CanopyPalette, t: number): number {
  * 輪郭に「節」が出ることで、これがあると遠景でも杉林に見える。
  * 幹は樹冠の上に少しだけ突き出す（杉の梢の特徴）。
  */
-export function coniferGeometry(season: number, shade: number): BufferGeometry {
+export function coniferGeometry(season: number, shade: number, noTrunk = false): BufferGeometry {
   const pal = CONIFER_SEASON[season] ?? CONIFER_SEASON[1]!;
-  const parts: Part[] = [
-    { geom: stem(0.03, 0.008, 1.0, 5), color: TRUNK_CONIFER, matrix: at(0, 0, 0) },
-  ];
+  const parts: Part[] = [];
+  // 遠景（LOD）では幹を落とす。杉皮の赤茶 (TRUNK_CONIFER) は樹冠の緑と補色に近く、
+  // 1〜2px に潰れると「緑の点に混じった赤い点」としてだけ残る。
+  // 幹は樹冠に隠れて見えていないのだから、遠くでは無いほうが正しい。
+  if (!noTrunk) parts.push({ geom: stem(0.03, 0.008, 1.0, 5), color: TRUNK_CONIFER, matrix: at(0, 0, 0) });
   // 段ごとの [高さ位置, 半径, 段の高さ]。上に行くほど詰まる。
   const tiers: [number, number, number][] = [
     [0.22, 0.27, 0.34],
@@ -142,12 +166,19 @@ export function coniferGeometry(season: number, shade: number): BufferGeometry {
  * 左右対称にすると途端に「アイスクリーム」になる。
  * `branched` を立てると枝を 2 本出す（街路樹・単木として見せるとき）。
  */
-export function broadleafGeometry(season: number, shade: number, branched: boolean, bare: boolean): BufferGeometry {
+export function broadleafGeometry(
+  season: number,
+  shade: number,
+  branched: boolean,
+  bare: boolean,
+  noTrunk = false,
+): BufferGeometry {
   const pal = BROADLEAF_SEASON[season] ?? BROADLEAF_SEASON[1]!;
   const seed = Math.round(shade * 97) + (branched ? 500 : 0);
-  const parts: Part[] = [
-    { geom: stem(0.05, 0.028, bare ? 0.5 : 0.44, 5), color: TRUNK_BROADLEAF, matrix: at(0, 0, 0) },
-  ];
+  const parts: Part[] = [];
+  if (!noTrunk) {
+    parts.push({ geom: stem(0.05, 0.028, bare ? 0.5 : 0.44, 5), color: TRUNK_BROADLEAF, matrix: at(0, 0, 0) });
+  }
 
   if (bare) {
     /**
@@ -156,35 +187,54 @@ export function broadleafGeometry(season: number, shade: number, branched: boole
      * ここを「小さく平たい樹冠」で済ませると、細い柄の上に傘が乗った
      * キノコにしかならない（実際にそうなった）。葉が落ちた木の輪郭を
      * 決めているのは樹冠ではなく**枝の骨格**なので、太い枝を上向きに
-     * 4 本出し、その先に小枝を足す。葉は残っていないので樹冠は置かない。
+     * 4 本出し、その先に小枝を足す。
+     *
+     * ただし枝だけにすると、俯瞰で木が 1〜2px に潰れたときに
+     * **茶色い幹の色だけが点として残る**。冬の田園一面にそれが並ぶと、
+     * 木ではなく「暗赤〜橙の粒が数千個散らばった不具合」に見えていた。
+     * 実際の冬の落葉樹も、遠目には枝と小枝が絡んだ**灰茶の塊**として見える
+     * （枝の 1 本 1 本が分離して見えるのは近くだけ）。
+     * そこで枝の上に、その灰茶色の「枝の塊」を樹冠として重ねる。
+     * 近景では枝の骨格が塊を突き抜けて見えるので、キノコにはならない。
      */
     for (let i = 0; i < 4; i++) {
       const a = (i / 4) * Math.PI * 2 + seed * 0.7;
       const tilt = 0.5 + hash2(seed + i, 3) * 0.25;
       const len = 0.34 + hash2(seed + i, 11) * 0.14;
+      if (!noTrunk) {
+        parts.push({
+          geom: stem(0.026, 0.011, len, 4),
+          color: TRUNK_BROADLEAF,
+          matrix: at(0, 0.42, 0, Math.sin(a) * tilt, 0, -Math.cos(a) * tilt),
+        });
+        // 小枝。先端の細かい分岐が無いと「フォーク」に見える。
+        parts.push({
+          geom: stem(0.014, 0.006, len * 0.62, 3),
+          color: TWIG_MASS,
+          matrix: at(
+            Math.cos(a) * len * 0.55,
+            0.42 + len * 0.78,
+            Math.sin(a) * len * 0.55,
+            Math.sin(a) * tilt * 0.6,
+            0,
+            -Math.cos(a) * tilt * 0.6,
+          ),
+        });
+      }
+    }
+    for (let i = 0; i < WINTER_MASS.length; i++) {
+      const [bx, by, bz, r] = WINTER_MASS[i]!;
       parts.push({
-        geom: stem(0.026, 0.011, len, 4),
-        color: TRUNK_BROADLEAF,
-        matrix: at(0, 0.42, 0, Math.sin(a) * tilt, 0, -Math.cos(a) * tilt),
-      });
-      // 小枝。先端の細かい分岐が無いと「フォーク」に見える。
-      parts.push({
-        geom: stem(0.014, 0.006, len * 0.62, 3),
-        color: canopyColor(pal, Math.min(1, shade + 0.2)),
-        matrix: at(
-          Math.cos(a) * len * 0.55,
-          0.42 + len * 0.78,
-          Math.sin(a) * len * 0.55,
-          Math.sin(a) * tilt * 0.6,
-          0,
-          -Math.cos(a) * tilt * 0.6,
-        ),
+        geom: blob(seed + i * 13 + 7, 1),
+        // 上の塊ほどわずかに明るく、灰緑に寄せる（日が当たる面）。
+        color: mixHex(TWIG_MASS, 0x6a7060, i * 0.22).getHex(),
+        matrix: at(bx, by, bz, 0, i * 1.1, 0, 1).scale(v.set(r, r * 0.82, r)),
       });
     }
     return finish(parts);
   }
 
-  if (branched) {
+  if (branched && !noTrunk) {
     // 枝は幹の途中から左右へ。角度を変えて 2 本だけ出す。
     parts.push({
       geom: stem(0.026, 0.012, 0.3, 4),
@@ -220,32 +270,45 @@ export function broadleafGeometry(season: number, shade: number, branched: boole
  * 根元に土のマス（植樹枡）を付けると、歩道に「置いてある」のではなく
  * 「植わっている」ように見える。
  */
-export function streetTreeGeometry(season: number, shade: number): BufferGeometry {
+export function streetTreeGeometry(season: number, shade: number, noTrunk = false): BufferGeometry {
   const pal = STREET_TREE_SEASON[season] ?? STREET_TREE_SEASON[1]!;
   const bare = season === 3; // 冬（Season.Winter）は落葉
   const seed = Math.round(shade * 61) + 900;
-  const parts: Part[] = [
+  const parts: Part[] = [];
+  if (!noTrunk) {
     // 植樹枡
-    { geom: boxGeom(0.42, 0.05, 0.42), color: GROUND.soil, matrix: at(0, 0, 0) },
-    { geom: stem(0.055, 0.038, 0.5, 6), color: TRUNK_BROADLEAF, matrix: at(0, 0.02, 0) },
-  ];
-  for (let i = 0; i < 3; i++) {
-    const a = (i / 3) * Math.PI * 2 + 0.4;
-    parts.push({
-      geom: stem(0.024, 0.012, 0.26, 4),
-      color: TRUNK_BROADLEAF,
-      matrix: at(0, 0.42, 0, Math.sin(a) * 0.5, 0, Math.cos(a) * 0.5),
-    });
+    parts.push({ geom: boxGeom(0.42, 0.05, 0.42), color: GROUND.soil, matrix: at(0, 0, 0) });
+    parts.push({ geom: stem(0.055, 0.038, 0.5, 6), color: TRUNK_BROADLEAF, matrix: at(0, 0.02, 0) });
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * Math.PI * 2 + 0.4;
+      parts.push({
+        geom: stem(0.024, 0.012, 0.26, 4),
+        color: TRUNK_BROADLEAF,
+        matrix: at(0, 0.42, 0, Math.sin(a) * 0.5, 0, Math.cos(a) * 0.5),
+      });
+    }
   }
   if (bare) {
     // 冬の街路樹は強剪定されていて、太い枝が数本上を向いているだけになる。
     // 日本の冬の並木の、あの「拳のような」形。
-    for (let i = 0; i < 4; i++) {
-      const a = (i / 4) * Math.PI * 2 + 0.8;
+    if (!noTrunk) {
+      for (let i = 0; i < 4; i++) {
+        const a = (i / 4) * Math.PI * 2 + 0.8;
+        parts.push({
+          geom: stem(0.02, 0.009, 0.22, 3),
+          color: canopyColor(pal, 0.5),
+          matrix: at(0, 0.6, 0, Math.sin(a) * 0.55, 0, -Math.cos(a) * 0.55),
+        });
+      }
+    }
+    // 街路樹も遠景では枝が消えて幹色の点だけが残るので、
+    // 自然木と同じ「枝の塊」を小さめに乗せる。
+    for (let i = 0; i < 2; i++) {
+      const [bx, by, bz, r] = WINTER_MASS[i]!;
       parts.push({
-        geom: stem(0.02, 0.009, 0.22, 3),
-        color: canopyColor(pal, 0.5),
-        matrix: at(0, 0.6, 0, Math.sin(a) * 0.55, 0, -Math.cos(a) * 0.55),
+        geom: blob(seed + i * 5, 1),
+        color: mixHex(TWIG_MASS, 0x6a7060, i * 0.25).getHex(),
+        matrix: at(bx, by * 0.95, bz, 0, i * 1.4, 0, 1).scale(v.set(r * 0.8, r * 0.68, r * 0.8)),
       });
     }
   } else {

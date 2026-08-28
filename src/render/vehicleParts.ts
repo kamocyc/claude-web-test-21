@@ -1,6 +1,7 @@
 import { BufferAttribute, BufferGeometry, Color } from 'three';
 import { TRAIN_CAR_LENGTH_M } from '@shared/constants';
 import { applyVerticalAO, mergeParts, type Part } from './materials';
+import { GLASS_ATTRIBUTE } from './agentMaterial';
 import { boxes, prism, strut, wheel, type BoxSpec } from './parts';
 
 /**
@@ -144,9 +145,38 @@ function mirrors(x: number, y: number, z: number): BoxSpec[] {
   ];
 }
 
-/** 車体を組んで焼き固める。接地部を落として影を足元に溜める。 */
+/**
+ * 車体を組んで焼き固める。接地部を落として影を足元に溜める。
+ *
+ * このとき **ガラスの部品だけを後ろにまとめて焼き、頂点属性 `aGlass` で
+ * 印を付ける**。窓は頂点カラー（＝車体色との掛け算）で塗ると、黒い車で
+ * RGB がほぼ 0 に潰れて「黒い天蓋」になってしまう。ガラスは空を映すものなので
+ * 車体色から切り離す必要があるが、別メッシュに割るとドローコールが車種ぶん増える。
+ * 印さえ付いていればシェーダ側で塗り分けられる（`agentMaterial.ts`）。
+ */
 function bake(parts: Part[]): BufferGeometry {
-  const g = mergeParts(parts);
+  const solidParts = parts.filter((p) => p.color !== GLASS);
+  const glassParts = parts.filter((p) => p.color === GLASS);
+  let g: BufferGeometry;
+  if (glassParts.length === 0) {
+    g = mergeParts(solidParts);
+    g.setAttribute(
+      GLASS_ATTRIBUTE,
+      new BufferAttribute(new Float32Array(g.getAttribute('position').count), 1),
+    );
+  } else {
+    // 焼く順番がそのまま頂点の並びになるので、前半＝不透明・後半＝ガラスで印を割れる。
+    const solid = mergeParts(solidParts);
+    const glass = mergeParts(glassParts);
+    const nSolid = solid.getAttribute('position').count;
+    const nGlass = glass.getAttribute('position').count;
+    g = mergeParts([{ geom: solid }, { geom: glass }]);
+    solid.dispose();
+    glass.dispose();
+    const mark = new Float32Array(nSolid + nGlass);
+    mark.fill(1, nSolid);
+    g.setAttribute(GLASS_ATTRIBUTE, new BufferAttribute(mark, 1));
+  }
   // 下ほど暗くする。車の下は実際に影になるので、これだけで「浮き」が消える。
   applyVerticalAO(g, 0.62, 1.06, 1.5);
   return g;
@@ -249,6 +279,14 @@ const CAR_BUILDERS: Record<CarKind, () => Part[]> = {
 
 export function carGeometry(kind: CarKind): BufferGeometry {
   return bake(CAR_BUILDERS[kind]());
+}
+
+/**
+ * 車種ごとの全幅の半分 (m)。
+ * 路肩に寄せて停めるとき、縁石までの距離をこれで決める（`agentLayer`）。
+ */
+export function carHalfWidth(kind: CarKind): number {
+  return CAR_SPECS[kind].width / 2;
 }
 
 /**

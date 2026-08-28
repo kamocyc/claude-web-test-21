@@ -38,6 +38,18 @@ function faceRot(f: Facing): number {
   return (f * Math.PI) / 2;
 }
 
+/**
+ * 看板を置くときの Y 回転。
+ * 看板キットは「板の裏（+Z）に取付アームが伸びている」向きで焼いてあるので、
+ * 面の向きから半回転ずらして、アームが壁の側を向くようにする。
+ */
+function signRot(f: Facing): number {
+  return (f * Math.PI) / 2 + Math.PI;
+}
+
+/** 看板のアクセント色。原色のべた塗りをやめ、白地に載る色として選んである。 */
+const SIGN_ACCENTS = [0xc4463a, 0xcf8a2a, 0x2f6fa8, 0x4a7a4a, 0x6a4f8f, 0x2f8f6a, 0xb03a6a];
+
 /** ハッシュから 0..1 を引く。salt を変えれば独立した値になる。 */
 export function rnd(hash: number, salt: number): number {
   let x = (hash ^ Math.imul(salt, 0x9e3779b1)) >>> 0;
@@ -71,6 +83,9 @@ export interface BuildCtx {
   /** 個体ごとの壁色。 */
   wall: Color;
   roof: Color;
+  /** 屋根の質感。金属葺き（トタン）だけ粗さを落として鈍く光らせる。 */
+  roofRough: number;
+  roofMetal: number;
 }
 
 const tmpA = new Color();
@@ -132,48 +147,83 @@ function rooftop(
   const r0 = rnd(hash, salt);
   const r1 = rnd(hash, salt + 1);
   const r2 = rnd(hash, salt + 2);
+  const r3 = rnd(hash, salt + 3);
+  const r4 = rnd(hash, salt + 4);
   const inner = 0.5 - Math.min(0.18, 2.2 / Math.max(w, d));
+  const px = (r: number): number => x + (r - 0.5) * w * inner * 1.8;
+  const pz = (r: number): number => z + (r - 0.5) * d * inner * 1.8;
+  /**
+   * 設備の大きさのばらつき（0.6〜1.8 倍）。
+   * これを入れないと、屋上が「同じ大きさの白い立方体を並べた角砂糖」になる。
+   * 実際の屋上は 1 台 40cm のパッケージから 3m の高置水槽まで大きさが揃っていない。
+   */
+  const vary = (r: number): number => 0.6 + r * 1.2;
+
+  // 落下防止柵。パラペットの天端に回す。
+  // 屋上の縁に「透けた線」が 1 本入るだけで、平らな灰色の面に厚みが出る。
+  const railH = 1.0 + r3 * 0.35;
+  const bigRoof = Math.min(w, d) > 9;
+  if (r3 > 0.28 && Math.min(w, d) > 5.5) {
+    for (const s of [-1, 1]) {
+      e.railFrame(x, topY + ph, z + s * (d / 2 - t * 1.2), w - t * 2, railH);
+      if (bigRoof) {
+        e.railFrame(x + s * (w / 2 - t * 1.2), topY + ph, z, d - t * 2, railH, Math.PI / 2);
+      }
+    }
+  }
 
   // 塔屋（階段室）。高さのある建物ほど確実に載る。
   if (r0 < 0.82) {
-    const sw = Math.min(w * 0.34, 5.2);
-    const sd = Math.min(d * 0.34, 4.4);
+    const k = 0.75 + r4 * 0.7;
+    const sw = Math.min(w * 0.34 * k, 5.6);
+    const sd = Math.min(d * 0.34 * k, 4.8);
+    const sh = 2.4 + r4 * 1.4;
     const sx = x + (r1 - 0.5) * (w - sw) * 0.7;
     const sz = z + (r2 - 0.5) * (d - sd) * 0.7;
     tmpB.copy(ctx.wall).multiplyScalar(0.9);
-    e.box(sx, topY, sz, sw, 2.7, sd, tmpB, 0.88, 0.04);
+    e.box(sx, topY, sz, sw, sh, sd, tmpB, 0.88, 0.04);
     // 塔屋の屋根の縁
-    e.box(sx, topY + 2.7, sz, sw + 0.3, 0.16, sd + 0.3, tmpA, 0.9, 0.03);
+    e.box(sx, topY + sh, sz, sw + 0.3, 0.16, sd + 0.3, tmpA, 0.9, 0.03);
+    // 出入口の鉄扉。面のどこかに 1 枚暗い矩形があると、大きさの見当が付く。
+    e.box(sx, topY + 0.05, sz + sd / 2, 0.95, 2.0, 0.1, 0x6e7276, 0.55, 0.45);
   }
-  // 受水槽
-  if (r1 < 0.55) {
-    const tw = Math.min(w * 0.26, 3.4);
-    e.tank(
-      x + (r2 - 0.5) * w * inner * 1.6,
-      topY,
-      z - (r0 - 0.5) * d * inner * 1.6,
-      tw,
-      Math.max(2.0, tw * 0.9),
-      tw * 0.8,
-      0xa8aca6,
-    );
+  // 架台付きの高置水槽
+  if (r1 < 0.6) {
+    const tw = Math.min(w * 0.26, 3.4) * vary(r4);
+    e.tank(px(r2), topY, pz(1 - r0), tw, Math.max(1.8, tw * 1.05), tw * 0.78, 0xa8aca6);
   }
-  // 空調室外機。小さいものを何台か並べると、それらしい雑然さが出る。
-  const units = 2 + Math.floor(r2 * 2);
-  for (let i = 0; i < units; i++) {
+  // 空調室外機の列。列そのものの長さと高さを散らす。
+  const rows = 1 + Math.floor(r2 * 2.4);
+  for (let i = 0; i < rows; i++) {
     const rx = rnd(hash, salt + 10 + i);
     const rz = rnd(hash, salt + 20 + i);
+    const s = vary(rnd(hash, salt + 30 + i));
+    // 経年で色が振れる。全部が同じ白だと、大きさを散らしても列が揃って見える。
+    const age = 0.82 + rnd(hash, salt + 70 + i) * 0.3;
+    tmpC.setRGB(age, age * 0.99, age * 0.95);
+    e.acRow(px(rx), topY, pz(rz), 2.6 * s, 0.95 * s, 0.85 * s, rx > 0.5 ? Math.PI / 2 : 0, tmpC);
+  }
+  // 円筒の排気筒。屋上で唯一の丸い形なので、1 本あるだけで面が単調でなくなる。
+  const stacks = r0 > 0.45 ? 1 + Math.floor(r1 * 2) : 0;
+  for (let i = 0; i < stacks; i++) {
+    const s = vary(rnd(hash, salt + 40 + i));
+    const age = 0.8 + rnd(hash, salt + 80 + i) * 0.35;
+    tmpC.setRGB(age, age * 0.97, age * 0.92);
+    e.stack(px(rnd(hash, salt + 50 + i)), topY, pz(rnd(hash, salt + 60 + i)), 0.3 * s, 1.7 * s, tmpC);
+  }
+  // 屋上を這う配管・ダクト。水平の線が 1 本走ると、屋上が「面」ではなく「場」になる。
+  if (r4 > 0.4 && bigRoof) {
+    const alongX = r0 > 0.5;
     e.box(
-      x + (rx - 0.5) * w * inner * 1.7,
-      topY,
-      z + (rz - 0.5) * d * inner * 1.7,
-      1.5,
-      1.2,
-      0.9,
-      0x9aa0a2,
-      0.5,
-      0.55,
-      rx > 0.5 ? Math.PI / 2 : 0,
+      px(r1),
+      topY + 0.35,
+      pz(r2),
+      alongX ? w * 0.5 : 0.45,
+      0.45,
+      alongX ? 0.45 : d * 0.5,
+      0xa4a8a4,
+      0.6,
+      0.4,
     );
   }
   // アンテナ・避雷針。細くて高いものが 1 本あると輪郭が締まる。
@@ -183,6 +233,47 @@ function rooftop(
     e.box(ax, topY + ph, az, 0.14, 2.6 + r0 * 3.5, 0.14, 0x9c9c9c, 0.7, 0.2);
     e.box(ax, topY + ph + 1.2, az, 1.1, 0.1, 0.1, 0x9c9c9c, 0.7, 0.2);
   }
+}
+
+/**
+ * 屋外の非常階段。
+ *
+ * 日本の雑居ビル・事務所ビルは、正面をどれだけ整えても裏側に必ずこれが付く。
+ * 踊り場・斜めの段板・手すりの 3 つが階ごとに繰り返す縦の要素なので、
+ * 平らな裏面に「階数の読める影の階段」ができる。
+ * 手すりは焼き固めたキットを 1 スパンぶん置くだけなので、
+ * 1 階あたり 3 インスタンスで済む。
+ */
+function fireStair(ctx: BuildCtx, cx: number, cz: number, w: number, d: number, baseY: number, h: number, floorH: number): void {
+  const { e } = ctx;
+  const b = ((ctx.front + 2) % 4) as Facing;
+  const dist = faceDist(b, w, d);
+  const len = faceLen(b, w, d);
+  const off = len * 0.28;
+  const wide = 1.5;
+  const px = cx + FX[b]! * (dist + wide * 0.5) + (b % 2 === 0 ? off : 0);
+  const pz = cz + FZ[b]! * (dist + wide * 0.5) + (b % 2 === 0 ? 0 : off);
+  const floors = Math.max(2, Math.min(9, Math.round(h / floorH)));
+  const rot = faceRot(b);
+  // 壁に沿う向き（接線）。段板と踊り場をこの向きに並べる。
+  const tanX = FZ[b]!;
+  const tanZ = -FX[b]!;
+  for (let i = 1; i <= floors; i++) {
+    const y = baseY + floorH * i;
+    // 踊り場
+    e.box(px, y - 0.14, pz, wide, 0.14, wide, 0x8f979c, 0.66, 0.3);
+    // 斜めの段板。1 枚の傾いた板でも、影が段に見える。
+    // `put` の回転は YXZ なので、傾け（X 軸まわり）が効くのは常にローカル Z。
+    // 段板の長手をローカル Z に取り、Y 回転で壁に平行な向きへ倒す。
+    const tilt = Math.atan2(floorH, 2.4);
+    const sx = px + tanX * wide * 0.55;
+    const sz = pz + tanZ * wide * 0.55;
+    e.box(sx, y - floorH * 0.5, sz, 1.1, 0.12, 2.7, 0x8f979c, 0.66, 0.3, rot + Math.PI / 2, tilt);
+    // 外側の手すり
+    e.railFrame(px + FX[b]! * (wide * 0.5), y, pz + FZ[b]! * (wide * 0.5), wide, 1.05, rot);
+  }
+  // 縦の主柱
+  e.box(px + FX[b]! * (wide * 0.45), baseY, pz + FZ[b]! * (wide * 0.45), 0.16, h, 0.16, 0x8f979c, 0.66, 0.3);
 }
 
 /** 勾配屋根。棟は長辺に沿わせる。 */
@@ -199,11 +290,23 @@ function pitched(
   const { e } = ctx;
   const h = Math.min(4.6, Math.max(1.5, Math.min(w, d) * 0.3)) * scale;
   if (kind === RoofKind.Hip) {
-    e.hip(x, topY, z, w, h, d, ctx.roof);
+    e.hip(x, topY, z, w, h, d, ctx.roof, 0, 0.45, ctx.roofRough, ctx.roofMetal);
     return;
   }
   const alongX = w >= d;
-  e.gable(x, topY, z, alongX ? w : d, h, alongX ? d : w, ctx.roof, alongX ? 0 : Math.PI / 2);
+  e.gable(
+    x,
+    topY,
+    z,
+    alongX ? w : d,
+    h,
+    alongX ? d : w,
+    ctx.roof,
+    alongX ? 0 : Math.PI / 2,
+    0.4,
+    ctx.roofRough,
+    ctx.roofMetal,
+  );
 }
 
 /** 正面の庇（店舗・玄関）。奥行きのある水平の板は、影が落ちて立体感を作る。 */
@@ -563,9 +666,18 @@ function konbini(ctx: BuildCtx): void {
   const len = faceLen(f, w, d);
   const dist = faceDist(f, w, d);
   // 軒先の看板帯。まわりの建物より一段明るく光らせる。
-  const sx = cx + FX[f]! * (dist + 0.12);
-  const sz = cz + FZ[f]! * (dist + 0.12);
-  e.sign(sx, gy + H - 1.2, sz, f % 2 === 0 ? len * 0.94 : 0.3, 0.95, f % 2 === 0 ? 0.3 : len * 0.94, 0x2f8f4f, 0.2, 2.3);
+  e.signFace(
+    cx + FX[f]! * (dist + 0.36),
+    gy + H - 1.2,
+    cz + FZ[f]! * (dist + 0.36),
+    len * 0.9,
+    1.05,
+    0x2f8f4f,
+    seed,
+    0.18,
+    1.9,
+    signRot(f),
+  );
   // パラペットと庇
   rooftop(ctx, cx, cz, gy + H, w, d, 60, { parapet: 0.75, clutter: 1 });
   awning(ctx, gy + H - 2.4, 1.5, 0xe8e8e4, 0.98);
@@ -588,7 +700,8 @@ function konbini(ctx: BuildCtx): void {
   const lx = cx + FX[f]! * (dist + 7.2) + (f % 2 === 0 ? len * 0.4 : 0);
   const lz = cz + FZ[f]! * (dist + 7.2) + (f % 2 === 0 ? 0 : len * 0.4);
   e.box(lx, gy, lz, 0.18, 5.4, 0.18, 0xb4b8ba, 0.7, 0.2);
-  e.sign(lx, gy + 5.4, lz, 1.9, 1.2, 0.3, 0xffffff, 0.25, 2.4, faceRot(f));
+  // ポールサイン。白地に店名が入る（純白のべた塗りをやめる）。
+  e.signFace(lx, gy + 6.0, lz, 2.0, 1.3, 0x2f8f4f, seed + 0.5, 0.2, 2.0, signRot(f));
 }
 
 /** 商店街。間口の狭い店が軒を連ね、通りに面してアーケードの庇と幟が並ぶ。 */
@@ -617,12 +730,23 @@ function shotengai(ctx: BuildCtx): void {
     } else {
       rooftop(ctx, px, pz, gy + h, alongX ? sw : depth, alongX ? depth : sw, 70 + i, { parapet: 0.6, clutter: 0 });
     }
-    // 店ごとの袖看板
+    // 店ごとの袖看板。壁から 0.3m のアームで持ち出した、厚み 0.12m の縦板。
     const dist = faceDist(f, w, d);
-    const bx = cx + FX[f]! * (dist + 0.5) + (alongX ? off : 0);
-    const bz = cz + FZ[f]! * (dist + 0.5) + (alongX ? 0 : off);
-    const sc = pick([0xd94f3a, 0xe0a13a, 0x3f7fbf, 0xe8e2d0, 0x4f9e5a], hash, 30 + i);
-    e.sign(bx, gy + style.floorH * 1.55, bz, alongX ? 0.3 : 1.5, 1.1, alongX ? 1.5 : 0.3, sc, 0.2, 2.2);
+    const proj = 1.0;
+    const bx = cx + FX[f]! * (dist + proj * 0.86) + (alongX ? off : 0);
+    const bz = cz + FZ[f]! * (dist + proj * 0.86) + (alongX ? 0 : off);
+    e.signBlade(
+      bx,
+      gy + style.floorH * 1.05,
+      bz,
+      proj,
+      1.9,
+      pick(SIGN_ACCENTS, hash, 30 + i),
+      seed + i * 0.23,
+      0.16,
+      1.9,
+      signRot(f),
+    );
   }
 
   // 軒を通して連ねる庇（アーケード）
@@ -651,16 +775,17 @@ function supermarket(ctx: BuildCtx): void {
   const len = faceLen(f, w, d);
   const dist = faceDist(f, w, d);
   awning(ctx, gy + style.floorH * 1.3, 2.6, 0xdedad0, 0.7);
-  e.sign(
-    cx + FX[f]! * (dist + 0.12),
+  e.signFace(
+    cx + FX[f]! * (dist + 0.36),
     gy + H - 2.0,
-    cz + FZ[f]! * (dist + 0.12),
-    f % 2 === 0 ? len * 0.6 : 0.3,
-    1.6,
-    f % 2 === 0 ? 0.3 : len * 0.6,
-    0xd94f3a,
-    0.22,
-    2.4,
+    cz + FZ[f]! * (dist + 0.36),
+    len * 0.6,
+    1.7,
+    0xc4463a,
+    seed,
+    0.2,
+    1.8,
+    signRot(f),
   );
 }
 
@@ -670,25 +795,33 @@ function zakkyo(ctx: BuildCtx): void {
   const v = Math.floor(rnd(hash, 1) * ctx.style.variants);
   const blocks = massing(ctx, v === 2 ? 3 : v);
   placeBlocks(ctx, blocks, Facade.Shop);
+  // 裏の非常階段。正面に看板が並ぶぶん、裏は階段で読ませる。
+  if (blocks[0]!.h > style.floorH * 3.5 && rnd(hash, 4) > 0.45) {
+    fireStair(ctx, cx, cz, w, d, gy, blocks[0]!.h, style.floorH);
+  }
   // 正面に縦に並ぶ袖看板。夜はここが街の光になる。
   const f = ctx.front;
   const dist = faceDist(f, w, d);
   const H = blocks[0]!.h;
   const n = Math.max(2, Math.min(5, Math.floor(H / style.floorH) - 1));
   const off = faceLen(f, w, d) * 0.34;
+  const seed = (hash % 997) / 997;
+  // 袖看板は 1 枚が縦に長い板で、階ごとに積み上がる。
+  // 厚みとアームがあることが近景で読めるので、以前の「付箋」からは抜けられる。
+  const proj = 1.3;
   for (let i = 0; i < n; i++) {
-    const y = gy + style.floorH * (1.35 + i);
-    const c = pick([0xd94f3a, 0xe0a13a, 0x3f7fbf, 0xf0e8d8, 0x7f5fb0], hash, 50 + i);
-    e.sign(
-      cx + FX[f]! * (dist + 0.55) + (f % 2 === 0 ? off : 0),
+    const y = gy + style.floorH * (0.95 + i);
+    e.signBlade(
+      cx + FX[f]! * (dist + proj * 0.86) + (f % 2 === 0 ? off : 0),
       y,
-      cz + FZ[f]! * (dist + 0.55) + (f % 2 === 0 ? 0 : off),
-      f % 2 === 0 ? 0.28 : 1.6,
-      1.0,
-      f % 2 === 0 ? 1.6 : 0.28,
-      c,
-      0.18,
-      2.6,
+      cz + FZ[f]! * (dist + proj * 0.86) + (f % 2 === 0 ? 0 : off),
+      proj,
+      style.floorH * 0.72,
+      pick(SIGN_ACCENTS, hash, 50 + i),
+      seed + i * 0.19,
+      0.16,
+      2.0,
+      signRot(f),
     );
   }
 }
@@ -696,9 +829,13 @@ function zakkyo(ctx: BuildCtx): void {
 /** オフィスビル。カーテンウォールと基壇。 */
 function office(ctx: BuildCtx): void {
   const v = Math.floor(rnd(ctx.hash, 1) * ctx.style.variants);
-  placeBlocks(ctx, massing(ctx, v === 0 ? 1 : v), Facade.Curtain);
+  const blocks = massing(ctx, v === 0 ? 1 : v);
+  placeBlocks(ctx, blocks, Facade.Curtain);
   tmpA.copy(ctx.wall).multiplyScalar(0.85);
   awning(ctx, ctx.gy + ctx.style.floorH * 1.15, 2.2, tmpA, 0.5);
+  if (rnd(ctx.hash, 4) > 0.55) {
+    fireStair(ctx, ctx.cx, ctx.cz, ctx.w, ctx.d, ctx.gy, blocks[0]!.h, ctx.style.floorH);
+  }
 }
 
 /** 工場・倉庫。折板の切妻／陸屋根、ダクト、煙突、サイロ。 */
@@ -812,16 +949,17 @@ function station(ctx: BuildCtx): void {
   // 駅名の看板
   const f = ctx.front;
   const dist = faceDist(f, bw, bd);
-  e.sign(
-    cx + FX[f]! * (dist + 0.15),
+  e.signFace(
+    cx + FX[f]! * (dist + 0.36),
     gy + H * 0.55,
-    cz + FZ[f]! * (dist + 0.15),
-    f % 2 === 0 ? bw * 0.5 : 0.3,
-    1.0,
-    f % 2 === 0 ? 0.3 : bd * 0.5,
+    cz + FZ[f]! * (dist + 0.36),
+    (f % 2 === 0 ? bw : bd) * 0.5,
+    1.1,
     0x2f6fb5,
+    seed,
     0.22,
-    2.8,
+    1.9,
+    signRot(f),
   );
 }
 
@@ -956,7 +1094,7 @@ function institution(ctx: BuildCtx, kind: 'hospital' | 'cityhall' | 'police' | '
   const dist = faceDist(f, w, d);
   if (kind === 'hospital') {
     // 赤十字の看板と屋上のヘリポート標識
-    e.sign(cx + FX[f]! * (dist + 0.12), gy + style.floorH * 2.0, cz + FZ[f]! * (dist + 0.12), 1.4, 1.4, 0.3, 0xe04b4b, 0.25, 1.8);
+    e.signFace(cx + FX[f]! * (dist + 0.36), gy + style.floorH * 2.0, cz + FZ[f]! * (dist + 0.36), 1.6, 1.5, 0xc4463a, (hash % 997) / 997, 0.22, 1.5, signRot(f));
   } else if (kind === 'fire') {
     // ホース乾燥塔。細く高い塔が 1 本立つのが消防署の目印。
     e.mass(cx + w * 0.36, gy, cz + d * 0.34, 2.6, style.baseHeight + 7, 2.6, ctx.wall, Facade.Plain, 0.85, 0.04, 0);
@@ -975,7 +1113,7 @@ function institution(ctx: BuildCtx, kind: 'hospital' | 'cityhall' | 'police' | '
       0.6,
     );
   } else if (kind === 'police') {
-    e.sign(cx + FX[f]! * (dist + 0.12), gy + style.baseHeight * 0.8, cz + FZ[f]! * (dist + 0.12), 1.2, 0.5, 0.3, 0xe8443a, 0.3, 2.0);
+    e.signFace(cx + FX[f]! * (dist + 0.36), gy + style.baseHeight * 0.8, cz + FZ[f]! * (dist + 0.36), 1.4, 0.6, 0xc4463a, (hash % 997) / 997, 0.25, 1.7, signRot(f));
   } else {
     // 庁舎は正面に柱列を立てて格を出す
     const len = faceLen(f, w, d);

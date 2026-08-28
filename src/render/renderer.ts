@@ -404,9 +404,11 @@ export class Renderer {
     this.updateEnvironment(frac);
 
     this.terrain.update(sim);
-    this.nature.update(sim);
+    // 距離を渡すのは、遠景で木の幹や路面標示の縞を 1 本ずつ描くのをやめさせるため。
+    // 1px 未満の造形は、絵にならずノイズとちらつきにしかならない。
+    this.nature.update(sim, this.rig.distance);
     this.applyShadowFlags();
-    this.roads.update(sim);
+    this.roads.update(sim, this.rig.distance);
     this.rails.update(sim);
     this.buildings.update(sim);
     this.buildings.setTimeOfDay(frac);

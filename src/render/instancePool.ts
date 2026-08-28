@@ -21,6 +21,16 @@ export class InstancePool {
   mesh: InstancedMesh;
   private cursor = 0;
   private capacity: number;
+  /**
+   * 表示状態と描画順を**プール側で覚えておく**。
+   *
+   * `grow()` はメッシュを作り直すので、呼び出し側が `mesh.visible` や
+   * `mesh.renderOrder` を直接いじっていると、容量が増えた瞬間に既定値へ戻る。
+   * 街が育って初めて「夜の光の板が急に手前に出る」「LOD で隠したはずの
+   * 標示が復活する」といった、再現しづらい不具合になる。
+   */
+  private visible = true;
+  private order = 0;
 
   constructor(
     private geometry: BufferGeometry,
@@ -36,6 +46,8 @@ export class InstancePool {
   private create(capacity: number): InstancedMesh {
     const m = new InstancedMesh(this.geometry, this.material, capacity);
     m.count = 0;
+    m.visible = this.visible;
+    m.renderOrder = this.order;
     // 道路の小物はマップ全体に散らばるので、区画に切らない限りカリングは効かない。
     // 効かないカリングのために毎フレーム境界球を計算するほうが無駄なので切る。
     m.frustumCulled = false;
@@ -90,7 +102,14 @@ export class InstancePool {
   }
 
   setVisible(v: boolean): void {
+    this.visible = v;
     this.mesh.visible = v;
+  }
+
+  /** 描画順（加算合成の板を最後に描くなど）。`grow()` を跨いでも保たれる。 */
+  setRenderOrder(o: number): void {
+    this.order = o;
+    this.mesh.renderOrder = o;
   }
 
   dispose(): void {

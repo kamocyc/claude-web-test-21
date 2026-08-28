@@ -71,7 +71,11 @@ const RAIL_WEB = 0x6b5a4c;
  */
 const DECK_COLOR = 0x6e6a64;
 const POLE_COLOR = 0x9aa0a6;
-const WIRE_COLOR = 0x5a5347;
+/**
+ * 架線の色。純黒に近い線は空を背景にするとジャギーが目立つので、
+ * 空との明度差を詰めた暗い灰褐色にしておく。
+ */
+const WIRE_COLOR = 0x6b6357;
 const PLATFORM_COLOR = 0xc8c4bc;
 
 /** 架線柱。高さと、線路中心からの張り出し。 */
@@ -200,10 +204,19 @@ function poleGeometry(): BufferGeometry {
   return g;
 }
 
-/** 架線 1 区間。+Z へ長さ 1 の細い棒。両端を指定して伸縮・回転させる。 */
+/**
+ * 架線 1 区間。+Z へ長さ 1 の細い棒。両端を指定して伸縮・回転させる。
+ *
+ * 角数を 4 から 6 へ、半径を 3.5cm から 4.5cm へ上げてある。
+ * 4 角柱だと真横から見たときに幅がゼロに近づく角度があり、そこで線が
+ * 1px を割ってジャギーとして砕ける。6 角柱にすると見る角度によらず
+ * 半径の 0.87 倍以上の幅が残るので、細い線でもアンチエイリアスが効く。
+ * 三角形は 1 区間 16 枚から 24 枚に増えるが、架線はインスタンスなので
+ * ドローコールは 1 本のままで済む。
+ */
 function wireGeometry(): BufferGeometry {
   return mergeParts([
-    prism({ r: 0.035, len: 1, seg: 4, axis: 'z', caps: 'none', tint: WIRE_COLOR }),
+    prism({ r: 0.045, len: 1, seg: 6, axis: 'z', caps: 'none', tint: WIRE_COLOR }),
   ]);
 }
 
@@ -310,7 +323,9 @@ export class RailLayer {
     this.rail = this.makeMesh(railGeometry(), MAX_TRACK, 0.24, 0.92, 1.5);
     this.deck = this.makeMesh(deckGeometry(), MAX_DECK, 0.88, 0.04);
     this.pole = this.makeMesh(poleGeometry(), MAX_POLES, 0.55, 0.55);
-    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.5, 0.7);
+    // 架線は金属だが、細い円柱に強い鏡面を乗せると 1px の線の上でハイライトが
+    // 明滅して、かえってちらつく。粗く・金属度を落として拡散寄りに寝かせる。
+    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.78, 0.3);
     this.crossing = this.makeMesh(crossingGeometry(), MAX_CROSSING, 0.7, 0.1);
     this.platform = this.makeMesh(platformGeometry(), MAX_PLATFORM, 0.85, 0.04);
   }

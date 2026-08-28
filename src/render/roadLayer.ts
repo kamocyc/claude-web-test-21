@@ -1,10 +1,8 @@
 import {
   AdditiveBlending,
-  BufferAttribute,
   BufferGeometry,
   Color,
-  LineBasicMaterial,
-  LineSegments,
+  CylinderGeometry,
   Matrix4,
   MeshBasicMaterial,
   Object3D,
@@ -118,9 +116,64 @@ const INWARD_ROT = [-Math.PI / 2, Math.PI, Math.PI / 2, 0] as const;
 const FACE_ROT = [0, -Math.PI / 2, Math.PI, Math.PI / 2] as const;
 
 /** 電線の色。夜空を背景にしたときに黒く沈みすぎない灰色にする。 */
-const WIRE_COLOR = 0x2a2c30;
+const WIRE_COLOR = 0x3a3d42;
 /** 電線 1 本のたわみ（水平距離に対する比）。 */
 const WIRE_SAG = 0.055;
+/**
+ * 電線の断面半径 (m)。
+ *
+ * 以前は `LineSegments`（1px の線）で描いていた。1px の線は
+ * **画面解像度に張り付いていて遠近が効かない**うえ、ライン描画は
+ * MSAA も SMAA も素直に効かないので、斜めに走るたびに階段状のジャギーが出る
+ * （夕方の空を背景にした電線がいちばん目立っていた）。
+ * 実物の低圧配電線の外径は 1cm 前後だが、それだと遠景で消えるので少し太らせる。
+ * 円柱にすると太さが距離で縮み、法線があるので光も乗る。
+ */
+const WIRE_RADIUS = 0.03;
+/** カテナリーの分割数。3 で「たるみ」は十分読める。 */
+const WIRE_SEGMENTS = 3;
+/** これより引いたら電線を描かない。1px を割った電線はちらつきにしかならない。 */
+const WIRE_LOD_DISTANCE = 620;
+
+/**
+ * 路面標示を 1 本ずつ描くのをやめるカメラ距離 (m)。
+ *
+ * この距離では横断歩道の縞 1 本が 1〜2px にしかならず、SMAA でも取り切れずに
+ * モアレとちらつきの粒になる。しかも塗料は舗装より明るいので、
+ * **街区の交点すべてが白いビーズの鎖として画面で最初に目に入る**。
+ * ここを超えたら、縞のかわりに「縞と舗装を面積比で平均した淡い矩形」を
+ * 交差点の流入 1 本につき 1 枚だけ置く。情報（そこに横断歩道がある）は残り、
+ * ちらつきの原因になる高周波だけが消える。
+ */
+const MARKING_LOD_DISTANCE = 500;
+
+/**
+ * 横断歩道の塗料。車線の白線よりさらに一段暗い。
+ * 横断歩道は轍が直接乗るので実物でもいちばん早く摩耗する。
+ */
+const CROSSWALK_COLOR = 0xa5a399;
+/**
+ * 遠景で縞のかわりに敷く矩形の色。
+ * 縞の被覆率（幅 0.55m / 間隔 1.25m ＝ 約 44%）で舗装と塗料を混ぜた値。
+ */
+const CROSSWALK_FAR_COLOR = 0x62635c;
+
+/**
+ * 夜、市街地の路面を底上げする「面光源」の色と大きさ。
+ *
+ * 夜景の説得力は「光っているもの」ではなく「光が当たっているもの」で決まる。
+ * 自発光する灯具だけを置いても路面は真っ黒のままで、街区の形が読めない。
+ * かといって PointLight を数百個置くとフォワード描画では破綻する。
+ * そこで市街地の道路タイル 1 枚ごとに、ごく弱い加算の板を敷いて
+ * 「窓明かりと空のスカイグローに照らされた路面」を作る。
+ * 街灯の光溜まりと同じ材質・同じプールに入れるので、描画は増えない
+ * （色を instanceColor で分けるだけ）。
+ */
+const AMBIENT_POOL_SIZE = TILE_M * 2.2;
+const AMBIENT_POOL_LEVEL = 0.1;
+/** 交差点はもう一回り広く。街区の格子はここで読める。 */
+const JUNCTION_POOL_SIZE = TILE_M * 3.0;
+const JUNCTION_POOL_LEVEL = 0.062;
 
 /** 光の板を白に寄せるための混色先。 */
 const WHITE = new Color(1, 1, 1);
@@ -132,6 +185,8 @@ export class RoadLayer {
   private readonly walkway: InstancePool;
   private readonly corner: InstancePool;
   private readonly marking: InstancePool;
+  /** 俯瞰用。横断歩道 1 か所につき淡い矩形 1 枚だけを持つ。 */
+  private readonly markingFar: InstancePool;
   private readonly lamp: InstancePool;
   private readonly lampHead: InstancePool;
   private readonly lightPool: InstancePool;
@@ -144,9 +199,8 @@ export class RoadLayer {
   private readonly busStop: InstancePool;
   private readonly pools: InstancePool[] = [];
 
-  /** 電線。1 本ずつメッシュにすると数千ドローになるので、線分の集合 1 つにまとめる。 */
-  private readonly wires: LineSegments;
-  private wireData = new Float32Array(0);
+  /** 電線。細い円柱のインスタンス群（1 ドローコール）。 */
+  private readonly wire: InstancePool;
 
   private readonly materials: Material[] = [];
   private readonly lampHeadMat: MeshBasicMaterial;
@@ -156,6 +210,9 @@ export class RoadLayer {
   private lastEpoch = -1;
   private lastNetwork = -1;
   private night = -1;
+  /** 直近に適用した LOD（毎フレーム visible を触らずに済ませるため）。 */
+  private detailFar = false;
+  private wiresShown = true;
 
   private readonly mat = new Matrix4();
   private readonly pos = new Vector3();
@@ -163,6 +220,11 @@ export class RoadLayer {
   private readonly quat = new Quaternion();
   private readonly axisY = new Vector3(0, 1, 0);
   private readonly color = new Color();
+  /** 電線を 1 区間ずつ置くための作業用。 */
+  private readonly segA = new Vector3();
+  private readonly segB = new Vector3();
+  private readonly segDir = new Vector3();
+  private readonly axisUp = new Vector3(0, 1, 0);
   /** 電柱の位置を「タイル*4+辺」で引けるようにしておく。電線を張るのに要る。 */
   private readonly poleAt = new Map<number, { x: number; y: number; z: number; d: number }>();
 
@@ -190,13 +252,17 @@ export class RoadLayer {
     this.corner = this.pool(walkwayCornerGeometry(), walkMat, false, 4096);
 
     // --- 路面標示 ---
-    // 白線は塗料なので、アスファルトよりわずかに粗く、反射しない。
-    const markMat = surface({ roughness: 0.62, metalness: 0.0, envMapIntensity: 0.2 });
+    // 白線は塗料なので、アスファルトよりずっと粗く、まったく反射しない。
+    // ここで反射を残していると、朝夕の低い日射で標示だけが白く輝いて、
+    // 俯瞰では建物の屋根より明るい「白いビーズの鎖」になる。
+    const markMat = surface({ roughness: 0.9, metalness: 0.0, envMapIntensity: 0.08 });
     markMat.polygonOffset = true;
     markMat.polygonOffsetFactor = -6;
     markMat.polygonOffsetUnits = -6;
     this.materials.push(markMat);
     this.marking = this.pool(plane.clone(), markMat, true, 16384);
+    // 俯瞰用の代替（横断歩道 1 か所 = 1 枚）。同じ材質を共有するので描画は 1 増えるだけ。
+    this.markingFar = this.pool(plane.clone(), markMat, true, 4096);
 
     // --- 街灯・電柱・防護柵 ---
     const propMat = surface({ roughness: 0.6, metalness: 0.3, vertexColors: true, envMapIntensity: 0.7 });
@@ -236,16 +302,16 @@ export class RoadLayer {
     poolGeom.rotateX(-Math.PI / 2);
     this.lightPool = this.pool(poolGeom, this.poolMat, true, 2048);
     // 加算の板は最後に描く。半透明のもの同士の前後関係を気にしなくて済む。
-    this.lightPool.mesh.renderOrder = 4;
+    this.lightPool.setRenderOrder(4);
 
     // --- 電線 ---
-    const wireMat = new LineBasicMaterial({ color: WIRE_COLOR, transparent: true, opacity: 0.85 });
+    // 細い円柱を 1 区間 1 インスタンスで敷く。線ではなく立体なので、
+    // 遠近で太さが変わり、SMAA も素直に効いてジャギーが出ない。
+    const wireMat = surface({ color: WIRE_COLOR, roughness: 0.55, metalness: 0.35, envMapIntensity: 0.5 });
     this.materials.push(wireMat);
-    const wireGeom = new BufferGeometry();
-    wireGeom.setAttribute('position', new BufferAttribute(new Float32Array(0), 3));
-    this.wires = new LineSegments(wireGeom, wireMat);
-    this.wires.frustumCulled = false;
-    this.group.add(this.wires);
+    // 中心が原点・+Y に高さ 1 の円柱。断面は 4 角形で十分（遠景では 1px 前後）。
+    const wireGeom = new CylinderGeometry(WIRE_RADIUS, WIRE_RADIUS, 1, 4, 1, true);
+    this.wire = this.pool(wireGeom, wireMat, false, 16384);
   }
 
   private pool(geom: BufferGeometry, material: Material, colored: boolean, cap: number): InstancePool {
@@ -264,9 +330,15 @@ export class RoadLayer {
     this.lastEpoch = -1;
   }
 
-  update(sim: Simulation): void {
+  /**
+   * @param camDistance カメラの注視点からの距離 (m)。路面標示と電線の LOD に使う。
+   *   既定を 0 にしてあるのは、呼び出し元（renderer.ts）が渡さなくても
+   *   「近景 = 全部描く」で従来どおり動くようにするため。
+   */
+  update(sim: Simulation, camDistance = 0): void {
     // 夜の点灯だけは毎フレーム。材質を数個いじるだけなので、ここに置いても安い。
     this.setNight(atmosphereAt(sim.clock.dayFraction).nightAmount);
+    this.setDetail(camDistance);
 
     const epoch = sim.world.epochs.roads;
     const net = sim.world.networkVersion;
@@ -274,6 +346,24 @@ export class RoadLayer {
     this.lastEpoch = epoch;
     this.lastNetwork = net;
     this.rebuild(sim);
+  }
+
+  /**
+   * カメラ距離で描き分ける。
+   *
+   * `InstancePool.grow()` はメッシュを作り直すので、再構築のたびに
+   * visible が既定へ戻る。状態を持っておいて `rebuild` の後にも通す。
+   */
+  private setDetail(camDistance: number): void {
+    this.detailFar = camDistance > MARKING_LOD_DISTANCE;
+    this.wiresShown = camDistance < WIRE_LOD_DISTANCE;
+    this.applyDetail();
+  }
+
+  private applyDetail(): void {
+    this.marking.setVisible(!this.detailFar);
+    this.markingFar.setVisible(this.detailFar);
+    this.wire.setVisible(this.wiresShown);
   }
 
   /**
@@ -296,7 +386,9 @@ export class RoadLayer {
     // 弱すぎると路面が黒いままで道路網が消え、強すぎると白飛びして
     // やはり道の形が消える。舗装が反射率 10% 前後で相当暗いので、
     // 加算で 0.9 くらい乗せてようやく「照らされた路面」に見える。
-    this.poolMat.opacity = night * 0.5;
+    // 板ごとの強さの差（街灯の直下か、街区全体のスカイグローか）は
+    // instanceColor 側で付けてあるので、ここは全体の掛け率だけ。
+    this.poolMat.opacity = night * 0.92;
     this.vendingGlowMat.opacity = Math.min(1, night * 1.2);
   }
 
@@ -321,11 +413,50 @@ export class RoadLayer {
       this.putPavement(cls, conn, cx, cz, gy, half, h);
       this.putWalkways(world, i, conn, cx, cz, gy, half, h, cls);
       this.putMarkings(world, i, cls, conn, degree, cx, cz, gy, half);
+      this.putGlow(world, i, degree, cx, cz, gy);
     }
 
     this.putBusStops(sim);
     this.buildWires(world);
     for (const p of this.pools) p.end();
+    // grow() でメッシュが作り直されていることがあるので、LOD を掛け直す。
+    this.applyDetail();
+  }
+
+  /**
+   * 夜の路面の底上げ。
+   *
+   * 街灯の光溜まり（`putEdgeProps`）だけだと、灯具のある辺の 20m 四方しか
+   * 明るくならず、街区の大半は純黒のままだった。実際の市街地の夜は、
+   * 窓明かり・看板・空のスカイグローで**道路面全体がうっすら見えている**。
+   * ここでは「まわりに建物がある道路タイル」にごく弱い板を 1 枚敷いて、
+   * その底上げを作る。何も無い郊外の道は暗いままにしたいので、
+   * 隣接タイルに用途地域があるかどうかで出し分ける。
+   */
+  private putGlow(world: Simulation['world'], i: number, degree: number, cx: number, cz: number, gy: number): void {
+    let built = false;
+    for (let d = 0; d < 4; d++) {
+      const nb = neighbor(i, d);
+      const zone = nb >= 0 ? world.zone[nb]! : Zone.None;
+      // 「まわりに人の営みがある」＝市街地の 3 用途だけ。農地・林業地・公園を
+      // 含めると、田園の農道まで格子状に光り、俯瞰でまた「配線パターン」に戻る
+      // （実際、夜の田んぼの中の道は街灯も窓明かりも無く真っ暗）。
+      if (zone >= Zone.ResidentialLow && zone <= Zone.IndustrialHeavy) {
+        built = true;
+        break;
+      }
+    }
+    if (!built) return;
+    const y = gy + Y_POOL;
+    // 板は暖色に寄せる。日本の夜の街路は水銀灯とナトリウム灯と
+    // 窓明かりが混ざって、写真で見るとわずかに黄色い。
+    this.color.setRGB(AMBIENT_POOL_LEVEL, AMBIENT_POOL_LEVEL * 0.95, AMBIENT_POOL_LEVEL * 0.82);
+    this.place(this.lightPool, cx, y, cz, AMBIENT_POOL_SIZE, AMBIENT_POOL_SIZE, 0, this.color);
+    // 交差点はもう一枚重ねる。格子の交点が明るいと、上空から街区の形が読める。
+    if (degree >= JUNCTION_DEGREE) {
+      this.color.setRGB(JUNCTION_POOL_LEVEL, JUNCTION_POOL_LEVEL * 0.96, JUNCTION_POOL_LEVEL * 0.86);
+      this.place(this.lightPool, cx, y, cz, JUNCTION_POOL_SIZE, JUNCTION_POOL_SIZE, 0, this.color);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -483,10 +614,12 @@ export class RoadLayer {
       // 路面に落ちる光。灯具の色をそのまま使うと路面がオレンジ一色になるので、
       // 白に寄せて薄める（実際の路面も光源色ほどは色が付かない）。
       this.color.lerp(WHITE, 0.26);
-      // 灯具が 6m の高さにあるので、光は直径 20m 程度に広がる。
+      // 灯具が 6m の高さにあるので、光は半径 12m 前後に広がる。
       // 隣の街灯の光と重なる大きさにしておくと、点の列ではなく
       // 「照らされた帯」になって、上空から道路の形が読める。
-      this.place(this.lightPool, gx, gy + Y_POOL, gz, 28, 28, 0, this.color);
+      // 広げすぎると、郊外では路肩を越えて田畑の上まで丸く光り、
+      // 路面ではなく「霧の塊」に見えるので 24m 角に収める。
+      this.place(this.lightPool, gx, gy + Y_POOL, gz, 24, 24, 0, this.color);
     }
 
     // --- 電柱 ---
@@ -607,15 +740,15 @@ export class RoadLayer {
    * 空を横切る電線だと思う。まっすぐな線分でつなぐと送電線に見えるので、
    * 懸垂曲線（近似としての放物線）でたるませる。
    *
-   * 1 本ずつメッシュにすると数千ドローになるので、全部を 1 つの
-   * `LineSegments` に詰める。線の太さは 1px 固定になるが、
-   * 電線はもともと細いのでかえって都合がいい。
+   * 描き方は `LineSegments`（1px の線）から**細い円柱のインスタンス**に変えた。
+   * 1px の線は距離によらず同じ太さで描かれるうえ、ライン描画にはアンチエイリアスが
+   * 素直に効かないので、空を斜めに横切るところで階段状のジャギーが目立つ。
+   * 半径 4cm の円柱にすれば、遠近で細り、法線があるので夕日も乗る。
+   * インスタンスは 1 メッシュにまとまるので、ドローコールは線のときと同じ 1 本。
    */
   private buildWires(world: Simulation['world']): void {
-    const SEGMENTS = 5;
     /** 隣の電柱を探しに行く最大距離（タイル）。実際の径間は 30〜40m。 */
     const MAX_SPAN = 4;
-    const verts: number[] = [];
     for (const [key, a] of this.poleAt) {
       const tile = (key / 4) | 0;
       const d = a.d;
@@ -650,29 +783,34 @@ export class RoadLayer {
         const y0 = a.y + ARM_Y[0]! + 0.1;
         const y1 = b.y + ARM_Y[0]! + 0.1;
         const sag = span * WIRE_SAG;
-        let prevX = a.x + offX;
-        let prevY = y0;
-        let prevZ = a.z + offZ;
-        for (let s = 1; s <= SEGMENTS; s++) {
-          const t2 = s / SEGMENTS;
-          const x = a.x + dx * t2 + offX;
-          const z = a.z + dz * t2 + offZ;
+        this.segA.set(a.x + offX, y0, a.z + offZ);
+        for (let seg = 1; seg <= WIRE_SEGMENTS; seg++) {
+          const t2 = seg / WIRE_SEGMENTS;
           // 放物線のたるみ。両端で 0、中央で最大。
-          const y = y0 + (y1 - y0) * t2 - sag * 4 * t2 * (1 - t2);
-          verts.push(prevX, prevY, prevZ, x, y, z);
-          prevX = x;
-          prevY = y;
-          prevZ = z;
+          this.segB.set(
+            a.x + dx * t2 + offX,
+            y0 + (y1 - y0) * t2 - sag * 4 * t2 * (1 - t2),
+            a.z + dz * t2 + offZ,
+          );
+          this.placeWire();
+          this.segA.copy(this.segB);
         }
       }
     }
-    if (verts.length !== this.wireData.length) this.wireData = new Float32Array(verts.length);
-    this.wireData.set(verts);
-    const geom = this.wires.geometry;
-    geom.setAttribute('position', new BufferAttribute(this.wireData, 3));
-    geom.setDrawRange(0, verts.length / 3);
-    (geom.getAttribute('position') as BufferAttribute).needsUpdate = true;
-    geom.computeBoundingSphere();
+  }
+
+  /** `segA` → `segB` の 1 区間を円柱 1 本で埋める。 */
+  private placeWire(): void {
+    this.segDir.subVectors(this.segB, this.segA);
+    const len = this.segDir.length();
+    if (len < 1e-4) return;
+    this.segDir.divideScalar(len);
+    // 単位円柱は +Y に伸びているので、それを区間の向きへ倒す。
+    this.quat.setFromUnitVectors(this.axisUp, this.segDir);
+    this.pos.addVectors(this.segA, this.segB).multiplyScalar(0.5);
+    this.scl.set(1, len, 1);
+    this.mat.compose(this.pos, this.quat, this.scl);
+    this.wire.push(this.mat);
   }
 
   // ---------------------------------------------------------------------
@@ -684,9 +822,14 @@ export class RoadLayer {
    *
    * 標示は「その道が何車線で、どちらが優先で、どこで止まるか」を
    * 絵だけで伝える言語なので、道路クラスごとに書き分ける。
-   *   生活道路 : 外側線 + 白の破線（中央線なし相当）
+   *   生活道路 : 外側線のみ（中央線を引かない）
    *   二車線   : 外側線 + 黄の中央線 + 車線境界の破線
    *   大通り   : 外側線 + 黄の二重線 + 車線境界の破線 2 本
+   *
+   * 生活道路に中央線を引かないのは、法規どおりというだけではない。
+   * 幅員 6m の道に中央線を入れると、俯瞰で街区のすべての生活道路に
+   * 明るい線が 1 本ずつ走り、道路網が「基板の配線パターン」に見える。
+   * 実際の日本の生活道路にも中央線はほとんど無い。
    */
   private putMarkings(
     world: Simulation['world'],
@@ -732,10 +875,8 @@ export class RoadLayer {
       line(half - 0.3, 0.15, TILE_M, LINE_WHITE);
       line(-(half - 0.3), 0.15, TILE_M, LINE_WHITE);
 
-      if (cls === RoadClass.Street) {
-        // 生活道路は中央線を引かず、白の破線 1 本で対向を分ける。
-        dashed(0, 0.14, LINE_WHITE);
-      } else if (cls === RoadClass.Avenue) {
+      // 生活道路（RoadClass.Street）はここで何も足さない。外側線だけ。
+      if (cls === RoadClass.Avenue) {
         line(0, 0.16, TILE_M, LINE_YELLOW);
         dashed(half * 0.5, 0.12, LINE_WHITE);
         dashed(-half * 0.5, 0.12, LINE_WHITE);
@@ -786,8 +927,8 @@ export class RoadLayer {
 
       // 横断歩道。縞は歩行者の進む向きに対して直角＝道路の向きに沿って伸びる。
       const e = TILE_M / 2 - 1.6;
-      this.color.setHex(LINE_WHITE);
       const stripes = Math.max(3, Math.round((half * 2 - 0.6) / 1.25));
+      this.color.setHex(CROSSWALK_COLOR);
       for (let k = 0; k < stripes; k++) {
         const t = (k - (stripes - 1) / 2) * 1.25;
         this.place(
@@ -801,11 +942,25 @@ export class RoadLayer {
           this.color,
         );
       }
+      // 俯瞰用の 1 枚。縞の並ぶ範囲をそのまま覆う矩形を、平均色で敷く。
+      const band = stripes * 1.25;
+      this.color.setHex(CROSSWALK_FAR_COLOR);
+      this.place(
+        this.markingFar,
+        cx + ox * e,
+        y,
+        cz + oz * e,
+        alongZ ? band : 2.1,
+        alongZ ? 2.1 : band,
+        0,
+        this.color,
+      );
 
       // 停止線。日本は左側通行なので、流入してくる車線＝進行方向に向かって左。
       // 交差点の手前に太い白帯が 1 本あるだけで「止まる場所」が読める。
       const se = TILE_M / 2 - 3.4;
       const lat = half * 0.5;
+      this.color.setHex(LINE_WHITE);
       this.place(
         this.marking,
         cx + ox * se - ax * lat,
@@ -883,7 +1038,6 @@ export class RoadLayer {
       p.mesh.geometry.dispose();
       p.dispose();
     }
-    this.wires.geometry.dispose();
     for (const m of this.materials) m.dispose();
   }
 }

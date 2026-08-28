@@ -81,6 +81,17 @@ const SNOW_LINE_DM = 620;
 /** 再構築のクールダウン（フレーム数）。建物のエポックは 1 日に何度も動く。 */
 const REBUILD_COOLDOWN = 24;
 
+/**
+ * 幹を描くのをやめるカメラ距離 (m)。
+ *
+ * この距離だと木 1 本が 2px 前後にしかならない。そこに幹（＝樹冠と補色に近い
+ * 赤茶の細い棒）を混ぜても「木らしさ」は 1px も増えず、色の異なる粒が
+ * 増えるだけになる。冬に樹冠が痩せると、その粒だけが残って
+ * 「田園に赤い点が数千個散っている」ように見えていた。
+ * 遠景では樹冠だけの LOD ジオメトリに差し替える。
+ */
+const TRUNK_LOD_DISTANCE = 800;
+
 /** 向き d (0=北,1=東,2=南,3=西) の外向き単位ベクトル。街路樹をどの辺に植えるかで使う。 */
 const OUT_X = [0, 1, 0, -1] as const;
 const OUT_Z = [-1, 0, 1, 0] as const;
@@ -94,10 +105,17 @@ export class NatureLayer {
   private readonly cursors = new Int32Array(REGION_COUNT * KIND_COUNT);
   /** 種類ごとのジオメトリ。季節が変わったら作り直す。 */
   private geoms: BufferGeometry[] = [];
+  /** 遠景用（幹なし）のジオメトリ。中身が変わらない種類は `geoms` を指す。 */
+  private farGeoms: BufferGeometry[] = [];
+  /** いま遠景ジオメトリを使っているか。距離の帯をまたいだときだけ差し替える。 */
+  private far = false;
 
   /** 数の少ない種類は区画に切らずに 1 メッシュで持つ。 */
   private readonly streetTrees: InstancePool;
   private readonly bamboo: InstancePool;
+  /** 街路樹の遠景版（植樹枡と幹を落としたもの）。 */
+  private streetTreeFar: BufferGeometry;
+  private streetTreeNear: BufferGeometry;
 
   // 葉は薄いので裏からの光がわずかに透ける。粗さを下げすぎると
   // 樹冠がプラスチックになるので、拡散寄りのまま少しだけ反射を残す。
@@ -132,8 +150,10 @@ export class NatureLayer {
     this.group.name = 'nature';
     this.buildGeometries(Season.Summer);
     this.geomSeason = Season.Summer;
+    this.streetTreeNear = streetTreeGeometry(Season.Summer, 0.5);
+    this.streetTreeFar = streetTreeGeometry(Season.Summer, 0.5, true);
     this.streetTrees = new InstancePool(
-      streetTreeGeometry(Season.Summer, 0.5),
+      this.streetTreeNear,
       this.treeMaterial,
       this.group,
       true,
@@ -157,7 +177,13 @@ export class NatureLayer {
     this.seen.terrain = -1;
   }
 
-  update(sim: Simulation): void {
+  /**
+   * @param camDistance カメラの注視点からの距離 (m)。遠景で幹を落とす LOD に使う。
+   *   既定を 0 にしてあるのは、呼び出し元（renderer.ts）が渡さなくても
+   *   「近景 = 全部描く」で従来どおり動くようにするため。
+   */
+  update(sim: Simulation, camDistance = 0): void {
+    this.applyLod(camDistance > TRUNK_LOD_DISTANCE);
     const e = sim.world.epochs;
     const season = sim.clock.season;
     const changed =
@@ -182,7 +208,12 @@ export class NatureLayer {
 
     if (this.geomSeason !== season) {
       this.buildGeometries(season);
-      this.streetTrees.setGeometry(streetTreeGeometry(season, 0.55));
+      this.streetTreeNear.dispose();
+      this.streetTreeFar.dispose();
+      this.streetTreeNear = streetTreeGeometry(season, 0.55);
+      this.streetTreeFar = streetTreeGeometry(season, 0.55, true);
+      this.streetTrees.setGeometry(this.far ? this.streetTreeFar : this.streetTreeNear);
+      this.bamboo.mesh.geometry.dispose();
       this.bamboo.setGeometry(bambooGeometry(season, 0.5));
       this.geomSeason = season;
     }
@@ -203,6 +234,12 @@ export class NatureLayer {
   /** 季節ぶんのジオメトリ。幹と樹冠を 1 つに合成し、色は頂点に焼き込む。 */
   private buildGeometries(season: number): void {
     for (const g of this.geoms) g.dispose();
+    // 幹を持つ種類だけ遠景版を別に持つ。低木・岩・畦は幹が無いので同じ物を指す
+    // （2 本持っても中身が同じで、頂点バッファを無駄に倍持つだけになる）。
+    for (let k = 0; k < KIND_COUNT; k++) {
+      const g = this.farGeoms[k];
+      if (g && g !== this.geoms[k]) g.dispose();
+    }
     const bare = season === Season.Winter;
     this.geoms = [];
     this.geoms[Kind.Conifer] = coniferGeometry(season, 0.5);
@@ -210,6 +247,30 @@ export class NatureLayer {
     this.geoms[Kind.Shrub] = shrubGeometry(season, 0.5);
     this.geoms[Kind.Rock] = rockGeometry(7, false);
     this.geoms[Kind.Bund] = bundGeometry(season);
+    this.farGeoms = this.geoms.slice();
+    this.farGeoms[Kind.Conifer] = coniferGeometry(season, 0.5, true);
+    this.farGeoms[Kind.Broadleaf] = broadleafGeometry(season, 0.5, false, bare, true);
+  }
+
+  /** いまの LOD で使うべきジオメトリ。 */
+  private geomFor(kind: number): BufferGeometry {
+    return (this.far ? this.farGeoms[kind] : this.geoms[kind])!;
+  }
+
+  /**
+   * 遠景 LOD の切り替え。
+   *
+   * 木の位置は変えないので、区画メッシュのジオメトリ参照を差し替えるだけで済む
+   * （インスタンス行列は書き直さない）。距離の帯をまたいだときしか通らない。
+   */
+  private applyLod(far: boolean): void {
+    if (far === this.far) return;
+    this.far = far;
+    for (let s = 0; s < this.meshes.length; s++) {
+      const mesh = this.meshes[s];
+      if (mesh) mesh.geometry = this.geomFor(s % KIND_COUNT);
+    }
+    this.streetTrees.setGeometry(far ? this.streetTreeFar : this.streetTreeNear);
   }
 
   private materialFor(kind: number): typeof this.treeMaterial {
@@ -226,8 +287,8 @@ export class NatureLayer {
         continue;
       }
       if (mesh && this.caps[s]! >= need) {
-        // 季節が変わってジオメトリを差し替えていることがある。
-        mesh.geometry = this.geoms[s % KIND_COUNT]!;
+        // 季節や LOD が変わってジオメトリを差し替えていることがある。
+        mesh.geometry = this.geomFor(s % KIND_COUNT);
         continue;
       }
       if (mesh) {
@@ -237,7 +298,7 @@ export class NatureLayer {
       // 建物が増減するたびに作り直さずに済むよう、少し余裕を持たせる。
       const cap = need + Math.max(32, need >> 2);
       const kind = s % KIND_COUNT;
-      const next = new InstancedMesh(this.geoms[kind]!, this.materialFor(kind), cap);
+      const next = new InstancedMesh(this.geomFor(kind), this.materialFor(kind), cap);
       next.count = 0;
       // 区画ごとに視錐台カリングを効かせる。これがこのレイヤの肝。
       next.frustumCulled = true;
@@ -435,7 +496,14 @@ export class NatureLayer {
           height,
           spread,
           ((g >>> 25) % 360) * (Math.PI / 180),
-          this.jitterCanopy(g, conifer ? 0.022 : 0.05, conifer ? 0.16 : 0.24),
+          // 冬の落葉樹は「枝の塊」＝ほぼ無彩色なので、色相を振ると
+          // 朝夕の低い日射を拾って個体ごとに赤やピンクに転ぶ。
+          // 遠景ではそれが「田園に散った赤い粒」に戻るので、冬だけ振れ幅を絞る。
+          this.jitterCanopy(
+            g,
+            conifer ? 0.022 : winter ? 0.014 : 0.05,
+            conifer ? 0.16 : winter ? 0.15 : 0.24,
+          ),
         );
       }
     }
@@ -563,7 +631,12 @@ export class NatureLayer {
       if (mesh) mesh.dispose();
     }
     for (const g of this.geoms) g.dispose();
-    this.streetTrees.mesh.geometry.dispose();
+    for (let k = 0; k < KIND_COUNT; k++) {
+      const g = this.farGeoms[k];
+      if (g && g !== this.geoms[k]) g.dispose();
+    }
+    this.streetTreeNear.dispose();
+    this.streetTreeFar.dispose();
     this.streetTrees.dispose();
     this.bamboo.mesh.geometry.dispose();
     this.bamboo.dispose();

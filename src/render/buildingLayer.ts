@@ -5,9 +5,36 @@ import type { Simulation } from '@sim/simulation';
 import { idx, tileX, tileY } from '@sim/world/tiles';
 import { BuildingParts, setBuildingNight } from './buildingParts';
 import { composeBuilding, rnd, type BuildCtx, type Facing } from './buildingShapes';
-import { jitterColor } from './materials';
 import { atmosphereAt } from './sky';
-import { meshStyle } from './theme';
+import { meshStyle, TIN_ROOFS } from './theme';
+
+const hsl = { h: 0, s: 0, l: 0 };
+
+/**
+ * 基準色を棟ハッシュで散らす。
+ *
+ * 以前は共通の `jitterColor` を使っていたが、あれは 1 つの乱数から
+ * 色相と明度の両方を作っていた（＝色相が上がると必ず明度も上がる）。
+ * 相関があると、散らしたはずの色が「明るい方は黄色、暗い方は青」という
+ * 一本の線の上に乗ってしまい、街を引いて見たときに色の帯として読める。
+ *
+ * ここでは色相・彩度・明度に独立したハッシュを引き、
+ * 色相 ±8度 / 明度 ±12% / 彩度 ±20% の範囲で散らす。
+ * instanceColor に載せるだけなので追加のコストはゼロ。
+ */
+function scatterColor(base: number, hash: number, out: Color, strength = 1): Color {
+  out.setHex(base);
+  out.getHSL(hsl);
+  const a = rnd(hash, 601) - 0.5; // 色相
+  const b = rnd(hash, 602) - 0.5; // 彩度
+  const c = rnd(hash, 603) - 0.5; // 明度
+  out.setHSL(
+    (hsl.h + a * (16 / 360) * strength + 1) % 1,
+    Math.max(0, Math.min(1, hsl.s * (1 + b * 0.4 * strength))),
+    Math.max(0.03, Math.min(0.97, hsl.l * (1 + c * 0.24 * strength))),
+  );
+  return out;
+}
 
 /**
  * 建物の描画。
@@ -21,10 +48,11 @@ import { meshStyle } from './theme';
  * - **どう積むか**（`buildingShapes.ts`）: 用途ごとに基壇・セットバック・
  *   塔屋・屋上設備・庇・看板・鳥居・煙突を積む。形はすべて棟のハッシュから
  *   決めるので、同じ用途でも 2〜4 通りの量塊になり、反復が目立たない。
- * - **どう描くか**（`buildingParts.ts`）: 積まれた部品を 6 種類の
- *   InstancedMesh（面取り箱・切妻・寄棟・円柱・受水槽・鳥居）に振り分ける。
- *   窓・バルコニー・シャッターはシェーダが壁のローカル座標から描くので、
- *   造形を増やしてもドローコールは 6 のまま増えない。
+ * - **どう描くか**（`buildingParts.ts`）: 積まれた部品を十数種類の
+ *   InstancedMesh（面取り箱・切妻・寄棟・円柱・受水槽・鳥居・室外機の列・
+ *   排気筒・手すり・看板 2 種）に振り分ける。窓・バルコニー・シャッター・
+ *   看板の文字はシェーダが部品のローカル座標から描くので、
+ *   街に何棟建とうとドローコールはキットの数のまま増えない。
  *
  * インスタンスの書き込みは以前と同じく「建物の増減があったとき」だけ。
  * 夜の点灯は材質のユニフォーム 1 つで動くので、毎フレームの走査は要らない。
@@ -55,6 +83,8 @@ export class BuildingLayer {
       style: meshStyle('house'),
       wall: this.wall,
       roof: this.roof,
+      roofRough: 0.74,
+      roofMetal: 0.06,
     };
   }
 
@@ -114,11 +144,17 @@ export class BuildingLayer {
       ctx.height = (style.baseHeight + style.perLevel * (level - 1)) * (0.93 + rnd(hash, 60) * 0.16);
       ctx.front = this.facingOf(b.accessTile[slot]!, ox, oy, a.w, a.h, hash);
 
-      // 個体色。候補から 1 つ選び、さらに色相と明度を僅かに散らす。
+      // 個体色。候補から 1 つ選び、さらに色相・彩度・明度を独立に散らす。
       const wallBase = style.walls[Math.floor(rnd(hash, 70) * style.walls.length) % style.walls.length]!;
-      jitterColor(wallBase, hash, 0.17, this.wall);
+      scatterColor(wallBase, hash, this.wall);
       const roofBase = style.roofs[Math.floor(rnd(hash, 71) * style.roofs.length) % style.roofs.length]!;
-      jitterColor(roofBase, hash ^ 0x5bf03, 0.08, this.roof);
+      // 屋根は壁ほど散らさない。同じ街区で屋根の色相まで暴れると、
+      // 「色を散らした」ではなく「配色が壊れている」に見える。
+      scatterColor(roofBase, hash ^ 0x5bf03, this.roof, 0.55);
+      // 金属葺きだけ鈍く光らせる。同じ切妻でも材の違いが読めるようになる。
+      const tin = TIN_ROOFS.has(roofBase);
+      ctx.roofRough = tin ? 0.42 : 0.79;
+      ctx.roofMetal = tin ? 0.55 : 0.06;
 
       composeBuilding(a.mesh, ctx);
     }
