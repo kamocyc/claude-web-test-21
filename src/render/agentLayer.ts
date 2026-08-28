@@ -153,7 +153,10 @@ const WALK_OUTER_M = TILE_M / 2;
  */
 const STREET_LIFE_DISTANCE_M = 400;
 const STREET_LIFE_RADIUS_M = 320;
-/** 路肩に飾りの車を置く確率 (%)。大通りは駐車禁止のつもりで減らす。 */
+/**
+ * 路肩に飾りの車を足す確率 (%)。縦列の枠 1 つが 5.2m なので、
+ * 5 割強で「20m にだいたい 1 台」になる。大通りは駐車禁止のつもりで減らす。
+ */
 const PARK_CHANCE_PCT: Record<number, number> = {
   [RoadClass.None]: 0,
   [RoadClass.Street]: 58,
@@ -838,20 +841,24 @@ export class AgentLayer {
     cls: number,
   ): void {
     const h = tileHash(tile, 1);
-    // 2 タイルに 1 台 ＝ 20m 間隔。
+    // タイルの半分ほどに 1 台足す（縦列の枠 1 つ ＝ 5.2m なので、おおむね 20m 間隔）。
     if (h % 100 >= (PARK_CHANCE_PCT[cls] ?? 0)) return;
-    const side = h & 0x200 ? 1 : -1;
+    // **駐車枠はシミュレーション由来の駐車車両と共有する。**
+    // 別々に置き場所を決めると、同じ路肩に 2 台が重なって 1 台が 2 台に割れる。
+    // 先に走った drawParkedCars が使った枠の続きに 1 台足す形にすれば、
+    // 縦列の間隔（5.2m）も左右の割り振りも自動的に噛み合う。
+    const used = this.parkSlots.get(tile) ?? 0;
+    if (used >= PARKED_CARS_PER_TILE) return;
+    const side = used & 1 ? 1 : -1;
     if (this.busy.has(tile * 2 + (side > 0 ? 1 : 0))) return;
-    // シミュレーション由来の駐車車両が既に埋めているタイルは譲る。
-    if (this.parkSlots.has(tile)) return;
 
     const kind = carKind(h);
     const fleet = this.cars[kind]!;
     if (fleet.count >= MAX_VISIBLE_VEHICLES) return;
+    this.parkSlots.set(tile, used + 1);
 
     const curb = side * shoulderOffset(cls, kind);
-    // タイルの中で前後に散らす。車長 4.4m なので ±1.5m までなら隣にはみ出さない。
-    const along = (((h >>> 12) % 64) / 64 - 0.5) * 3.0;
+    const along = ((used >> 1) - 0.5) * 5.2;
     const ox = alongZ ? curb : along;
     const oz = alongZ ? along : curb;
     this.quat.setFromAxisAngle(this.axisY, parkHeading(alongZ, side));
@@ -896,8 +903,11 @@ export class AgentLayer {
     for (let k = 0; k < n; k++) {
       const g = tileHash(tile, 10 + k);
       const side = g & 1 ? 1 : -1;
-      // 縁石の上から歩道の外縁まで。車道側にはみ出さないよう内側は縁石 +0.55m。
-      const lateral = side * Math.min(WALK_OUTER_M - 0.5, half + 0.55 + ((g >>> 3) % 3) * 0.45);
+      // 縁石の内側（車道）と歩道の外縁の**両方**で挟む。外縁で切るだけだと、
+      // 車道の広い大通り（半幅 4.3m）で人が舗装の上に立ってしまう。
+      const inner = half + 0.35;
+      const outer = Math.max(inner, WALK_OUTER_M - 0.35);
+      const lateral = side * Math.min(outer, inner + ((g >>> 3) % 3) * 0.4);
       const along = (((g >>> 6) % 100) / 100 - 0.5) * TILE_M * 0.86;
       const px = wx + (alongZ ? lateral : along);
       const pz = wz + (alongZ ? along : lateral);
@@ -1040,7 +1050,7 @@ export class AgentLayer {
         this.tmp.z + oz,
       );
       this.mat.compose(this.pos, this.quat, this.scl);
-      this.markLane(this.tmp.x + ox, this.tmp.z + oz, heading, ox, oz);
+      this.markLane(this.tmp.x + ox, this.tmp.z + oz, heading, ox, oz, isTruck || isBus);
 
       const owner = tr.owner[v]!;
       if (isTruck) {
@@ -1089,17 +1099,21 @@ export class AgentLayer {
    * 車体は 4m 級なのでタイル境界をまたぐ。前後 1 つずつも一緒に潰しておかないと、
    * 隣のタイルに置いた駐車車両に半分めり込む。
    */
-  private markLane(x: number, z: number, heading: number, ox: number, oz: number): void {
+  private markLane(x: number, z: number, heading: number, ox: number, oz: number, wide: boolean): void {
     // 前方は (sin h, cos h)。|cos| が大きいほど道は Z 方向に走っている。
     const alongZ = Math.abs(Math.cos(heading)) >= Math.abs(Math.sin(heading));
     const side = (alongZ ? ox : oz) > 0 ? 1 : 0;
-    const fx = Math.sin(heading) * 3.6;
-    const fz = Math.cos(heading) * 3.6;
+    // タイルは 10m。前後 5m を潰しておけば、車体がまたいだ隣のタイルも必ず入る。
+    const fx = Math.sin(heading) * 5;
+    const fz = Math.cos(heading) * 5;
     for (let k = -1; k <= 1; k++) {
       const tx = Math.floor((x + fx * k) / TILE_M);
       const tz = Math.floor((z + fz * k) / TILE_M);
       if (tx < 0 || tz < 0 || tx >= MAP_W || tz >= MAP_H) continue;
-      this.busy.add(idx(tx, tz) * 2 + side);
+      const t = idx(tx, tz);
+      this.busy.add(t * 2 + side);
+      // バス（全幅 2.44m）とトラックは、車線の中央にいても反対側の路肩まで届く。
+      if (wide) this.busy.add(t * 2 + (1 - side));
     }
   }
 

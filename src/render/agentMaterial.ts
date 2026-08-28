@@ -36,16 +36,16 @@ export const GLASS_ATTRIBUTE = 'aGlass';
  * ガラスの絶対色（＝金属度を上げたときの反射色）。
  * 空色に寄せた明るい青灰。ここが暗いと結局ガラスが黒くなる。
  */
-const GLASS_TINT = 'vec3(0.44, 0.49, 0.55)';
+const GLASS_TINT = 'vec3(0.40, 0.43, 0.47)';
 /** ガラスの粗さと金属度。ほぼ鏡にして環境マップを拾わせる。 */
 const GLASS_ROUGHNESS = '0.07';
 const GLASS_METALNESS = '0.94';
 /** ガラスだけ環境マップを強く拾わせる倍率。 */
-const GLASS_ENV_GAIN = '2.0';
+const GLASS_ENV_GAIN = '1.6';
 
 /** 夜の持ち上げ量。一律の下駄と、車体色に比例する分。 */
-const NIGHT_FLOOR = 0.05;
-const NIGHT_TINT = 0.1;
+const NIGHT_FLOOR = 0.028;
+const NIGHT_TINT = 0.065;
 
 export interface AgentSurfaceOptions {
   roughness: number;
