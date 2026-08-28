@@ -382,7 +382,7 @@ export class RoadLayer {
     // ただし金属の見えは間接鏡面がほぼすべてなので、遮蔽の無い環境マップだと
     // 視線が寝たとたんに真っ白な円板になる。舗装を暗くしたぶん目立つので、
     // 金属度と映り込みを一段落として「錆びた鋳鉄」の側に寄せる。
-    const manholeMat = surface({ roughness: 0.62, metalness: 0.32, envMapIntensity: 0.16 });
+    const manholeMat = surface({ roughness: 0.62, metalness: 0.2, envMapIntensity: 0.22 });
     manholeMat.polygonOffset = true;
     manholeMat.polygonOffsetFactor = -7;
     manholeMat.polygonOffsetUnits = -7;

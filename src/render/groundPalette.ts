@@ -289,8 +289,14 @@ export const RUT_COLOR = 0x2c2d29;
 export const CROWN_COLOR = 0x3d3e37;
 /** 補修跡。掘り返して埋め戻した新しいアスファルトなので、周りより黒い。 */
 export const PATCH_COLOR = 0x26272a;
-/** マンホールの鋳鉄蓋。錆と土埃で茶色く濁っている。 */
-export const MANHOLE_COLOR = 0x4c4740;
+/**
+ * マンホールの鋳鉄蓋。錆と土埃で茶色く濁っている。
+ *
+ * 舗装より明るいのがポイント。材質の金属度を上げるほど拡散反射が削られるので、
+ * 蓋が「路面に空いた黒い穴」に見える。蓋が目に留まるのは路面より明るいからで、
+ * 暗い円板では傷にしか見えない。
+ */
+export const MANHOLE_COLOR = 0x5b554b;
 
 /** 歩道の平板（インターロッキング）。日本の歩道はやや暖色のグレー。 */
 export const WALKWAY_COLOR = 0x9a958a;
