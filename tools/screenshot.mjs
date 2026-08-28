@@ -31,14 +31,15 @@ mkdirSync(outDir, { recursive: true });
 const SHOTS = [
   { name: '01-overview-noon', dist: 900, azim: 0.7, elev: 48, hour: 12 },
   { name: '02-district-noon', dist: 380, azim: 0.9, elev: 34, hour: 12 },
-  { name: '03-street-noon', dist: 120, azim: 1.2, elev: 18, hour: 12 },
-  { name: '04-street-dusk', dist: 130, azim: 2.4, elev: 16, hour: 18.2 },
+  { name: '03-street-noon', dist: 210, azim: 1.2, elev: 20, hour: 12 },
+  { name: '04-street-dusk', dist: 150, azim: 2.4, elev: 14, hour: 18.2 },
   { name: '05-district-night', dist: 340, azim: 0.9, elev: 30, hour: 21 },
   { name: '06-overview-morning', dist: 700, azim: 3.9, elev: 40, hour: 6.6 },
   // 目線の高さ。路面・歩道・車・人・街灯が「人が見る距離」でどう見えるかは
   // ここでしか分からない。俯瞰だけ見て作ると路上が空っぽのまま気づけない。
-  { name: '07-eyelevel-noon', dist: 155, azim: 1.9, elev: 12, hour: 12 },
-  { name: '08-eyelevel-night', dist: 160, azim: 1.9, elev: 13, hour: 20.5 },
+  // 道路は軸に平行なので、方位を軸に合わせないと街路を見通せない。
+  { name: '07-eyelevel-noon', dist: 115, azim: 0.02, elev: 6, hour: 12 },
+  { name: '08-eyelevel-night', dist: 118, azim: 0.02, elev: 6.5, hour: 20.5 },
 ];
 
 // すでに立っている dev サーバがあれば使い回す（撮影のたびに 1 秒待たない）
@@ -90,8 +91,23 @@ try {
 
   await page.goto(base + '?start=sample&seed=42&fx=high', { waitUntil: 'load' });
   await page.waitForFunction(() => window.__game != null, null, { timeout: 180000 });
+  // 実際に描かれたフレーム数を数える。ソフトウェア描画では 1 フレームに
+  // 数秒かかることがあり、固定の秒数で待つと「まだ何も反映されていない絵」を
+  // 撮ってしまう。
+  await page.evaluate(() => {
+    window.__frames = 0;
+    const tick = () => {
+      window.__frames++;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+  const waitFrames = async (n) => {
+    const from = await page.evaluate(() => window.__frames);
+    await page.waitForFunction((a) => window.__frames >= a.from + a.n, { from, n }, { timeout: 300000 });
+  };
   // 街の生成直後は建物・車のインスタンスがまだ 1 フレームも書かれていない
-  await page.waitForTimeout(4000);
+  await waitFrames(6);
 
   for (const shot of SHOTS) {
     if (only && !only.split(',').includes(shot.name.replace(/^\d+-/, '')) && !only.split(',').includes(shot.name)) continue;
@@ -108,10 +124,8 @@ try {
       g.sim.clock.tick += ((want - cur) + perDay) % perDay;
     }, shot);
     // 数フレーム回して補間・インスタンス更新を落ち着かせる
-    // ソフトウェア描画（CI やコンテナ）では 1 フレーム 1 秒近くかかる。
-    // 待ちと撮影のタイムアウトを実測より十分長く取っておかないと、
-    // ポストエフェクトの掛かっていない途中の絵が撮れてしまう。
-    await page.waitForTimeout(3000);
+    // カメラと時刻を変えてから、実際に数フレーム描かれるまで待つ。
+    await waitFrames(4);
     await page.screenshot({ path: resolve(outDir, shot.name + '.png'), timeout: 180000 });
     const stats = await page.evaluate(() => ({
       drawCalls: window.__game.renderer.drawCalls,
