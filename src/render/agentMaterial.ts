@@ -30,7 +30,15 @@ import { surface } from './materials';
  * 黒い車が黒いままで、下駄だけだと白い車も黒い車も同じ明るさになる。
  */
 
-/** ガラス部分に 1 を立てる頂点属性の名前。 */
+/**
+ * ガラス部分に印を付ける頂点属性の名前。
+ *
+ * 値は **0 = 不透明部・1..2 = ガラス**。1 を足したうえで小数部に
+ * 「そのガラスの中での高さ（0 = 下端、1 = 上端）」を載せてある。
+ * varying を 1 本増やさずに「ここはガラス」と「窓の上下」を同時に運ぶための
+ * 詰め方で、フラグメント側で `step` と `fract` 相当の 2 つに割って使う。
+ * 窓 1 枚の中に上下の階調を作るのに、この高さがどうしても要る。
+ */
 export const GLASS_ATTRIBUTE = 'aGlass';
 
 /**
@@ -56,7 +64,7 @@ export const SKIN_ATTRIBUTE = 'aSkin';
  * 明るく見えているぶんはすべて**反射**である。地は暗く置き直し、
  * 明るさは下の反射項で作る。
  */
-const GLASS_TINT = 'vec3(0.055, 0.062, 0.075)';
+const GLASS_TINT = 'vec3(0.030, 0.034, 0.042)';
 /** ガラスの粗さと金属度。反射は自前で足すので、環境マップは補助に留める。 */
 const GLASS_ROUGHNESS = '0.10';
 const GLASS_METALNESS = '0.65';
@@ -94,9 +102,14 @@ const GLASS_REFLECT = /* glsl */ `
 		float up = dot( reflect( -vDir, nrm ), upView );
 		vec3 refl = mix( uGlassGround, uGlassHorizon, smoothstep( -0.45, 0.0, up ) );
 		refl = mix( refl, uGlassSky, smoothstep( 0.0, 0.6, up ) );
+		// **窓の高さそのもの**でもう一段割る。法線から引いた 3 段は、側面窓のように
+		// 面が真横を向いていると面内でほとんど変化せず、結局 1 枚が一色になる
+		//（前回「反りを足した」のが効かなかったのはここ）。窓の上端は空を、
+		// 下端は路面と暗い車内を映すので、上下で 4 倍の明度差を直接与える。
+		refl *= 0.26 + 1.12 * gUp;
 		// 視線が浅いほど強く映る（フレネル）。縁が光るとガラスの厚みが出る。
 		float fres = pow( 1.0 - clamp( dot( vDir, nrm ), 0.0, 1.0 ), 4.0 );
-		totalEmissiveRadiance += vGlass * refl * ( 0.34 + 1.15 * fres );
+		totalEmissiveRadiance += gMask * refl * ( 0.30 + 1.15 * fres );
 	}
 `;
 
@@ -171,23 +184,29 @@ export function agentSurface(o: AgentSurfaceOptions): AgentSurface {
     let fs = `uniform float uNight;\nuniform vec3 uGlassSky;\nuniform vec3 uGlassHorizon;\nuniform vec3 uGlassGround;\n${glass ? 'varying float vGlass;\n' : ''}${shader.fragmentShader}`;
     if (glass) {
       fs = fs
-        // 車体色の変調を捨てて絶対色にする。ここがガラスが黒くならない理由。
+        // 属性に詰めた 2 つの値をここで割る。以降は gMask（0/1）と
+        // gUp（窓の中の高さ 0..1）だけを使う。`color_fragment` は
+        // 粗さ・金属度より前に来るので、ここで宣言しておけば全部から見える。
         .replace(
           '#include <color_fragment>',
-          `#include <color_fragment>\n\tdiffuseColor.rgb = mix(diffuseColor.rgb, ${GLASS_TINT}, vGlass);`,
+          `#include <color_fragment>
+	float gMask = step(0.5, vGlass);
+	float gUp = clamp(vGlass - 1.0, 0.0, 1.0);
+	diffuseColor.rgb = mix(diffuseColor.rgb, ${GLASS_TINT}, gMask);`,
         )
         .replace(
           '#include <roughnessmap_fragment>',
-          `#include <roughnessmap_fragment>\n\troughnessFactor = mix(roughnessFactor, ${GLASS_ROUGHNESS}, vGlass);`,
+          `#include <roughnessmap_fragment>\n\troughnessFactor = mix(roughnessFactor, ${GLASS_ROUGHNESS}, gMask);`,
         )
         .replace(
           '#include <metalnessmap_fragment>',
-          `#include <metalnessmap_fragment>\n\tmetalnessFactor = mix(metalnessFactor, ${GLASS_METALNESS}, vGlass);`,
+          `#include <metalnessmap_fragment>\n\tmetalnessFactor = mix(metalnessFactor, ${GLASS_METALNESS}, gMask);`,
         )
         // 空の映り込みそのものを強める。金属度だけだと日陰の車で足りない。
+        // ただし窓の下半分には掛けない（下端まで空を映すと平板に戻る）。
         .replace(
           '#include <lights_fragment_maps>',
-          `#include <lights_fragment_maps>\n\tradiance *= mix(1.0, ${GLASS_ENV_GAIN}, vGlass);`,
+          `#include <lights_fragment_maps>\n\tradiance *= mix(1.0, ${GLASS_ENV_GAIN} * (0.30 + 0.85 * gUp), gMask);`,
         );
     }
     // 夜の持ち上げと、ガラスの反射。どちらも法線が確定した後でないと書けないので、
