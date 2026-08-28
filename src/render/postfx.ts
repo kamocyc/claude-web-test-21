@@ -160,17 +160,23 @@ export class PostFx {
    */
   setMood(nightAmount: number, warmth: number): void {
     if (this.bloom) {
-      // 昼は光源が太陽だけなので弱く、夜は窓と街灯が主役なので強く
-      this.bloom.strength = 0.16 + nightAmount * 0.3;
-      this.bloom.threshold = 0.95 - nightAmount * 0.18;
+      // しきい値はトーンマッピング前の値に効く。夜に 0.8 まで下げると、
+      // 街灯に照らされた壁のような「明るいだけの面」まで滲み、
+      // 窓の灯りが白い矩形に潰れる。1.0 より上＝自発光だけを拾わせる。
+      this.bloom.strength = 0.16 + nightAmount * 0.34;
+      this.bloom.threshold = 1.25 - nightAmount * 0.22;
       this.bloom.radius = 0.5 + nightAmount * 0.25;
     }
     if (this.grade) {
       const u = this.grade.uniforms;
       (u.uTint!.value as Vector2).set(warmth, 0);
-      u.uContrast!.value = 1.05 + nightAmount * 0.06;
-      u.uSaturation!.value = 1.1 - nightAmount * 0.12;
-      u.uLift!.value = nightAmount * 0.012;
+      // 夜はコントラストを上げない。上げると暗部が先に 0 に沈み、
+      // 「黒い穴と白いシール」の 2 値になる。代わりに黒を持ち上げる。
+      u.uContrast!.value = 1.06 - nightAmount * 0.1;
+      u.uSaturation!.value = 1.1 - nightAmount * 0.06;
+      u.uLift!.value = nightAmount * 0.05;
+      // 周辺減光も夜は弱める。四隅が黒く沈むと、暗部の潰れがさらに広がる。
+      u.uVignette!.value = 0.28 - nightAmount * 0.15;
     }
   }
 

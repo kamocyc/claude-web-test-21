@@ -3,7 +3,7 @@ import {
   BufferGeometry,
   Color,
   DirectionalLight,
-  Fog,
+  FogExp2,
   HemisphereLight,
   InstancedMesh,
   Line,
@@ -107,7 +107,11 @@ export class Renderer {
 
     // 背景は空ドームが描く。単色の background を残すと手前に出て台無しになる。
     this.scene.background = null;
-    this.scene.fog = new Fog(0xcadbe8, 900, 3400);
+    // 指数フォグにする。線形フォグは「開始距離」と「消える距離」を
+    // カメラ距離から毎フレーム決め直す必要があり、近景を守ろうとすると
+    // 遠景の空気遠近が消え、遠景を出そうとすると街区が白く洗われる。
+    // 指数なら 1 つの密度で、近くは素通し・遠くだけ空色に溶ける。
+    this.scene.fog = new FogExp2(0xcadbe8, 0.00022);
     this.scene.add(this.sky.mesh);
     this.skyScene.add(this.sky.clone());
 
@@ -350,8 +354,14 @@ export class Renderer {
     // いちばん大きな減点だった。粗い影でも、無いよりはるかに良い。
     // そこで、引いたら影マップを 4096 に上げて範囲を広げ、
     // 日が出ているあいだは切らないことにした。
-    const span = Math.max(110, Math.min(2200, this.rig.distance * 0.95));
-    const wantSize = this.rig.distance > 420 ? 4096 : 2048;
+    // 太陽が低いほど影は長く伸びる。仰角 10 度なら 30m のビルの影は 170m
+    // 先まで届くので、範囲をカメラ距離だけで決めると夕方の影が途中で
+    // 切り落とされ、「低い太陽なのに影が無い」絵になる。
+    const lowSun = Math.min(2.6, 1 / Math.max(0.32, this.sunDir.y));
+    const span = Math.max(110, Math.min(2400, this.rig.distance * 0.95 * lowSun));
+    // 解像度は 2048 に留める。4096 は帯域を倍以上使うわりに、
+    // 実際に見える差は「影の縁が 1px 締まる」程度しかない。
+    const wantSize = 2048;
     if (this.sun.shadow.mapSize.width !== wantSize) {
       this.sun.shadow.mapSize.set(wantSize, wantSize);
       // 解像度を変えたら、確保済みのデプステクスチャは作り直させる
@@ -389,16 +399,13 @@ export class Renderer {
     // 霞は地平線の色に合わせる。カメラが寄っているときに霞ませると
     // 近景の造形が全部白くなるので、距離に応じて開始位置を押し出す。
     if (this.scene.fog) {
-      const fog = this.scene.fog as Fog;
+      const fog = this.scene.fog as FogExp2;
       fog.color.copy(atmo.horizon);
+      // 朝夕は靄が濃く、日中と夜は澄む。2km 先でコントラストが残る濃さ。
+      fog.density = 0.00019 + (1 - Math.abs(atmo.nightAmount - 0.5) * 2) * 0.00016;
       // 霞み始めをカメラ距離の 2 倍より遠くに置く。ここを近くすると、
       // 街区を見下ろしている距離で「見えている街の大半」が霞に沈み、
       // せっかくの造形が白く飛んでしまう。
-      // 空気遠近はカメラ距離に比例させる。俯瞰で霞を遠くへ逃がすと、
-      // 手前の家と 3km 先の家が同じ濃さで描かれ、街が一枚の平面に見える。
-      // 近景では霞に沈む物が視界にほとんど入らないので、下限だけ置けばよい。
-      fog.near = Math.max(180, this.rig.distance * 0.5);
-      fog.far = Math.max(1400, this.rig.distance * 5.5);
     }
 
     this.updateEnvironment(frac);

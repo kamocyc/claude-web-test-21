@@ -83,16 +83,18 @@ const key = (
  *
  * 数字は「写真で見た日本の空」に寄せてある。とくに
  *   - 朝夕は日射が橙〜赤に寄り、強さが落ちるぶん露出を上げる
- *   - 夜は月光（青）を弱く残す。真っ暗にすると街の造形が全部消える
+ *   - 夜は露出を上げるのではなく、回り込み（半球ライト）を上げて稼ぐ。
+ *     露出で持ち上げると、窓の灯りが先に 255 に張り付いて白い矩形になり、
+ *     そのくせ壁は黒いままで、階調が 2 値になる
  *   - 日中は回り込み（半球ライト）を控えめにし、直射との差を開ける。
  *     環境光を上げると陰が消えて全部が平らな板になる。明るさは日射で稼ぐ。
  * の 3 点が絵の印象を決める。
  */
 const KEYFRAMES: Keyframe[] = [
   //   h   zenith    horizon   sun       int   skyLt     grndLt    amb   exp   star  night
-  key(0, 0x080d1c, 0x141d33, 0x8ea2d8, 0.42, 0x4a5f92, 0x2a3040, 0.72, 1.3, 1, 1),
-  key(4.4, 0x0a1020, 0x18223a, 0x8ea2d8, 0.44, 0x4d6396, 0x2c3242, 0.74, 1.28, 0.95, 1),
-  key(5.3, 0x1b2748, 0x53415a, 0xc08a84, 0.55, 0x5b74c0, 0x2c2a34, 0.78, 1.2, 0.35, 0.85),
+  key(0, 0x080d1c, 0x141d33, 0x8ea2d8, 0.5, 0x5d74ad, 0x363d4e, 1.0, 1.06, 1, 1),
+  key(4.4, 0x0a1020, 0x18223a, 0x8ea2d8, 0.52, 0x6076b0, 0x383f50, 1.02, 1.05, 0.95, 1),
+  key(5.3, 0x1b2748, 0x53415a, 0xc08a84, 0.62, 0x6a82c8, 0x3a3742, 1.0, 1.08, 0.35, 0.85),
   key(6.2, 0x39527f, 0xc07a58, 0xff9a5e, 0.85, 0x6a80cc, 0x46403c, 0.66, 1.12, 0, 0.35),
   key(7.4, 0x3f6ea6, 0xbfc9cd, 0xffd9b0, 1.55, 0x8fb0d4, 0x6a6152, 0.5, 1.0, 0, 0.05),
   key(9.5, 0x2f6fb4, 0xc2d3e0, 0xfff0da, 2.25, 0x9dc0e4, 0x77705d, 0.54, 0.95, 0, 0),
@@ -100,9 +102,9 @@ const KEYFRAMES: Keyframe[] = [
   key(15, 0x2f6fb4, 0xc6d6e4, 0xfff0d6, 2.3, 0x9dc0e4, 0x7a7360, 0.55, 0.95, 0, 0),
   key(17.2, 0x3a68a2, 0xd7b489, 0xffd3a0, 1.5, 0x7e9ada, 0x6a6256, 0.52, 1.0, 0, 0.05),
   key(18.3, 0x39406f, 0xd98a52, 0xff8a4a, 0.78, 0x6a7fc8, 0x453e3e, 0.66, 1.1, 0, 0.45),
-  key(19.2, 0x1d2445, 0x6a4358, 0xb87280, 0.55, 0x5a6ec0, 0x2d2a36, 0.78, 1.2, 0.3, 0.85),
-  key(20.2, 0x0b1120, 0x1b2540, 0x8ea2d8, 0.44, 0x4c6094, 0x2b3141, 0.73, 1.3, 0.85, 1),
-  key(24, 0x080d1c, 0x141d33, 0x8ea2d8, 0.42, 0x4a5f92, 0x2a3040, 0.72, 1.3, 1, 1),
+  key(19.2, 0x1d2445, 0x6a4358, 0xb87280, 0.62, 0x6a80c8, 0x3b3844, 1.0, 1.08, 0.3, 0.85),
+  key(20.2, 0x0b1120, 0x1b2540, 0x8ea2d8, 0.52, 0x5f75ae, 0x373e4f, 1.01, 1.06, 0.85, 1),
+  key(24, 0x080d1c, 0x141d33, 0x8ea2d8, 0.5, 0x5d74ad, 0x363d4e, 1.0, 1.06, 1, 1),
 ];
 
 const current: Atmosphere = {
@@ -168,10 +170,11 @@ export function sunDirection(dayFraction: number, out = new Vector3()): Vector3 
   }
   // 方位: 0 = 東、π/2 = 南、π = 西
   const az = progress * Math.PI;
-  // 仰角の頂点は 46 度に抑える。真上から照らすと影が建物の真下に隠れ、
-  // 街全体が「陰影の無い塗り絵」になる。斜めから当てて初めて、
-  // 建物の高さ・軒の出・道路の谷が影として読めるようになる。
-  const maxEl = night ? MathUtils.degToRad(38) : MathUtils.degToRad(46);
+  // 仰角の頂点は 38 度に抑える。真上から照らすと影が建物の真下に隠れ、
+  // 街全体が「陰影の無い塗り絵」になる。46 度でも俯瞰では影が建物に隠れて
+  // 街区に落ちなかったので、実際の南中高度より低く倒してある。
+  // 物理的な正しさより、「高さが影として読める」ほうを取る。
+  const maxEl = night ? MathUtils.degToRad(32) : MathUtils.degToRad(38);
   // 地平線ぎりぎりまで下げると影が画面の端まで伸びて破綻するので、下限を置く
   const el = Math.max(MathUtils.degToRad(9), Math.sin(az) * maxEl);
   const cosEl = Math.cos(el);
@@ -258,15 +261,22 @@ const SKY_FRAG = /* glsl */ `
       vec2 uv = dir.xz / max(up + 0.14, 0.14);
       float n = fbm(uv * 0.55 + vec2(uTime * 0.004, uTime * 0.0016));
       float n2 = fbm(uv * 1.7 - vec2(uTime * 0.009, 0.0));
-      float density = smoothstep(0.52, 0.86, n * 0.75 + n2 * 0.35);
+      float density = smoothstep(0.46, 0.82, n * 0.78 + n2 * 0.32);
       // 地平線近くは雲が重なって見えるので厚く、天頂は薄く
       density *= mix(1.0, 0.55, clamp(up, 0.0, 1.0));
       density *= uCloud;
       // 太陽側の縁を明るく（銀縁）
       float rim = pow(max(cosA, 0.0), 3.0);
-      vec3 cloudCol = mix(uHorizon * 1.12, uZenith * 0.55 + vec3(0.42), 0.55);
-      cloudCol += uSunColor * rim * 0.35 * clamp(uSunIntensity, 0.1, 2.0);
-      col = mix(col, cloudCol, clamp(density, 0.0, 0.92));
+      // 雲は「空より明るい白」でなければ雲に見えない。地平線側の空は
+      // すでに白く霞んでいるので、そこに空の色を混ぜた灰色を置いても
+      // 完全に埋もれる（実際それで 1 枚も見えていなかった）。
+      // 日向側は白、日陰側は青灰に振って、塊としての厚みを出す。
+      float shade = 1.0 - density * 0.45;
+      vec3 lit = mix(vec3(0.92, 0.94, 0.97), uSunColor, 0.22) * clamp(uSunIntensity * 0.55, 0.18, 1.15);
+      vec3 dark = mix(uZenith, vec3(0.35, 0.39, 0.46), 0.5);
+      vec3 cloudCol = mix(dark, lit, shade);
+      cloudCol += uSunColor * rim * 0.5 * clamp(uSunIntensity, 0.1, 2.0);
+      col = mix(col, cloudCol, clamp(density, 0.0, 0.94));
     }
 
     // 星。天頂ほど濃く、地平では霞に負ける。
@@ -338,7 +348,8 @@ export class SkyDome {
     u.uStars!.value = atmo.starAmount;
     u.uTime!.value = elapsed;
     // 夜は雲を薄くする。暗い空に灰色の雲を敷くと、星が消えて濁るだけになる。
-    u.uCloud!.value = 0.62 - atmo.nightAmount * 0.34;
+    // 夜も雲は残す。星だけの無地の空は、かえって書き割りに見える。
+    u.uCloud!.value = 0.78 - atmo.nightAmount * 0.16;
     this.mesh.position.set(cameraPos.x, cameraPos.y, cameraPos.z);
   }
 
