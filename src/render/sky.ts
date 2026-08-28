@@ -1,6 +1,7 @@
 import {
   BackSide,
   Color,
+  MathUtils,
   Mesh,
   ShaderMaterial,
   SphereGeometry,
@@ -83,7 +84,9 @@ const key = (
  * 数字は「写真で見た日本の空」に寄せてある。とくに
  *   - 朝夕は日射が橙〜赤に寄り、強さが落ちるぶん露出を上げる
  *   - 夜は月光（青）を弱く残す。真っ暗にすると街の造形が全部消える
- * の 2 点が絵の印象を決める。
+ *   - 日中は回り込み（半球ライト）を控えめにし、直射との差を開ける。
+ *     環境光を上げると陰が消えて全部が平らな板になる。明るさは日射で稼ぐ。
+ * の 3 点が絵の印象を決める。
  */
 const KEYFRAMES: Keyframe[] = [
   //   h   zenith    horizon   sun       int   skyLt     grndLt    amb   exp   star  night
@@ -91,11 +94,11 @@ const KEYFRAMES: Keyframe[] = [
   key(4.4, 0x0a1020, 0x18223a, 0x8ea2d8, 0.44, 0x36476f, 0x1c2130, 0.64, 1.28, 0.95, 1),
   key(5.3, 0x1b2748, 0x53415a, 0xc08a84, 0.55, 0x4a5a84, 0x2c262e, 0.7, 1.2, 0.35, 0.85),
   key(6.2, 0x39527f, 0xc07a58, 0xff9a5e, 0.72, 0x6c7fa8, 0x4a3a2e, 0.6, 1.12, 0, 0.35),
-  key(7.4, 0x3f6ea6, 0xbfc9cd, 0xffd9b0, 1.35, 0x8fb0d4, 0x6a6152, 0.72, 1.0, 0, 0.05),
-  key(9.5, 0x2f6fb4, 0xc2d3e0, 0xfff0da, 1.95, 0x9dc0e4, 0x77705d, 0.8, 0.95, 0, 0),
-  key(12, 0x2a68b8, 0xcadbe8, 0xfff6e8, 2.25, 0xa6c8ea, 0x7d7663, 0.85, 0.92, 0, 0),
-  key(15, 0x2f6fb4, 0xc6d6e4, 0xfff0d6, 2.0, 0x9dc0e4, 0x7a7360, 0.8, 0.95, 0, 0),
-  key(17.2, 0x3a68a2, 0xd7b489, 0xffd3a0, 1.35, 0x8ea8cc, 0x6d6050, 0.7, 1.0, 0, 0.05),
+  key(7.4, 0x3f6ea6, 0xbfc9cd, 0xffd9b0, 1.55, 0x8fb0d4, 0x6a6152, 0.5, 1.0, 0, 0.05),
+  key(9.5, 0x2f6fb4, 0xc2d3e0, 0xfff0da, 2.25, 0x9dc0e4, 0x77705d, 0.54, 0.95, 0, 0),
+  key(12, 0x2a68b8, 0xcadbe8, 0xfff6e8, 2.6, 0xa6c8ea, 0x7d7663, 0.58, 0.92, 0, 0),
+  key(15, 0x2f6fb4, 0xc6d6e4, 0xfff0d6, 2.3, 0x9dc0e4, 0x7a7360, 0.55, 0.95, 0, 0),
+  key(17.2, 0x3a68a2, 0xd7b489, 0xffd3a0, 1.5, 0x8ea8cc, 0x6d6050, 0.5, 1.0, 0, 0.05),
   key(18.3, 0x39406f, 0xd98a52, 0xff8a4a, 0.65, 0x6a6f96, 0x4a382c, 0.58, 1.1, 0, 0.45),
   key(19.2, 0x1d2445, 0x6a4358, 0xb87280, 0.55, 0x47507e, 0x2b232c, 0.7, 1.2, 0.3, 0.85),
   key(20.2, 0x0b1120, 0x1b2540, 0x8ea2d8, 0.44, 0x35456c, 0x1b202d, 0.63, 1.3, 0.85, 1),
@@ -163,13 +166,16 @@ export function sunDirection(dayFraction: number, out = new Vector3()): Vector3 
     const nh = h < 5 ? h + 5 : h - 19;
     progress = nh / 10;
   }
-  const angle = progress * Math.PI; // 0 = 東の地平線, π/2 = 南中, π = 西
-  const elevation = Math.sin(angle) * (night ? 0.62 : 0.92);
-  // 南中でも真上には来ない（仰角 62 度程度）ようにして、影を常に出す
-  const y = Math.max(0.12, Math.sin(elevation * 1.2));
-  const x = Math.cos(angle);
-  const z = -0.45 * Math.cos(elevation); // 南（-Z）寄りの軌道
-  return out.set(x, y, z).normalize();
+  // 方位: 0 = 東、π/2 = 南、π = 西
+  const az = progress * Math.PI;
+  // 仰角の頂点は 46 度に抑える。真上から照らすと影が建物の真下に隠れ、
+  // 街全体が「陰影の無い塗り絵」になる。斜めから当てて初めて、
+  // 建物の高さ・軒の出・道路の谷が影として読めるようになる。
+  const maxEl = night ? MathUtils.degToRad(38) : MathUtils.degToRad(46);
+  // 地平線ぎりぎりまで下げると影が画面の端まで伸びて破綻するので、下限を置く
+  const el = Math.max(MathUtils.degToRad(9), Math.sin(az) * maxEl);
+  const cosEl = Math.cos(el);
+  return out.set(Math.cos(az) * cosEl, Math.sin(el), -Math.sin(az) * cosEl).normalize();
 }
 
 const SKY_VERT = /* glsl */ `

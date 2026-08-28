@@ -164,10 +164,14 @@ void facadeShade(vec3 base) {
     float p = (az >= ax) ? vLocalM.z : vLocalM.x;
     float pitchStep = max(vFacadeV.w, 0.15);
     float s = p / pitchStep;
-    float line = bandAA(fract(s), 0.0, 0.16, fwidth(s));
+    // 葺き足の線。遠景では 1 本が 1 画素に満たなくなるので、距離で平均へ寄せる。
+    // 寄せずに置くと、建物の隙間から覗く遠くの屋根が細かい縞のノイズになる。
+    float rFar = smoothstep(110.0, 300.0, vViewDepth);
+    float line = mix(bandAA(fract(s), 0.0, 0.16, fwidth(s)), 0.16, rFar);
     gTint = vec3(1.0 - line * 0.34);
     // 棟と軒先の稜線。屋根が 1 枚の板ではなく葺かれた面に見える。
-    gTint *= 1.0 + bandAA(abs(p) / max(vFacadeV.w, 0.15), 0.0, 0.25, fwidth(p) / max(vFacadeV.w, 0.15)) * 0.10;
+    float ridge = mix(bandAA(abs(p) / pitchStep, 0.0, 0.25, fwidth(p) / pitchStep), 0.0, rFar);
+    gTint *= 1.0 + ridge * 0.10;
     // 棟に近いほど明るく。平らな面に流れの向きが出る。
     gTint *= mix(0.92, 1.06, clamp(vLocalM.y / max(vScaleM.y, 0.001), 0.0, 1.0));
     return;
@@ -236,7 +240,10 @@ void facadeShade(vec3 base) {
   float litRate = 0.28;
   vec3 litCol = vec3(1.0, 0.74, 0.42);
   vec3 glassCol = vec3(0.16, 0.20, 0.24);
-  float glassRough = 0.10, glassMetal = 0.70;
+  // 粗さを 0.1 まで落とすと、空の環境マップの低いミップを引いてしまい、
+  // 太陽まわりの高周波が窓の中で砂粒状にちらつく。0.2 前後だと
+  // 「よく磨いた板ガラス」の見えは保ったまま、その破綻だけが消える。
+  float glassRough = 0.24, glassMetal = 0.68;
   float wallRough = 0.88, wallMetal = 0.03;
   float extra = 0.0;      // 壁面に足す明暗（庇・スラブ・リブ）
   float glow = 1.0;       // 灯りの強さ
@@ -269,7 +276,7 @@ void facadeShade(vec3 base) {
     litRate = 0.26;
     litCol = vec3(0.86, 0.88, 0.84);
     glassCol = vec3(0.20, 0.28, 0.34);
-    glassRough = 0.06; glassMetal = 0.82;
+    glassRough = 0.18; glassMetal = 0.80;
     wallRough = 0.42; wallMetal = 0.55;      // 腰の金属パネル
     // 縦のマリオン（方立）。細く明るい線が入るだけで高層らしくなる。
     float mullion = bandAA(fract(fx * 2.0), 0.0, 0.10, fwidth(fx * 2.0));
@@ -285,7 +292,7 @@ void facadeShade(vec3 base) {
       litRate = 0.9; glow = 1.35;
       litCol = vec3(1.0, 0.92, 0.74);
       glassCol = vec3(0.26, 0.28, 0.30);
-      glassRough = 0.07; glassMetal = 0.55;
+      glassRough = 0.22; glassMetal = 0.55;
     } else {
       x0 = 0.16; x1 = 0.84; y0 = 0.24; y1 = 0.74;
     }
@@ -362,8 +369,12 @@ void facadeShade(vec3 base) {
   vec3 curtain = mix(vec3(0.46, 0.44, 0.40), vec3(0.30, 0.31, 0.33), step(0.5, cell2));
   float hasCurtain = mix(step(cell2, 0.38), 0.38, cellFade);
   glassCol = mix(glassCol, curtain, hasCurtain);
-  gRough = mix(wallRough, glassRough, win);
-  gMetal = mix(wallMetal, mix(glassMetal, glassMetal * 0.4, hasCurtain), win);
+  // 材質（粗さ・金属度）は窓の内外で切り替えるだけにして、fwidth 由来の
+  // 中間値を持ち込まない。導関数はブロック単位で量子化されるので、
+  // その段差がそのまま粗さに乗ると、光沢の強い窓面で細かい格子状のノイズになる。
+  float winMat = step(0.5, win);
+  gRough = mix(wallRough, glassRough, winMat);
+  gMetal = mix(wallMetal, mix(glassMetal, glassMetal * 0.4, hasCurtain), winMat);
   gTint = mix(vec3(1.0 + extra), glassCol / max(base, vec3(0.02)), win);
   gTint *= 1.0 + max(frame, 0.0) * 0.12 + sill * 0.14 - slabLine * 0.10;
   gTint *= 1.0 - reveal * 0.34;

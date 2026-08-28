@@ -180,8 +180,8 @@ function rooftop(
   if (r0 > 0.55) {
     const ax = x + (r1 - 0.5) * w * inner;
     const az = z + (r2 - 0.5) * d * inner;
-    e.box(ax, topY + ph, az, 0.14, 2.6 + r0 * 3.5, 0.14, 0x9c9c9c, 0.45, 0.7);
-    e.box(ax, topY + ph + 1.2, az, 1.1, 0.1, 0.1, 0x9c9c9c, 0.45, 0.7);
+    e.box(ax, topY + ph, az, 0.14, 2.6 + r0 * 3.5, 0.14, 0x9c9c9c, 0.7, 0.2);
+    e.box(ax, topY + ph + 1.2, az, 1.1, 0.1, 0.1, 0x9c9c9c, 0.7, 0.2);
   }
 }
 
@@ -287,7 +287,7 @@ function balconies(
       // 手すり壁（外側の立ち上がり）
       const rx = x + (alongX ? 0 : s * (dist + depth - 0.06));
       const rz = z + (alongX ? s * (dist + depth - 0.06) : 0);
-      e.box(rx, y, rz, alongX ? len : 0.12, 1.05, alongX ? 0.12 : len, 0xb6bcbe, 0.55, 0.22);
+      e.box(rx, y, rz, alongX ? len : 0.12, 1.05, alongX ? 0.12 : len, 0xb6bcbe, 0.78, 0.10);
     }
   }
 }
@@ -443,8 +443,8 @@ function house(ctx: BuildCtx): void {
     const cw = f % 2 === 0 ? len : 3.6;
     const cd = f % 2 === 0 ? 3.6 : len;
     e.box(px, gy + 2.3, pz, cw, 0.12, cd, 0xb8c4c8, 0.35, 0.25);
-    e.box(px - cw / 2 + 0.2, gy, pz - cd / 2 + 0.2, 0.16, 2.3, 0.16, 0xa8adb0, 0.4, 0.6);
-    e.box(px + cw / 2 - 0.2, gy, pz + cd / 2 - 0.2, 0.16, 2.3, 0.16, 0xa8adb0, 0.4, 0.6);
+    e.box(px - cw / 2 + 0.2, gy, pz - cd / 2 + 0.2, 0.16, 2.3, 0.16, 0xa8adb0, 0.72, 0.18);
+    e.box(px + cw / 2 - 0.2, gy, pz + cd / 2 - 0.2, 0.16, 2.3, 0.16, 0xa8adb0, 0.72, 0.18);
   }
   // ブロック塀
   if (rnd(hash, 3) > 0.45) {
@@ -489,14 +489,14 @@ function apartment(ctx: BuildCtx): void {
       1.05,
       corridorSide % 2 === 0 ? 0.1 : len,
       0x9fa8ad,
-      0.42,
-      0.55,
+      0.72,
+      0.14,
     );
   }
   // 鉄骨階段
   const sx = cx + cwx * (dist + 1.0) + (corridorSide % 2 === 0 ? len * 0.42 : 0);
   const sz = cz + cwz * (dist + 1.0) + (corridorSide % 2 === 0 ? 0 : len * 0.42);
-  e.box(sx, gy, sz, 1.3, H, 1.3, 0x8f979c, 0.5, 0.55);
+  e.box(sx, gy, sz, 1.3, H, 1.3, 0x8f979c, 0.72, 0.16);
 
   // 反対側のバルコニー
   balconies(ctx, cx, cz, w, d, gy, H, style.floorH, [balconySide === longA ? 1 : -1]);
@@ -587,7 +587,7 @@ function konbini(ctx: BuildCtx): void {
   }
   const lx = cx + FX[f]! * (dist + 7.2) + (f % 2 === 0 ? len * 0.4 : 0);
   const lz = cz + FZ[f]! * (dist + 7.2) + (f % 2 === 0 ? 0 : len * 0.4);
-  e.box(lx, gy, lz, 0.18, 5.4, 0.18, 0xb4b8ba, 0.4, 0.6);
+  e.box(lx, gy, lz, 0.18, 5.4, 0.18, 0xb4b8ba, 0.7, 0.2);
   e.sign(lx, gy + 5.4, lz, 1.9, 1.2, 0.3, 0xffffff, 0.25, 2.4, faceRot(f));
 }
 
@@ -635,7 +635,7 @@ function shotengai(ctx: BuildCtx): void {
     const off = -span / 2 + sw * (i + 0.72);
     const bx = cx + FX[f]! * (dist + 2.0) + (alongX ? off : 0);
     const bz = cz + FZ[f]! * (dist + 2.0) + (alongX ? 0 : off);
-    e.box(bx, gy, bz, 0.09, 3.0, 0.09, 0xb0b4b6, 0.5, 0.5);
+    e.box(bx, gy, bz, 0.09, 3.0, 0.09, 0xb0b4b6, 0.75, 0.15);
     e.box(bx + 0.3 * FZ[f]!, gy + 0.9, bz + 0.3 * FX[f]!, alongX ? 0.55 : 0.06, 1.9, alongX ? 0.06 : 0.55, pick([0xd94f3a, 0xf0f0e8, 0x3f7fbf], hash, 40 + i), 0.85, 0.02);
   }
 }
@@ -801,8 +801,8 @@ function station(ctx: BuildCtx): void {
         4.2,
         0.22,
         0x9aa2a6,
-        0.42,
-        0.6,
+        0.72,
+        0.18,
       );
     }
   }
@@ -875,8 +875,8 @@ function school(ctx: BuildCtx): void {
       4.2,
       0.16,
       0x9aa2a6,
-      0.5,
-      0.5,
+      0.75,
+      0.15,
     );
   }
 }
@@ -1018,8 +1018,8 @@ function powerplant(ctx: BuildCtx): void {
   e.cyl(cx - w * 0.34, gy, cz - d * 0.32, 3.4, 5.2, 0xc8ccc8, 0.5, 0.4);
   e.cyl(cx + w * 0.06, gy, cz - d * 0.34, 3.0, 4.6, 0xc8ccc8, 0.5, 0.4);
   // 送電鉄塔のような架構
-  e.box(cx + w * 0.4, gy, cz - d * 0.1, 0.3, H + 12, 0.3, 0xa8adb0, 0.45, 0.7);
-  e.box(cx + w * 0.4, gy + H + 8, cz - d * 0.1, 6.0, 0.25, 0.25, 0xa8adb0, 0.45, 0.7);
+  e.box(cx + w * 0.4, gy, cz - d * 0.1, 0.3, H + 12, 0.3, 0xa8adb0, 0.7, 0.2);
+  e.box(cx + w * 0.4, gy + H + 8, cz - d * 0.1, 6.0, 0.25, 0.25, 0xa8adb0, 0.7, 0.2);
 }
 
 /** 太陽光発電所。傾けたパネルの列。 */

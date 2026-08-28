@@ -5,6 +5,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
 
 /**
  * ポストエフェクト。
@@ -12,6 +13,9 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
  * 街の絵が「ゲームの画面」に見えるか「レンダリングされた風景」に見えるかは、
  * 最後のこの一段で決まるところが大きい。ここでやるのは 3 つ。
  *
+ * - **環境遮蔽（GTAO）**: 壁と地面が出会う角、庇の下、車の下に影が溜まる。
+ *   直射日光の影だけでは、物が「置かれている」感じが出ない。曇りの日でも
+ *   隅が暗いのは遮蔽のためで、これが無いと何もかもが宙に浮いて見える。
  * - **ブルーム**: 夜の窓・街灯・ヘッドライトが滲む。夜景の説得力がこれで変わる。
  *   しきい値を高めに置き、昼間の白い壁が光らないようにしてある。
  * - **色調整（グレード）**: 露出・コントラスト・彩度・周辺減光を 1 パスで掛ける。
@@ -81,6 +85,7 @@ export class PostFx {
   private bloom: UnrealBloomPass | null = null;
   private grade: ShaderPass | null = null;
   private smaa: SMAAPass | null = null;
+  private gtao: GTAOPass | null = null;
   /** 実際に composer を通しているか。 */
   enabled = false;
   private level: FxLevel;
@@ -100,6 +105,22 @@ export class PostFx {
     composer.renderTarget2.texture.type = HalfFloatType;
     composer.setSize(size.x, size.y);
     composer.addPass(new RenderPass(scene, camera));
+
+    // 環境遮蔽。半径は実寸（m）。街路の幅が 6〜9m なので、
+    // 5m 前後にすると「建物の足元と軒下だけ」が締まり、街全体は暗くならない。
+    const gtao = new GTAOPass(scene, camera as never, size.x, size.y);
+    gtao.output = GTAOPass.OUTPUT.Default;
+    gtao.updateGtaoMaterial({
+      radius: 5,
+      distanceExponent: 1.2,
+      thickness: 2.5,
+      scale: 1.1,
+      samples: 16,
+      screenSpaceRadius: false,
+    });
+    gtao.blendIntensity = 0.7;
+    composer.addPass(gtao);
+    this.gtao = gtao;
 
     this.bloom = new UnrealBloomPass(new Vector2(size.x, size.y), 0.42, 0.7, 0.92);
     composer.addPass(this.bloom);
@@ -141,6 +162,7 @@ export class PostFx {
   setSize(w: number, h: number): void {
     this.composer?.setSize(w, h);
     this.bloom?.setSize(w, h);
+    this.gtao?.setSize(w, h);
   }
 
   /**
@@ -171,6 +193,7 @@ export class PostFx {
     this.composer?.dispose();
     this.bloom?.dispose();
     this.smaa?.dispose();
+    this.gtao?.dispose();
     this.grade?.dispose();
   }
 }
