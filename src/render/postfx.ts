@@ -55,9 +55,13 @@ const GRADE_SHADER = {
       vec4 tex = texture2D(tDiffuse, vUv);
       vec3 c = tex.rgb;
 
-      // 色かぶり（朝は青、夕は橙）
-      c.r *= 1.0 + uTint.x * 0.06;
-      c.b *= 1.0 - uTint.x * 0.06;
+      // 色かぶり。画面全体に一律で掛けると、夕方は影の中まで橙になり、
+      // 画面が「オレンジのセロファンを貼った 1 色」に潰れる。
+      // 明部と暗部で逆向きに振る（split-toning）と、
+      // 直射の暖色と空からの回り込みの寒色が対立して、夕景に奥行きが出る。
+      float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      c += uTint.x * 0.055 * vec3(lum, lum * 0.15, -lum);
+      c += uTint.x * 0.045 * vec3(-(1.0 - lum), 0.0, (1.0 - lum));
       c.g *= 1.0 + uTint.y * 0.03;
 
       // コントラスト（0.5 を中心に）
@@ -111,25 +115,36 @@ export class PostFx {
     const gtao = new GTAOPass(scene, camera as never, size.x, size.y);
     gtao.output = GTAOPass.OUTPUT.Default;
     gtao.updateGtaoMaterial({
-      radius: 5,
-      distanceExponent: 1.2,
-      thickness: 2.5,
-      scale: 1.1,
+      radius: 3,
+      distanceExponent: 1.1,
+      thickness: 1.6,
+      scale: 1.0,
       samples: 16,
       screenSpaceRadius: false,
     });
-    gtao.blendIntensity = 0.7;
+    gtao.blendIntensity = 0.75;
+    // デノイズを強めに掛ける。サンプル数を増やすより安く粒を潰せる。
+    gtao.updatePdMaterial({ lumaPhi: 12, depthPhi: 2.5, normalPhi: 3.5, radius: 6, rings: 3, samples: 16 });
     composer.addPass(gtao);
     this.gtao = gtao;
 
     this.bloom = new UnrealBloomPass(new Vector2(size.x, size.y), 0.42, 0.7, 0.92);
     composer.addPass(this.bloom);
 
+    // OutputPass がトーンマッピングと色空間変換を担当する。
+    //
+    // 色調整はこの**後ろ**に置かなければならない。composer のレンダーターゲットへ
+    // 描いている間、three はマテリアル側のトーンマッピングを外すので、
+    // ここまでの値はリニアの HDR（日向の壁なら 1.5〜4.0）のまま流れてくる。
+    // その状態で clamp(0,1) を掛けると、白い塗り壁もクリームのタイルも
+    // 打ちっぱなしコンクリートも全部 1.0 に潰れ、ACES の肩（ハイライトの
+    // ロールオフ）が一切効かなくなる。日向側が「同じ白」になるあの安さは、
+    // ほぼこれが原因だった。0..1 に畳んだ後なら、コントラストの支点 0.5 も
+    // 周辺減光も意図どおりに効く。
+    composer.addPass(new OutputPass());
+
     this.grade = new ShaderPass(GRADE_SHADER as never);
     composer.addPass(this.grade);
-
-    // OutputPass がトーンマッピングと色空間変換を担当する
-    composer.addPass(new OutputPass());
 
     this.smaa = new SMAAPass(size.x, size.y);
     composer.addPass(this.smaa);

@@ -35,6 +35,10 @@ const SHOTS = [
   { name: '04-street-dusk', dist: 130, azim: 2.4, elev: 16, hour: 18.2 },
   { name: '05-district-night', dist: 340, azim: 0.9, elev: 30, hour: 21 },
   { name: '06-overview-morning', dist: 700, azim: 3.9, elev: 40, hour: 6.6 },
+  // 目線の高さ。路面・歩道・車・人・街灯が「人が見る距離」でどう見えるかは
+  // ここでしか分からない。俯瞰だけ見て作ると路上が空っぽのまま気づけない。
+  { name: '07-eyelevel-noon', dist: 155, azim: 1.9, elev: 12, hour: 12 },
+  { name: '08-eyelevel-night', dist: 160, azim: 1.9, elev: 13, hour: 20.5 },
 ];
 
 // すでに立っている dev サーバがあれば使い回す（撮影のたびに 1 秒待たない）

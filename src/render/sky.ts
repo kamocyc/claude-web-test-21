@@ -90,19 +90,19 @@ const key = (
  */
 const KEYFRAMES: Keyframe[] = [
   //   h   zenith    horizon   sun       int   skyLt     grndLt    amb   exp   star  night
-  key(0, 0x080d1c, 0x141d33, 0x8ea2d8, 0.42, 0x33436e, 0x1a1f2c, 0.62, 1.3, 1, 1),
-  key(4.4, 0x0a1020, 0x18223a, 0x8ea2d8, 0.44, 0x36476f, 0x1c2130, 0.64, 1.28, 0.95, 1),
-  key(5.3, 0x1b2748, 0x53415a, 0xc08a84, 0.55, 0x4a5a84, 0x2c262e, 0.7, 1.2, 0.35, 0.85),
-  key(6.2, 0x39527f, 0xc07a58, 0xff9a5e, 0.72, 0x6c7fa8, 0x4a3a2e, 0.6, 1.12, 0, 0.35),
+  key(0, 0x080d1c, 0x141d33, 0x8ea2d8, 0.42, 0x4a5f92, 0x2a3040, 0.72, 1.3, 1, 1),
+  key(4.4, 0x0a1020, 0x18223a, 0x8ea2d8, 0.44, 0x4d6396, 0x2c3242, 0.74, 1.28, 0.95, 1),
+  key(5.3, 0x1b2748, 0x53415a, 0xc08a84, 0.55, 0x5b74c0, 0x2c2a34, 0.78, 1.2, 0.35, 0.85),
+  key(6.2, 0x39527f, 0xc07a58, 0xff9a5e, 0.85, 0x6a80cc, 0x46403c, 0.66, 1.12, 0, 0.35),
   key(7.4, 0x3f6ea6, 0xbfc9cd, 0xffd9b0, 1.55, 0x8fb0d4, 0x6a6152, 0.5, 1.0, 0, 0.05),
   key(9.5, 0x2f6fb4, 0xc2d3e0, 0xfff0da, 2.25, 0x9dc0e4, 0x77705d, 0.54, 0.95, 0, 0),
   key(12, 0x2a68b8, 0xcadbe8, 0xfff6e8, 2.6, 0xa6c8ea, 0x7d7663, 0.58, 0.92, 0, 0),
   key(15, 0x2f6fb4, 0xc6d6e4, 0xfff0d6, 2.3, 0x9dc0e4, 0x7a7360, 0.55, 0.95, 0, 0),
-  key(17.2, 0x3a68a2, 0xd7b489, 0xffd3a0, 1.5, 0x8ea8cc, 0x6d6050, 0.5, 1.0, 0, 0.05),
-  key(18.3, 0x39406f, 0xd98a52, 0xff8a4a, 0.65, 0x6a6f96, 0x4a382c, 0.58, 1.1, 0, 0.45),
-  key(19.2, 0x1d2445, 0x6a4358, 0xb87280, 0.55, 0x47507e, 0x2b232c, 0.7, 1.2, 0.3, 0.85),
-  key(20.2, 0x0b1120, 0x1b2540, 0x8ea2d8, 0.44, 0x35456c, 0x1b202d, 0.63, 1.3, 0.85, 1),
-  key(24, 0x080d1c, 0x141d33, 0x8ea2d8, 0.42, 0x33436e, 0x1a1f2c, 0.62, 1.3, 1, 1),
+  key(17.2, 0x3a68a2, 0xd7b489, 0xffd3a0, 1.5, 0x7e9ada, 0x6a6256, 0.52, 1.0, 0, 0.05),
+  key(18.3, 0x39406f, 0xd98a52, 0xff8a4a, 0.78, 0x6a7fc8, 0x453e3e, 0.66, 1.1, 0, 0.45),
+  key(19.2, 0x1d2445, 0x6a4358, 0xb87280, 0.55, 0x5a6ec0, 0x2d2a36, 0.78, 1.2, 0.3, 0.85),
+  key(20.2, 0x0b1120, 0x1b2540, 0x8ea2d8, 0.44, 0x4c6094, 0x2b3141, 0.73, 1.3, 0.85, 1),
+  key(24, 0x080d1c, 0x141d33, 0x8ea2d8, 0.42, 0x4a5f92, 0x2a3040, 0.72, 1.3, 1, 1),
 ];
 
 const current: Atmosphere = {
@@ -197,12 +197,39 @@ const SKY_FRAG = /* glsl */ `
   uniform vec3 uSunDir;
   uniform float uSunIntensity;
   uniform float uStars;
+  uniform float uTime;
+  uniform float uCloud;
 
   // 星用の安いハッシュノイズ
   float hash(vec3 p) {
     p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
     p *= 17.0;
     return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+  }
+
+  // 雲用の 2 次元ノイズ（値ノイズ + 3 オクターブ）
+  float hash2(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+  }
+  float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash2(i);
+    float b = hash2(i + vec2(1.0, 0.0));
+    float c = hash2(i + vec2(0.0, 1.0));
+    float d = hash2(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  }
+  float fbm(vec2 p) {
+    float v = 0.0;
+    float amp = 0.5;
+    for (int i = 0; i < 4; i++) {
+      v += amp * vnoise(p);
+      p *= 2.03;
+      amp *= 0.5;
+    }
+    return v;
   }
 
   void main() {
@@ -223,6 +250,24 @@ const SKY_FRAG = /* glsl */ `
     float glow = pow(max(cosA, 0.0), 34.0) * 0.55 + pow(max(cosA, 0.0), 6.0) * 0.16;
     float disc = smoothstep(0.9986, 0.9995, cosA);
     col += uSunColor * (glow + disc * 6.0) * clamp(uSunIntensity, 0.15, 2.4);
+
+    // 雲。無地のグラデーションだけの空は、それだけで書き割りに見える。
+    // ライティングは要らない。天球を平面に投影して薄い層を 2 枚重ね、
+    // 太陽側だけ縁を明るくすれば、高層雲としては十分に通る。
+    if (uCloud > 0.001 && up > -0.02) {
+      vec2 uv = dir.xz / max(up + 0.14, 0.14);
+      float n = fbm(uv * 0.55 + vec2(uTime * 0.004, uTime * 0.0016));
+      float n2 = fbm(uv * 1.7 - vec2(uTime * 0.009, 0.0));
+      float density = smoothstep(0.52, 0.86, n * 0.75 + n2 * 0.35);
+      // 地平線近くは雲が重なって見えるので厚く、天頂は薄く
+      density *= mix(1.0, 0.55, clamp(up, 0.0, 1.0));
+      density *= uCloud;
+      // 太陽側の縁を明るく（銀縁）
+      float rim = pow(max(cosA, 0.0), 3.0);
+      vec3 cloudCol = mix(uHorizon * 1.12, uZenith * 0.55 + vec3(0.42), 0.55);
+      cloudCol += uSunColor * rim * 0.35 * clamp(uSunIntensity, 0.1, 2.0);
+      col = mix(col, cloudCol, clamp(density, 0.0, 0.92));
+    }
 
     // 星。天頂ほど濃く、地平では霞に負ける。
     if (uStars > 0.001) {
@@ -254,6 +299,8 @@ export class SkyDome {
         uSunDir: { value: new Vector3(0, 1, 0) },
         uSunIntensity: { value: 1 },
         uStars: { value: 0 },
+        uTime: { value: 0 },
+        uCloud: { value: 0.55 },
       },
       vertexShader: SKY_VERT,
       fragmentShader: SKY_FRAG,
@@ -276,7 +323,12 @@ export class SkyDome {
     return m;
   }
 
-  update(atmo: Atmosphere, sunDir: Vector3, cameraPos: { x: number; y: number; z: number }): void {
+  update(
+    atmo: Atmosphere,
+    sunDir: Vector3,
+    cameraPos: { x: number; y: number; z: number },
+    elapsed = 0,
+  ): void {
     const u = this.material.uniforms;
     (u.uZenith!.value as Color).copy(atmo.zenith);
     (u.uHorizon!.value as Color).copy(atmo.horizon);
@@ -284,6 +336,9 @@ export class SkyDome {
     (u.uSunDir!.value as Vector3).copy(sunDir);
     u.uSunIntensity!.value = atmo.sunIntensity;
     u.uStars!.value = atmo.starAmount;
+    u.uTime!.value = elapsed;
+    // 夜は雲を薄くする。暗い空に灰色の雲を敷くと、星が消えて濁るだけになる。
+    u.uCloud!.value = 0.62 - atmo.nightAmount * 0.34;
     this.mesh.position.set(cameraPos.x, cameraPos.y, cameraPos.z);
   }
 

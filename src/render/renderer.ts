@@ -70,6 +70,8 @@ export class Renderer {
   private readonly sunDir = new Vector3();
   private atmo: Atmosphere;
   private lastFrameMs = 16;
+  /** 起動からの経過秒。雲の流れに使う。 */
+  private elapsed = 0;
 
   /** タイル選択のハイライト。 */
   private readonly cursor: Mesh;
@@ -321,7 +323,8 @@ export class Renderer {
     this.atmo = atmo;
     sunDirection(frac, this.sunDir);
 
-    this.sky.update(atmo, this.sunDir, this.rig.camera.position);
+    this.elapsed += dt;
+    this.sky.update(atmo, this.sunDir, this.rig.camera.position, this.elapsed);
 
     // 太陽（夜は月）。注視点を基準に置くことで、影の解像度を街の見えている
     // 範囲に集中させる。マップ全体を 1 枚の影マップで覆うと 1 タイルあたり
@@ -373,8 +376,11 @@ export class Renderer {
       // 霞み始めをカメラ距離の 2 倍より遠くに置く。ここを近くすると、
       // 街区を見下ろしている距離で「見えている街の大半」が霞に沈み、
       // せっかくの造形が白く飛んでしまう。
-      fog.near = Math.max(420, this.rig.distance * 1.7);
-      fog.far = Math.max(3000, this.rig.distance * 11);
+      // 空気遠近はカメラ距離に比例させる。俯瞰で霞を遠くへ逃がすと、
+      // 手前の家と 3km 先の家が同じ濃さで描かれ、街が一枚の平面に見える。
+      // 近景では霞に沈む物が視界にほとんど入らないので、下限だけ置けばよい。
+      fog.near = Math.max(180, this.rig.distance * 0.5);
+      fog.far = Math.max(1400, this.rig.distance * 5.5);
     }
 
     this.updateEnvironment(frac);
