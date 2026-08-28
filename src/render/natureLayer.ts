@@ -1,14 +1,9 @@
 import {
-  BoxGeometry,
-  BufferAttribute,
   BufferGeometry,
   Color,
-  ConeGeometry,
   InstancedMesh,
   Matrix4,
-  MeshLambertMaterial,
   Object3D,
-  OctahedronGeometry,
   Quaternion,
   Vector3,
 } from 'three';
@@ -16,42 +11,53 @@ import { MAP_W, TERRAIN_HEIGHT_SCALE, TILE_COUNT, TILE_M } from '@shared/constan
 import { RoadClass, Season, Terrain, Zone } from '@shared/enums';
 import type { Simulation } from '@sim/simulation';
 import { neighbor, tileX, tileY } from '@sim/world/tiles';
+import { surface } from './materials';
+import { InstancePool } from './instancePool';
+import { hash2 } from './groundPalette';
+import { CARRIAGE_HALF, WALK_OUTER } from './roadLayer';
+import {
+  bambooGeometry,
+  broadleafGeometry,
+  bundGeometry,
+  coniferGeometry,
+  rockGeometry,
+  shrubGeometry,
+  streetTreeGeometry,
+} from './vegetation';
 
 /**
  * 自然の造形。
  *
- * 地形は地形メッシュが色を塗っているだけだった。森林は「濃い緑の平面」、
- * 山地は「灰色の平面」で、建物と車だけが立体という画になっていた。
- * 街の外側が平らなままだと、街の側をどれだけ作り込んでも
- * 「盤面の上に置いた模型」に見える。
+ * 以前の木は「箱の幹 + 円錐 1 個」で、しかも全部が同じ大きさ・同じ色だった。
+ * 森は「緑の円錐が整列した畑」に見えていた。木が木に見え、森が森に見えるには
+ * 3 つが要る。
  *
- * ここでは木・岩・田の畦を置く。数が桁違いに多い（森林だけで 1.7 万タイル）ので、
- * 他の描画レイヤと違う工夫が 2 つ要る。
+ * **1. 樹冠が 1 個の凸形でないこと。**（`vegetation.ts` が受け持つ）
+ * **2. 同じ木が 2 本と無いこと。** 大きさ・向き・色・位置をハッシュで散らす。
+ *    とくに色を `instanceColor` で個体ごとにずらすのが効く。頂点カラーと
+ *    掛け算で合成されるので、「幹と樹冠の塗り分け」を保ったまま
+ *    個体の明暗と色味だけを動かせる。
+ * **3. 種類が複数あること。** 針葉樹（杉の人工林）・広葉樹（雑木）・竹・
+ *    街路樹・低木を、地形と用途地域から生え分けさせる。
  *
- * **1. 区画に分けて視錐台カリングを効かせる。**
- * 他のレイヤは `frustumCulled = false` の 1 メッシュで済ませているが、
- * それをここでやると、カメラを最大まで寄せていても 4 万本ぶんの頂点処理が
- * 毎フレーム走る。マップを 64 タイル角の区画に切り、区画ごとにメッシュを持つと、
- * three.js が区画単位で「見えていない」を判定して丸ごと捨ててくれる。
+ * 数が桁違いに多い（森林だけで 1.7 万タイル）ので、描き方に 2 つ工夫がある。
  *
- * **2. 木の色をジオメトリに焼き込む。**
- * `instanceColor` で色を変えると、幹と樹冠を別メッシュに分けるほかなくなり、
- * インスタンス数が倍になる（幹 4 万 ＋ 樹冠 4 万）。色は季節ごとに数種類しか
- * 無いのだから、種類ぶんのジオメトリを作って頂点色に焼いてしまえば、
- * 幹と樹冠を 1 つのインスタンスにまとめられる。季節が変わったときだけ
- * ジオメトリを作り直せばよい。
+ * **区画に分けて視錐台カリングを効かせる。** マップを 80 タイル角の区画に切り、
+ * 区画ごとにメッシュを持つ。カメラを寄せているとき、three.js が区画単位で
+ * 「見えていない」を判定して丸ごと捨ててくれる。
  *
- * 木の色は季節で変わる。田んぼの色と合わせて、街の時間経過が
- * 遠景からでも伝わるようになる。
+ * **数の少ない種類は区画に切らない。** 街路樹と竹は道路沿い・特定の地形にしか
+ * 生えないので、区画に切るとドローコールだけが増えて中身が空になる。
+ * こちらは 1 種類 1 メッシュにまとめる。
  */
 
-/** 区画の 1 辺（タイル）。320 / 64 = 5 で 25 区画。 */
-const REGION_TILES = 64;
+/** 区画の 1 辺（タイル）。320 / 80 = 4 で 16 区画。 */
+const REGION_TILES = 80;
 const REGIONS_X = MAP_W / REGION_TILES;
 const REGION_COUNT = REGIONS_X * REGIONS_X;
 
-/** 部品の種類。区画ごとにこの数だけメッシュを持つ。 */
-const Kind = { Conifer: 0, BroadleafA: 1, BroadleafB: 2, Rock: 3, Bund: 4 } as const;
+/** 区画ごとに持つ部品の種類。 */
+const Kind = { Conifer: 0, Broadleaf: 1, Shrub: 2, Rock: 3, Bund: 4 } as const;
 const KIND_COUNT = 5;
 
 /** 森林タイル 1 枚に生やす本数。 */
@@ -59,37 +65,25 @@ const TREES_PER_FOREST = 2;
 /** 丘陵・平地にまばらに生やす周期（タイルのハッシュの法）。 */
 const HILL_PERIOD = 3;
 const PLAIN_PERIOD = 11;
+/**
+ * 低木・草むらの周期。
+ * 密にしすぎると、草地一面に茶色い塊が散らばって「ゴミが落ちている」ように見える。
+ */
+const SHRUB_PERIOD = 9;
 /** 山地に岩を置く周期。 */
 const ROCK_PERIOD = 2;
-
-/** 針葉樹（杉・檜）。日本の人工林はほぼこれ。 */
-const CONIFER_COLORS: Record<number, number> = {
-  [Season.Spring]: 0x3f7a4a,
-  [Season.Summer]: 0x2f6b3c,
-  [Season.Autumn]: 0x35633c,
-  [Season.Winter]: 0x2b5236,
-};
-/**
- * 広葉樹は 2 種類の色で交互に生やす。1 色だと塗り絵に見えるので、
- * どの季節でも少し散らしておく。秋は紅葉と黄葉の差になる。
- */
-const BROADLEAF_COLORS: Record<number, [number, number]> = {
-  [Season.Spring]: [0x8cc063, 0x6fae55],
-  [Season.Summer]: [0x4f9243, 0x3f8039],
-  [Season.Autumn]: [0xc9702c, 0xd8a53a],
-  [Season.Winter]: [0x7a6c58, 0x6d604f],
-};
-
-const TRUNK_COLOR = 0x6b5540;
-const ROCK_COLOR = 0x7c7a72;
-const SNOW_COLOR = 0xdfe4e8;
-const BUND_COLOR = 0x8f7f5f;
+/** 竹林の周期。里山の縁にだけ、まばらに。 */
+const BAMBOO_PERIOD = 23;
 
 /** 雪をかぶる標高 (dm)。冬だけ、これより高い山を白くする。 */
 const SNOW_LINE_DM = 620;
 
 /** 再構築のクールダウン（フレーム数）。建物のエポックは 1 日に何度も動く。 */
 const REBUILD_COOLDOWN = 24;
+
+/** 向き d (0=北,1=東,2=南,3=西) の外向き単位ベクトル。街路樹をどの辺に植えるかで使う。 */
+const OUT_X = [0, 1, 0, -1] as const;
+const OUT_Z = [-1, 0, 1, 0] as const;
 
 export class NatureLayer {
   readonly group = new Object3D();
@@ -100,9 +94,27 @@ export class NatureLayer {
   private readonly cursors = new Int32Array(REGION_COUNT * KIND_COUNT);
   /** 種類ごとのジオメトリ。季節が変わったら作り直す。 */
   private geoms: BufferGeometry[] = [];
-  private readonly treeMaterial = new MeshLambertMaterial({ vertexColors: true });
-  private readonly rockMaterial = new MeshLambertMaterial({});
-  private readonly bundMaterial = new MeshLambertMaterial({ color: BUND_COLOR });
+
+  /** 数の少ない種類は区画に切らずに 1 メッシュで持つ。 */
+  private readonly streetTrees: InstancePool;
+  private readonly bamboo: InstancePool;
+
+  // 葉は薄いので裏からの光がわずかに透ける。粗さを下げすぎると
+  // 樹冠がプラスチックになるので、拡散寄りのまま少しだけ反射を残す。
+  // 葉も岩も鏡面反射をほとんど持たない。既定の envMapIntensity 1 のままだと、
+  // 低い視点で見たときにフレネル反射で空の色が乗って白く飛ぶ。
+  private readonly treeMaterial = surface({
+    vertexColors: true,
+    roughness: 0.9,
+    metalness: 0.0,
+    envMapIntensity: 0.3,
+  });
+  private readonly rockMaterial = surface({
+    vertexColors: true,
+    roughness: 0.94,
+    metalness: 0.0,
+    envMapIntensity: 0.25,
+  });
   private geomSeason = -1;
 
   /** 直近に反映したエポックと季節。1 つでも変われば作り直す。 */
@@ -118,6 +130,22 @@ export class NatureLayer {
 
   constructor() {
     this.group.name = 'nature';
+    this.buildGeometries(Season.Summer);
+    this.geomSeason = Season.Summer;
+    this.streetTrees = new InstancePool(
+      streetTreeGeometry(Season.Summer, 0.5),
+      this.treeMaterial,
+      this.group,
+      true,
+      2048,
+    );
+    this.bamboo = new InstancePool(
+      bambooGeometry(Season.Summer, 0.5),
+      this.treeMaterial,
+      this.group,
+      true,
+      512,
+    );
   }
 
   /** 情報表示のときは隠す（道路・線路レイヤと同じ理由）。 */
@@ -154,6 +182,8 @@ export class NatureLayer {
 
     if (this.geomSeason !== season) {
       this.buildGeometries(season);
+      this.streetTrees.setGeometry(streetTreeGeometry(season, 0.55));
+      this.bamboo.setGeometry(bambooGeometry(season, 0.5));
       this.geomSeason = season;
     }
     // 1 周目で区画ごとの本数を数え、器を用意してから 2 周目で書き込む。
@@ -162,31 +192,28 @@ export class NatureLayer {
     this.walk(sim, false);
     this.ensureMeshes();
     this.cursors.fill(0);
+    this.streetTrees.begin();
+    this.bamboo.begin();
     this.walk(sim, true);
+    this.streetTrees.end();
+    this.bamboo.end();
     this.finish();
   }
 
   /** 季節ぶんのジオメトリ。幹と樹冠を 1 つに合成し、色は頂点に焼き込む。 */
   private buildGeometries(season: number): void {
     for (const g of this.geoms) g.dispose();
-    const conifer = CONIFER_COLORS[season] ?? CONIFER_COLORS[Season.Summer]!;
-    const broad = BROADLEAF_COLORS[season] ?? BROADLEAF_COLORS[Season.Summer]!;
-    // 冬の広葉樹は葉を落とすので、樹冠を小さく描く。
     const bare = season === Season.Winter;
-    const bundGeom = new BoxGeometry(1, 1, 1);
-    bundGeom.translate(0, 0.5, 0);
     this.geoms = [];
-    this.geoms[Kind.Conifer] = coniferGeometry(conifer);
-    this.geoms[Kind.BroadleafA] = broadleafGeometry(broad[0], bare);
-    this.geoms[Kind.BroadleafB] = broadleafGeometry(broad[1], bare);
-    this.geoms[Kind.Rock] = new OctahedronGeometry(1, 0);
-    this.geoms[Kind.Bund] = bundGeom;
+    this.geoms[Kind.Conifer] = coniferGeometry(season, 0.5);
+    this.geoms[Kind.Broadleaf] = broadleafGeometry(season, 0.5, false, bare);
+    this.geoms[Kind.Shrub] = shrubGeometry(season, 0.5);
+    this.geoms[Kind.Rock] = rockGeometry(7, false);
+    this.geoms[Kind.Bund] = bundGeometry(season);
   }
 
-  private materialFor(kind: number): MeshLambertMaterial {
-    if (kind === Kind.Rock) return this.rockMaterial;
-    if (kind === Kind.Bund) return this.bundMaterial;
-    return this.treeMaterial;
+  private materialFor(kind: number): typeof this.treeMaterial {
+    return kind === Kind.Rock || kind === Kind.Bund ? this.rockMaterial : this.treeMaterial;
   }
 
   /** 数え終わった本数に合わせて、区画ごとのメッシュを用意する。 */
@@ -214,6 +241,8 @@ export class NatureLayer {
       next.count = 0;
       // 区画ごとに視錐台カリングを効かせる。これがこのレイヤの肝。
       next.frustumCulled = true;
+      // instanceColor を先に確保する。個体ごとの色ずらしに必ず使う。
+      next.setColorAt(0, WHITE);
       this.group.add(next);
       this.meshes[s] = next;
       this.caps[s] = cap;
@@ -255,6 +284,15 @@ export class NatureLayer {
       const cz = (y + 0.5) * TILE_M;
       const h = (i * 2654435761) >>> 0;
 
+      // --- 街路樹 ---
+      // 道路タイルの、道路が繋がっていない辺（＝歩道のある辺）に植える。
+      // 全部の辺に植えると並木というより生垣になり、田畑の間の農道にまで
+      // 街路樹が並んで日本の風景から外れるので、用途地域で密度を変える。
+      if (world.road[i] !== RoadClass.None) {
+        if (place) this.putStreetTrees(sim, i, cx, cz, gy, h);
+        continue;
+      }
+
       // 田んぼの畦。隣が田んぼでない辺にだけ盛る。
       // 全部の辺に置くと 1 枚ずつ囲われた升目になり、日本の水田の
       // 「大きな区画がいくつか」という見え方から外れる。
@@ -271,13 +309,14 @@ export class NatureLayer {
           const ox = d === 1 ? edge : d === 3 ? -edge : 0;
           const oz = d === 2 ? edge : d === 0 ? -edge : 0;
           const vertical = d === 1 || d === 3;
-          this.put(slot, cx + ox, gy, cz + oz, vertical ? 0.9 : TILE_M, 0.45, vertical ? TILE_M : 0.9, 0);
+          // 畦は「土を盛った細い道」。太く高くすると木の板を並べたように見える。
+          this.put(slot, cx + ox, gy - 0.12, cz + oz, vertical ? 0.7 : TILE_M, 0.42, vertical ? TILE_M : 0.7, 0);
         }
         continue;
       }
 
-      // 道路・線路・建物の上には何も生やさない。
-      if (world.road[i] !== RoadClass.None || world.rail[i] !== 0 || world.buildingRef[i] !== 0) continue;
+      // 線路・建物の上には何も生やさない。
+      if (world.rail[i] !== 0 || world.buildingRef[i] !== 0) continue;
 
       if (terrain === Terrain.Mountain) {
         if (h % ROCK_PERIOD !== 0) continue;
@@ -291,11 +330,15 @@ export class NatureLayer {
         const oz = (((h >>> 13) % 100) / 100 - 0.5) * TILE_M * 0.7;
         // 冬の高山は雪をかぶる。街から見上げたときの季節感がここで出る。
         const snowy = winter && world.heightDm[i]! > SNOW_LINE_DM;
-        this.color.setHex(snowy ? SNOW_COLOR : ROCK_COLOR);
+        // 岩は色味を持たないので、明度だけを散らす。同じ灰色の塊が並ぶより、
+        // 明暗が混ざっているほうが「崩れた斜面」に見える。
+        const v = 0.78 + ((h >>> 11) % 45) / 100;
+        if (snowy) this.color.setRGB(v * 1.25, v * 1.27, v * 1.3);
+        else this.color.setRGB(v, v * 0.99, v * 0.95);
         this.put(
           slot,
           cx + ox,
-          gy + size * 0.35,
+          gy - size * 0.25,
           cz + oz,
           size,
           size * 0.8,
@@ -304,6 +347,50 @@ export class NatureLayer {
           this.color,
         );
         continue;
+      }
+
+      // --- 竹林 ---
+      // 森と平地の境目（＝里山の縁）に生える。日本の郊外の風景で、
+      // 杉林でも雑木林でもない「明るい黄緑の藪」がこれ。
+      if (place && zone === Zone.None && terrain !== Terrain.Mountain && h % BAMBOO_PERIOD === 5) {
+        const near = this.nextTo(world, i, Terrain.Forest);
+        if (near) {
+          const size = 6 + ((h >>> 5) % 40) / 10;
+          this.color.setRGB(1, 1, 1);
+          this.pushProp(
+            this.bamboo,
+            cx + (((h >>> 3) % 100) / 100 - 0.5) * TILE_M * 0.6,
+            gy,
+            cz + (((h >>> 9) % 100) / 100 - 0.5) * TILE_M * 0.6,
+            size,
+            ((h >>> 15) % 360) * (Math.PI / 180),
+            this.jitterCanopy(h, 0.1, 0.16),
+          );
+        }
+      }
+
+      // --- 低木・草むら ---
+      // 木のふもとと空き地を埋める。木と地面が直接ぶつかっていると、
+      // 「模型の芝生に木を刺した」ように見える。
+      if (zone === Zone.None || zone === Zone.Park || zone === Zone.Forestry) {
+        if (h % SHRUB_PERIOD === 2) {
+          const slot = region * KIND_COUNT + Kind.Shrub;
+          if (!place) this.counts[slot]!++;
+          else {
+            const size = 1.2 + ((h >>> 19) % 18) / 10;
+            this.put(
+              slot,
+              cx + (((h >>> 7) % 100) / 100 - 0.5) * TILE_M * 0.8,
+              gy - size * 0.12,
+              cz + (((h >>> 17) % 100) / 100 - 0.5) * TILE_M * 0.8,
+              size,
+              size * (0.5 + ((h >>> 23) % 32) / 100),
+              size,
+              ((h >>> 27) % 360) * (Math.PI / 180),
+              this.jitterCanopy(h ^ 0x5bf03635, 0.05, 0.22),
+            );
+          }
+        }
       }
 
       // 木を何本生やすか。森林は密に、林業地は植林として規則的に、
@@ -327,7 +414,7 @@ export class NatureLayer {
         const g = ((h >>> (k * 5)) ^ (k * 0x9e3779b9)) >>> 0;
         // 森林と林業地は針葉樹が主体、丘や平地の雑木は広葉樹が主体。
         const conifer = terrain === Terrain.Forest || planted ? (g >>> 19) % 4 !== 0 : (g >>> 19) % 4 === 0;
-        const kind = conifer ? Kind.Conifer : (g >>> 21) & 1 ? Kind.BroadleafA : Kind.BroadleafB;
+        const kind = conifer ? Kind.Conifer : Kind.Broadleaf;
         const slot = region * KIND_COUNT + kind;
         if (!place) {
           this.counts[slot]!++;
@@ -337,9 +424,95 @@ export class NatureLayer {
         const ox = planted ? (k - (count - 1) / 2) * 3.2 : (((g >>> 3) % 100) / 100 - 0.5) * TILE_M * 0.72;
         const oz = planted ? ((i % 3) - 1) * 3.0 : (((g >>> 11) % 100) / 100 - 0.5) * TILE_M * 0.72;
         const height = conifer ? 9 + ((g >>> 23) % 70) / 10 : 7 + ((g >>> 23) % 50) / 10;
-        this.put(slot, cx + ox, gy, cz + oz, height, height, height, ((g >>> 25) % 360) * (Math.PI / 180));
+        // 樹形も少し崩す。幅を高さと別に散らすと、同じ木の反復が消える。
+        const spread = height * (0.86 + ((g >>> 13) % 32) / 100);
+        this.put(
+          slot,
+          cx + ox,
+          gy,
+          cz + oz,
+          spread,
+          height,
+          spread,
+          ((g >>> 25) % 360) * (Math.PI / 180),
+          this.jitterCanopy(g, conifer ? 0.022 : 0.05, conifer ? 0.16 : 0.24),
+        );
       }
     }
+  }
+
+  /** 隣接 4 タイルにその地形があるか。里山の縁の判定に使う。 */
+  private nextTo(world: Simulation['world'], i: number, terrain: number): boolean {
+    for (let d = 0; d < 4; d++) {
+      const nb = neighbor(i, d);
+      if (nb >= 0 && world.terrain[nb] === terrain) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 街路樹。道路レイヤではなくここに置いてあるのは、
+   * (a) 季節で色が変わる仕組みが植生側にあること、
+   * (b) 道路グループは影を落とさない設定なので、木の影が消えてしまうこと、
+   * の 2 つの理由による。
+   */
+  private putStreetTrees(sim: Simulation, i: number, cx: number, cz: number, gy: number, h: number): void {
+    const world = sim.world;
+    const conn = world.roadConn(i);
+    for (let d = 0; d < 4; d++) {
+      if (conn & (1 << d)) continue;
+      const facing = neighbor(i, d);
+      const zone = facing >= 0 ? world.zone[facing]! : Zone.None;
+      const dense =
+        zone === Zone.ResidentialMid ||
+        zone === Zone.CommercialLocal ||
+        zone === Zone.CommercialCentral ||
+        zone === Zone.Park;
+      // 低層住宅地は庭木が主役で街路樹はまばら。ここを密にすると郊外が並木道になる。
+      const sparse = zone === Zone.ResidentialLow;
+      const period = dense ? 2 : sparse ? 6 : 0;
+      if (period === 0) continue;
+      const key = (h ^ (d * 0x9e3779b9)) >>> 0;
+      if (key % period !== 0) continue;
+      const size = 5.4 + ((key >>> 5) % 26) / 10;
+      // 歩道の上に植える。大通りは車道が広いぶん歩道が外に寄るので、
+      // 車道の半幅を見て位置をずらす（そうしないと車道の真ん中に木が立つ）。
+      const offset = Math.max(CARRIAGE_HALF[world.road[i]!]! + 0.55, WALK_OUTER - 1.0);
+      this.pushProp(
+        this.streetTrees,
+        cx + OUT_X[d]! * offset,
+        gy + 0.38,
+        cz + OUT_Z[d]! * offset,
+        size,
+        ((key >>> 11) % 360) * (Math.PI / 180),
+        this.jitterCanopy(key, 0.03, 0.18),
+      );
+    }
+  }
+
+  /**
+   * 樹冠の色を個体ごとに散らす。
+   *
+   * `jitterColor`（materials.ts）は建物向けに色相の振れ幅が狭い。
+   * 木は「同じ樹種でも日当たりと樹齢で色が全然違う」ので、
+   * 色相をもう少し広く、明度はさらに広く振る必要がある。
+   * 返す色は `instanceColor` に入り、頂点カラーと掛け算で合成される
+   * （＝白 1.0 が「変化なし」）。
+   */
+  private jitterCanopy(hash: number, hue: number, light: number): Color {
+    const a = hash2(hash & 0xffff, (hash >>> 16) & 0xffff) - 0.5;
+    const b = hash2((hash >>> 8) & 0xffff, hash & 0xff) - 0.5;
+    // 明度は掛け算なので 1 を中心に。色相は緑↔黄緑↔褐色の間で振る。
+    const l = 1 + b * 2 * light;
+    this.color.setHSL((1 + a * 2 * hue) % 1, 0.5, 0.5);
+    // setHSL で作った色をそのまま掛けると全体が濁るので、白に寄せて薄める。
+    const w = 0.72;
+    this.color.setRGB(
+      (this.color.r * 2 * (1 - w) + w) * l,
+      (this.color.g * 2 * (1 - w) + w) * l,
+      (this.color.b * 2 * (1 - w) + w) * l,
+    );
+    return this.color;
   }
 
   private put(
@@ -367,88 +540,36 @@ export class NatureLayer {
     this.cursors[slot] = index + 1;
   }
 
+  /** 区画に切らない種類（街路樹・竹）の配置。 */
+  private pushProp(
+    pool: InstancePool,
+    x: number,
+    y: number,
+    z: number,
+    size: number,
+    rotY: number,
+    color: Color,
+  ): void {
+    this.pos.set(x, y, z);
+    this.scl.set(size, size, size);
+    if (rotY === 0) this.quat.identity();
+    else this.quat.setFromAxisAngle(this.axisY, rotY);
+    this.mat.compose(this.pos, this.quat, this.scl);
+    pool.push(this.mat, color);
+  }
+
   dispose(): void {
     for (const mesh of this.meshes) {
       if (mesh) mesh.dispose();
     }
     for (const g of this.geoms) g.dispose();
+    this.streetTrees.mesh.geometry.dispose();
+    this.streetTrees.dispose();
+    this.bamboo.mesh.geometry.dispose();
+    this.bamboo.dispose();
     this.treeMaterial.dispose();
     this.rockMaterial.dispose();
-    this.bundMaterial.dispose();
   }
 }
 
-/** 高さ 1・底面 y=0 に正規化した針葉樹。大きさはインスタンスの拡大率で決める。 */
-function coniferGeometry(canopy: number): BufferGeometry {
-  const trunk = new BoxGeometry(0.06, 0.34, 0.06);
-  trunk.translate(0, 0.17, 0);
-  const cone = new ConeGeometry(0.28, 0.72, 5);
-  cone.translate(0, 0.64, 0);
-  return mergeColored([
-    { geom: trunk, color: TRUNK_COLOR },
-    { geom: cone, color: canopy },
-  ]);
-}
-
-/** 同じく広葉樹。冬は葉を落とすので樹冠を縮める。 */
-function broadleafGeometry(canopy: number, bare: boolean): BufferGeometry {
-  const trunk = new BoxGeometry(0.08, 0.44, 0.08);
-  trunk.translate(0, 0.22, 0);
-  const r = bare ? 0.21 : 0.37;
-  const vr = bare ? 0.19 : 0.32;
-  const crown = new OctahedronGeometry(1, 0);
-  crown.scale(r, vr, r);
-  crown.translate(0, bare ? 0.56 : 0.66, 0);
-  return mergeColored([
-    { geom: trunk, color: TRUNK_COLOR },
-    { geom: crown, color: canopy },
-  ]);
-}
-
-/**
- * 部品を 1 つのジオメトリに合成し、部品ごとの色を頂点色として焼き込む。
- * 索引の無いジオメトリ（多面体）も混ざるので、そこは連番の索引を作る。
- */
-function mergeColored(parts: readonly { geom: BufferGeometry; color: number }[]): BufferGeometry {
-  let vertexCount = 0;
-  let indexCount = 0;
-  for (const p of parts) {
-    const n = p.geom.getAttribute('position').count;
-    vertexCount += n;
-    indexCount += p.geom.getIndex()?.count ?? n;
-  }
-  const position = new Float32Array(vertexCount * 3);
-  const normal = new Float32Array(vertexCount * 3);
-  const color = new Float32Array(vertexCount * 3);
-  const index = new Uint16Array(indexCount);
-
-  let vo = 0;
-  let io = 0;
-  for (const p of parts) {
-    const pos = p.geom.getAttribute('position');
-    const nrm = p.geom.getAttribute('normal');
-    const n = pos.count;
-    position.set(pos.array as Float32Array, vo * 3);
-    normal.set(nrm.array as Float32Array, vo * 3);
-    const r = ((p.color >> 16) & 255) / 255;
-    const g = ((p.color >> 8) & 255) / 255;
-    const b = (p.color & 255) / 255;
-    for (let v = 0; v < n; v++) {
-      color[(vo + v) * 3] = r;
-      color[(vo + v) * 3 + 1] = g;
-      color[(vo + v) * 3 + 2] = b;
-    }
-    const src = p.geom.getIndex();
-    for (let k = 0; k < (src?.count ?? n); k++) index[io + k] = (src ? src.getX(k) : k) + vo;
-    io += src?.count ?? n;
-    vo += n;
-    p.geom.dispose();
-  }
-
-  const out = new BufferGeometry();
-  out.setAttribute('position', new BufferAttribute(position, 3));
-  out.setAttribute('normal', new BufferAttribute(normal, 3));
-  out.setAttribute('color', new BufferAttribute(color, 3));
-  out.setIndex(new BufferAttribute(index, 1));
-  return out;
-}
+const WHITE = new Color(1, 1, 1);

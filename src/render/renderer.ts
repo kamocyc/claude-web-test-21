@@ -370,8 +370,11 @@ export class Renderer {
     if (this.scene.fog) {
       const fog = this.scene.fog as Fog;
       fog.color.copy(atmo.horizon);
-      fog.near = Math.max(160, this.rig.distance * 1.4);
-      fog.far = Math.max(1400, this.rig.distance * 7.5);
+      // 霞み始めをカメラ距離の 2 倍より遠くに置く。ここを近くすると、
+      // 街区を見下ろしている距離で「見えている街の大半」が霞に沈み、
+      // せっかくの造形が白く飛んでしまう。
+      fog.near = Math.max(600, this.rig.distance * 2.4);
+      fog.far = Math.max(4200, this.rig.distance * 16);
     }
 
     this.updateEnvironment(frac);
