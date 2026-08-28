@@ -13,6 +13,14 @@ import {
   Vector3,
 } from 'three';
 import { applyVerticalAO, chamferedUnitBox, mergeParts, place, tintGeometry, type Part } from './materials';
+import {
+  ROOF_TILES_X,
+  ROOF_TILES_Y,
+  disposeRoofTextures,
+  roofAlbedoTexture,
+  roofNormalTexture,
+  roofTexMean,
+} from './roofTexture';
 
 /**
  * 建物の部品キットと、立面（ファサード）を描くための材質。
@@ -76,6 +84,14 @@ export const Facade = {
    * 前回いちばん大きな減点だった。
    */
   Front: 9,
+  /**
+   * バルコニーの手すり・腰壁。p1=種別（0 コンクリート腰壁 / 1 アルミ手すり /
+   * 2 濃色パネル）, p2=パネル 1 枚の幅 (m), p3=種。
+   *
+   * 3 種に分けたつもりが、絵の上では全部「無地の実壁パネル」に見えていた。
+   * 手すりを `Facade.Plain` の箱で描いていたので、天端も目地も無かったのが本体。
+   */
+  Parapet: 10,
 } as const;
 
 /**
@@ -111,6 +127,13 @@ export const FrontKind = {
   /** 雑居ビル：テナント看板の並ぶ入口。 */
   Tenant: 4,
 } as const;
+
+/**
+ * 桟瓦 1 枚の幅は葺き足の 0.78 倍。
+ * 実寸だと葺き足 0.40m に対して幅 0.31m で、この比が崩れると
+ * 俯瞰で瓦が縦に間延びして「縞模様の布」に見える。
+ */
+const TILE_W_RATIO = 0.78;
 
 /** これより小さい部品は、上下の面取りを省いた軽い箱で描く (m)。 */
 const SMALL_PART_M = 3.2;
@@ -224,6 +247,29 @@ float gEnv;
 float gWin;
 /** フェイク反射で足す色。ガラスの証明はこれ 1 本にかかっている。 */
 vec3 gRefl;
+/** 屋根の接空間法線。棟の稜線はここで折る。 */
+vec3 gRoofN;
+/** 屋根テクスチャの UV（屋根のローカル座標から毎画素作る）。 */
+vec2 gRoofUV;
+#ifdef ROOF_TEX
+uniform sampler2D uRoofMap;
+uniform sampler2D uRoofNrm;
+uniform float uRoofGain;
+#endif
+
+/**
+ * 手続きの細かい模様を距離で消す係数。
+ *
+ * 距離でフェードしないプロシージャルノイズは、1 画素より細かくなった瞬間に
+ * 圧縮ノイズに読める。カメラが動けば画面の全面でクロールする。
+ * 画面上の変化率 w（fwidth）が 1 画素ぶんを超えたら 0 へ収束させる。
+ *
+ * @param w その模様の座標の fwidth
+ * @param n 何周期ぶんで消し切るか
+ */
+float detailFade(float w, float n) {
+  return 1.0 - smoothstep(0.0, 1.0, w * n);
+}
 
 /**
  * 反射方向から空の色を引く。
@@ -240,18 +286,27 @@ vec3 fakeSky(vec3 R) {
   // 地平のすぐ下は「向かいの建物の日の当たった上半分」なので、実際にはかなり明るい。
   // ここを黒に寄せると、見下ろした窓がすべて黒い板になって元に戻ってしまう。
   vec3 grd = mix(uSkyGround, uSkyHorizon, smoothstep(-0.55, -0.01, t));
-  vec3 c = (t > 0.0) ? sky : grd;
-  // 地平のすぐ上下に映るのは「向かいの建物」。街路でガラスを斜めに見たとき、
+  // 地平をまたぐところは smoothstep で繋ぐ。
+  // 三項演算子で切り替えていたので、反射ベクトルが水平を横切る画素の列で
+  // 色が階段状に飛び、窓の中に**直線の境界**が出ていた。
+  // レビューの「窓に白い紙を貼ったように見える」はここが出所。
+  vec3 c = mix(grd, sky, smoothstep(-0.07, 0.07, t));
+  // 地平の上下に映るのは「向かいの建物」。街路でガラスを斜めに見ると
   // 反射ベクトルはほぼ水平になるので、ここを明るい地平色のままにすると
-  // グレージング角の窓が一様な白い板になる — 拡大したときの「平板」の正体はこれ。
-  // 向かいの壁のぶんだけ確実に落とす。
-  float town = 1.0 - smoothstep(0.02, 0.22, abs(t));
-  c = mix(c, uSkyGround * 1.1, town * 0.68);
+  // グレージング角の窓が一様な白い板になる。
+  // 帯の幅を広く取り、縁を smoothstep で抜いて、境界が線に見えないようにする。
+  float town = (1.0 - smoothstep(0.0, 0.32, abs(t))) * 0.60;
+  c = mix(c, uSkyGround * 1.1, town);
   // 太陽のギラつき。窓が 1 枚だけ白く光る瞬間があると、一気にガラスになる。
+  // ただし pow(s, 180) は 1 画素で 0 から 1 まで跳ぶので、そのままだと
+  // 縁の立った白い矩形になる。smoothstep で裾を作って角を殺す。
   float s = max(dot(R, uSunDir), 0.0);
-  c += uSunTint * pow(s, 180.0) * 2.6;
-  // 雲の帯。反射の中に低周波のむらが 1 つ入るだけで「塗った青」から抜ける。
-  c *= 1.0 + 0.16 * sin(R.x * 7.0 + R.z * 5.0) * smoothstep(0.05, 0.5, t);
+  c += uSunTint * smoothstep(0.88, 0.999, s) * 1.9;
+  // 向かいの街並みと雲のむら。**反射ベクトルだけの関数**にするのが肝で、
+  // 壁のローカル座標から作ると壁に貼り付いた模様になり、カメラが動いても
+  // 動かない明るい面として「貼った紙」に見えてしまう。
+  float m = sin(R.x * 5.3 + R.z * 3.1) * sin(R.y * 6.1 - R.x * 2.3);
+  c *= 1.0 + 0.15 * m;
   return c;
 }
 
@@ -556,7 +611,7 @@ void frontShade(vec3 base) {
     float pdoor = step(0.03, un) * (1.0 - step(0.13, un)) * (1.0 - step(2.0, py));
     col = mix(col, vec3(0.30, 0.33, 0.34), pdoor);
     // 錆と汚れ。搬入口の下端は必ず擦れている。
-    col *= 1.0 - vnoise(vec2(u * 1.4, py * 1.4)) * 0.10;
+    col *= 1.0 - vnoise(vec2(u * 1.4, py * 1.4)) * 0.10 * detailFade(fwidth(u * 1.4), 1.4);
     col *= 1.0 - rail * 0.18;
     rough = 0.62; metal = 0.42;
     emis = vec3(1.0, 0.93, 0.78) * pdoor * uNight * 0.25;
@@ -591,7 +646,8 @@ void frontShade(vec3 base) {
     plate *= mix(0.35, 1.0, gap);
     col = vec3(0.42, 0.42, 0.41);
     // 入口まわりの壁は磨いた石。雑居ビルの足元はたいていこれ。
-    col *= 0.9 + 0.2 * vnoise(vec2(ux * 3.0, py * 3.0));
+    // 軒下の粒状ノイズ。距離で消さないと、遠景で壁がざらついて見える。
+    col *= 1.0 + 0.2 * (vnoise(vec2(ux * 3.0, py * 3.0)) - 0.5) * detailFade(fwidth(ux * 3.0), 1.2);
     col = mix(col, inside, ent);
     col = mix(col, plate, boardM);
     // 自動販売機（右端）。日本の雑居ビルの足元には必ず 1 台ある。
@@ -621,9 +677,126 @@ void frontShade(vec3 base) {
   }
 }
 
+/**
+ * バルコニーの手すり・腰壁。
+ *
+ * 3 種類に作り分けたはずのものが、絵の上では全部「無地の実壁パネル」に
+ * 見えていた。原因は 2 つで、
+ *  (a) 手すりを Facade.Plain の箱で描いていたので、天端も目地も無かった。
+ *  (b) アルミ手すりは 1 スパンのキットを横に引き伸ばしていたので、
+ *      幅 4.5cm のはずの子柱が、長さ 10m の腰壁では幅 45cm の板になっていた。
+ *      引き伸ばす作りである限り、キットの子柱は絶対に細くならない。
+ *
+ * どちらもシェーダで描けば消える。3 種を材質側で描き分ける。
+ *   0 = コンクリートの腰壁（笠木＋縦目地＋雨だれ）
+ *   1 = アルミの手すり（細い子柱が並び、その間は奥の影）
+ *   2 = 濃色パネル＋アルミ枠（枠が明るく、面が暗く艶がある）
+ * どれも同じ箱のキットに載るので、インスタンスもドローコールも増えない。
+ */
+void parapetShade(vec3 base) {
+  gTint = vec3(1.0); gRough = 0.84; gMetal = 0.06; gEmis = vec3(0.0);
+  gEnv = 1.0; gWin = 0.0; gRefl = vec3(0.0);
+  float kind = vFacadeV.y;
+  float panelW = max(vFacadeV.z, 0.6);
+  vec3 n = vObjN;
+  float ax = abs(n.x), ay = abs(n.y), az = abs(n.z);
+
+  // 天端（笠木）。どの種類でもアルミか石の見切りが載る。
+  // 上面がひとつ明るい線として抜けるだけで、帯が「厚みのある壁」になる。
+  if (ay > max(ax, az)) {
+    gTint = vec3(n.y > 0.0 ? 1.30 : 0.42);
+    gRough = 0.40; gMetal = 0.45;
+    return;
+  }
+
+  bool alongZ = ax > az;
+  float u = alongZ ? vLocalM.z : vLocalM.x;
+  float len = max(alongZ ? vScaleM.z : vScaleM.x, 0.3);
+  float H = max(vScaleM.y, 0.2);
+  float y = vLocalM.y;
+  float dTop = H - y;                     // 天端からの距離 (m)
+  float wy = fwidth(y);
+  float ul = u + len * 0.5;               // 端からの距離 (m)
+
+  // ---- 全種共通の 2 本：天端キャップの見付と、その真下に落ちる影 ----
+  // 眼高では「4cm の見切り 1 本」が素材の説得力を決める。
+  // これがゼロだと、淡い色の腰壁が発泡スチロールの板に見える。
+  float capFace = bandAA(dTop, 0.0, 0.05, wy);
+  float capShad = bandAA(dTop, 0.05, 0.115, wy);
+  // 下端の水切り。床スラブとの取り合いに必ず影が溜まる。
+  float dripS = bandAA(y, 0.0, 0.05, wy);
+
+  if (kind > 1.5) {
+    // ---- 濃色パネル（ガラス／スチール）＋アルミ枠 ----
+    // 面を暗く、枠を明るくする。腰壁とは明暗が逆になるので、
+    // 同じ形でも遠目に別の作りとして読める。
+    float post = bandAA(fract(ul / 1.2), 0.0, 0.055, fwidth(ul / 1.2));
+    float frame = max(post, max(bandAA(dTop, 0.05, 0.13, wy), bandAA(y, 0.0, 0.10, wy)));
+    vec3 panel = vec3(0.30, 0.32, 0.35);
+    vec3 alum = vec3(0.82, 0.83, 0.84);
+    vec3 col = mix(panel, alum, frame);
+    gTint = col / max(base, vec3(0.03));
+    gRough = mix(0.24, 0.42, frame);
+    gMetal = mix(0.35, 0.62, frame);
+    // 面はわずかに空を映す。ここが板のままだと「濃い色を塗った腰壁」に戻る。
+    vec3 V = normalize(vWorldPos - cameraPosition);
+    vec3 Nw = normalize(vWorldN);
+    gRefl = fakeSky(reflect(V, Nw)) * mix(0.06, 0.40, fresnelAt(V, Nw)) * (1.0 - frame);
+    gTint *= 1.0 + capFace * 0.30 - capShad * 0.30;
+    return;
+  }
+
+  if (kind > 0.5) {
+    // ---- アルミの手すり ----
+    //
+    // 子柱を実寸（径 1.6cm・ピッチ 11cm）で描く。抜くことはできないので、
+    // 子柱の間はバルコニーの奥（＝日の当たらない面）の色にする。
+    // 明暗の縞が細かく入るだけで、腰壁とは別物として読める。
+    float pp = 0.11;
+    float bar = fract(ul / pp);
+    float wb = fwidth(ul / pp);
+    float baluster = bandAA(bar, 0.0, 0.16, wb);
+    // 笠木（上端の太い横桟）と中桟・下桟。
+    float rails = max(bandAA(dTop, 0.0, 0.055, wy),
+                  max(bandAA(dTop, H * 0.5 - 0.02, H * 0.5 + 0.02, wy),
+                      bandAA(y, 0.0, 0.035, wy)));
+    float metalM = max(baluster, rails);
+    // 遠景では子柱が 1 画素を割る。そこで縞を描き続けると
+    // 柵がちらつく点の集合になるので、平均の明るさへ寄せる。
+    float near = detailFade(wb, 0.9);
+    metalM = mix(0.42, metalM, near);
+    // 奥は建物の陰。手すりの向こうが暗いから「抜けている」に見える。
+    vec3 col = mix(vec3(0.16, 0.17, 0.18), vec3(0.86, 0.87, 0.88), metalM);
+    gTint = col / max(base, vec3(0.03));
+    gRough = mix(0.7, 0.30, metalM);
+    gMetal = mix(0.05, 0.70, metalM);
+    return;
+  }
+
+  // ---- コンクリートの腰壁 ----
+  float t = 1.0;
+  t += capFace * 0.34;                    // 笠木の見付（明るい 5cm）
+  t -= capShad * 0.36;                    // その真下の影
+  t -= dripS * 0.26;                      // 下端の水切り
+  // パネルの縦目地。打ち継ぎか、乾式パネルの継ぎ目が必ず 1 本ある。
+  // 見えるのは幅 1cm 前後の線 1 本だが、これが無い帯は必ず板に見える。
+  t -= bandAA(fract(ul / panelW), 0.0, 0.014, fwidth(ul / panelW)) * 0.34;
+  // 笠木から垂れる雨だれ。遠景では必ず消す（近くでしか意味を持たない）。
+  float sc = ul * 0.7;
+  float streak = smoothstep(0.62, 1.0, h21(vec2(floor(sc), 5.0) + vFacadeV.w * 31.0))
+               * sin(fract(sc) * 3.14159)
+               * clamp(1.0 - dTop / 0.9, 0.0, 1.0);
+  t -= streak * 0.16 * detailFade(fwidth(sc), 1.6);
+  // 足元がわずかに暗い。板ではなく「立ち上がった壁」に見せる最小の勾配。
+  t *= mix(0.90, 1.02, clamp(y / max(H, 0.2), 0.0, 1.0));
+  gTint = vec3(t);
+  gRough = 0.86; gMetal = 0.04;
+}
+
 void facadeShade(vec3 base) {
   gTint = vec3(1.0); gRough = 0.9; gMetal = 0.03; gEmis = vec3(0.0);
   gEnv = 1.0; gWin = 0.0; gRefl = vec3(0.0);
+  gRoofN = vec3(0.0, 0.0, 1.0); gRoofUV = vec2(0.0);
   float style = vFacadeV.x;
   vec3 n = vObjN;
   float ax = abs(n.x), ay = abs(n.y), az = abs(n.z);
@@ -635,6 +808,10 @@ void facadeShade(vec3 base) {
     // 小物は相対高さで軽く陰影を付ける（下が暗い）。実寸で掛けると小物が全部黒くなる。
     float t = clamp(vLocalM.y / max(vScaleM.y, 0.001), 0.0, 1.0);
     gTint = vec3(mix(0.78, 1.06, t));
+    // 下を向く面は必ず暗い。庇・バルコニーの床スラブ・看板の裏の軒天が
+    // 明るいままだと、眼高でどれも「厚みの無い板」に見える。
+    // 影マップは薄い板の裏側までは届かないので、ここで 1 行入れておく。
+    gTint *= mix(1.0, 0.52, clamp(-n.y, 0.0, 1.0));
     return;
   }
 
@@ -698,6 +875,12 @@ void facadeShade(vec3 base) {
     return;
   }
 
+  // ---- バルコニーの手すり・腰壁 ----
+  if (style > 9.5) {
+    parapetShade(base);
+    return;
+  }
+
   // ---- 1 階の店構え ----
   if (style > 8.5) {
     frontShade(base);
@@ -705,21 +888,120 @@ void facadeShade(vec3 base) {
   }
 
   // ---- 屋根（瓦・折板）----
+  //
+  // 俯瞰のカットでは画面の 4 割以上が屋根で、ここが単色のクアッドだと
+  // 街全体が「色紙を折った模型」に見える。面積のいちばん大きい素材が
+  // 情報ゼロなのが、俯瞰の絵で最も大きな減点だった。
+  //
+  // 直し方は 3 段。
+  //  (1) 全屋根で共有する 1 枚の桟瓦テクスチャを、屋根のローカル座標
+  //      （棟方向 × 流れ方向、単位はメートル）で貼る。
+  //      屋根キットはもともと InstancedMesh 1 つずつなので、
+  //      ここだけ材質を分けてもドローコールは増えない。
+  //  (2) 棟・軒先は幾何から描く。テクスチャに焼くと屋根の大きさで
+  //      棟の太さが変わってしまう。
+  //  (3) 棟の稜線は法線で折る。明暗を塗るだけでは、日陰の屋根で棟が消える。
   if (style > 6.5 && style < 7.5) {
     gRough = vFacadeV.y; gMetal = vFacadeV.z;
-    float p = (az >= ax) ? vLocalM.z : vLocalM.x;
-    float pitchStep = max(vFacadeV.w, 0.15);
-    float s = p / pitchStep;
-    // 葺き足の線。遠景では 1 本が 1 画素に満たなくなるので、距離で平均へ寄せる。
-    // 寄せずに置くと、建物の隙間から覗く遠くの屋根が細かい縞のノイズになる。
-    float rFar = smoothstep(110.0, 300.0, vViewDepth);
-    float line = mix(bandAA(fract(s), 0.0, 0.16, fwidth(s)), 0.16, rFar);
-    gTint = vec3(1.0 - line * 0.34);
-    // 棟と軒先の稜線。屋根が 1 枚の板ではなく葺かれた面に見える。
-    float ridge = mix(bandAA(abs(p) / pitchStep, 0.0, 0.25, fwidth(p) / pitchStep), 0.0, rFar);
-    gTint *= 1.0 + ridge * 0.10;
-    // 棟に近いほど明るく。平らな面に流れの向きが出る。
-    gTint *= mix(0.92, 1.06, clamp(vLocalM.y / max(vScaleM.y, 0.001), 0.0, 1.0));
+    gRoofN = vec3(0.0, 0.0, 1.0);
+    // 流れ（勾配）方向は、法線の X/Z 成分の大きい方。
+    bool downZ = (az >= ax);
+    float run = 0.5 * max(downZ ? vScaleM.z : vScaleM.x, 0.2);
+    float rise = max(vScaleM.y, 0.05);
+    // 勾配ぶんだけ流れ方向は長い。水平距離のまま葺き足を刻むと、
+    // 勾配の急な屋根ほど瓦が間延びして見える。
+    float slopeLen = run * sqrt(1.0 + (rise * rise) / (run * run));
+    // 棟／軒までの距離は高さ比から出す。寄棟の隅（三角形の面）でも
+    // 高さ比なら破綻せず、棟と軒が必ず正しい位置に来る。
+    float yn = clamp(vLocalM.y / rise, 0.0, 1.0);
+    float dRidge = (1.0 - yn) * slopeLen;
+    float dEave = yn * slopeLen;
+    float pitch = max(abs(vFacadeV.w), 0.15);
+    float q = downZ ? vLocalM.x : vLocalM.z;
+    // テクスチャ 1 枚に瓦が ROOF_TILES_X 枚 × ROOF_TILES_Y 段ぶん焼いてある。
+    // ここで枚数まで割らないと、瓦 1 枚が数センチの砂目になってしまう。
+    gRoofUV = vec2(q / (pitch * ${TILE_W_RATIO} * ${ROOF_TILES_X}.0), dRidge / (pitch * ${ROOF_TILES_Y}.0));
+
+    // 屋根の流れではない面（鼻隠し・軒天・妻面の破風）。
+    // 流れの面は必ず上を向いているので、法線の Y でまとめて拾える。
+    // ここに瓦を貼ると、軒先の木口や破風にまで瓦が回り込んで、
+    // 屋根が「全面に模様を巻いた塊」に見えてしまう。
+    float board = max(step(vLocalM.y, -0.004 * rise), 1.0 - step(0.12, n.y));
+    // 折板葺き（トタン）は瓦ではないので、テクスチャを外して縦の山だけにする。
+    float metalRoof = step(0.25, vFacadeV.z);
+    // 葺き足に負の値が来たら「屋根ではないもの」（植林の樹冠・東屋）の印。
+    // 同じ寄棟のキットを流用しているので、瓦を貼らせないための逃げ道が要る。
+    float noTile = step(vFacadeV.w, 0.0);
+    float plain = max(max(metalRoof, board), noTile);
+
+    vec3 col = vec3(1.0);
+#ifdef ROOF_TEX
+    // この材質は屋根キット専用なので、style の分岐は材質の全画素で真になる。
+    // つまりテクスチャの読み出しは一様な制御フローの中にあり、
+    // ミップ選択の導関数が壊れる心配が無い（材質を分けた理由の半分はこれ）。
+    // ミップを半段早く落とす。俯瞰では瓦 1 枚が 1〜2 画素しかなく、
+    // 素のミップ選択だと瓦の格子と画素の格子が干渉して、
+    // 屋根に規則正しい光る点の並び（モアレ）が出る。
+    col = mix(texture2D(uRoofMap, gRoofUV, 0.55).rgb * uRoofGain, vec3(1.0), plain);
+    gRoofN = mix(texture2D(uRoofNrm, gRoofUV, 0.55).xyz * 2.0 - 1.0, vec3(0.0, 0.0, 1.0), plain);
+#endif
+
+    // 折板葺きの山と谷。流れ方向に通る太い縦線で、瓦とは読みが変わる。
+    if (metalRoof > 0.5) {
+      float sm = q / (pitch * 1.6);
+      float wm = fwidth(sm);
+      float rib = bandAA(fract(sm), 0.0, 0.13, wm);
+      col *= 1.0 - rib * 0.24 + bandAA(fract(sm), 0.15, 0.24, wm) * 0.14;
+      gRoofN.x = mix(gRoofN.x, -0.5, rib * (1.0 - board));
+    }
+
+    // 瓦 1 枚ごとの明るさをシェーダ側でも引き直す。
+    // テクスチャは 8×6 枚で 1 周するので、大きな屋根ではまったく同じむらが
+    // 何度も繰り返して見える（それ自体が「貼ったテクスチャ」の証拠になる）。
+    // 屋根のローカル座標から引けば周期が無くなる。
+    // 1 枚が 1 画素を割ったら消して、遠景のざらつきにしない。
+    vec2 tileId = floor(vec2(gRoofUV.x * ${ROOF_TILES_X}.0, gRoofUV.y * ${ROOF_TILES_Y}.0));
+    col *= 1.0 + (h21(tileId + 7.0) - 0.5) * 0.17
+         * detailFade(fwidth(gRoofUV.x) * ${ROOF_TILES_X}.0, 1.1) * (1.0 - plain);
+
+    // 遠景では瓦の細かい起伏を法線から抜く。
+    // 1 画素より細かい凹凸を法線に残すと、山が拾う光が画素ごとに跳ねて、
+    // 屋根に規則正しい光る点の並び（スペキュラのエイリアス）が出る。
+    // アルベドはミップが平均してくれるので、暴れるのは法線のほうだけ。
+    // 棟と軒の折りはこの後に入れるので、遠景でも残る。
+    gRoofN.xy *= detailFade(fwidth(gRoofUV.x) * ${ROOF_TILES_X}.0, 0.8);
+
+    // 棟瓦（熨斗瓦）。棟に沿って 1 本、丸い別部材が載る。
+    // 境の幅は画面上の変化率で広げる。固定幅のままだと、遠景で棟が
+    // 1 画素を割った瞬間にちらつく細い線になる（俯瞰では棟が街中に出るので
+    // それがそのまま画面全体のざらつきになる）。
+    float capW = pitch * 1.05;
+    float aaR = max(fwidth(dRidge), capW * 0.22);
+    float ridge = 1.0 - smoothstep(capW - aaR, capW + aaR, dRidge);
+    // 棟瓦の下端に落ちる影。この 1 本があって初めて棟が「線」ではなく
+    // 「盛り上がり」になる。
+    float ridgeSh = (1.0 - smoothstep(capW * 1.4 - aaR, capW * 1.9 + aaR, dRidge)) * (1.0 - ridge);
+    // 軒先。最下段の瓦の鼻と、その下に回る唐草の陰。
+    float aaE = max(fwidth(dEave), pitch * 0.2);
+    float eave = 1.0 - smoothstep(pitch * 0.55 - aaE, pitch * 0.55 + aaE, dEave);
+    float solid = (1.0 - board) * (1.0 - noTile);
+    // 棟瓦は平部と同じ材だが、丸い断面が光を拾うぶん必ず明るく見える。
+    // 明るい 1 本と、その真下の暗い 1 本を対で置かないと、
+    // 遠景で棟が消えて「二等辺三角形の色板」に戻ってしまう。
+    col *= 1.0 + ridge * 0.16 * solid;
+    col *= 1.0 - ridgeSh * 0.34 * solid;
+    col *= 1.0 - eave * 0.18 * solid;
+    // 鼻隠し・破風は少し暗く、軒天（下を向く面）はさらに暗い。
+    // ここが明るいと、下から見上げた屋根が紙のように見える。
+    col *= mix(1.0, mix(0.70, 0.42, step(n.y, -0.3)), board);
+    // 棟に近いほど明るい。平らな面に流れの向きが出る。
+    col *= mix(0.93, 1.06, yn);
+    gTint = col;
+    // 棟と軒の稜線を法線で折る。テクスチャは平部の瓦しか持っていないので、
+    // ここだけは幾何から作らないと「線を描いた板」に戻る。
+    gRoofN.y = mix(gRoofN.y, -0.72, ridge * solid);
+    gRoofN.y = mix(gRoofN.y, 0.42, ridgeSh * solid);
+    gRoofN.y = mix(gRoofN.y, 0.38, eave * 0.7 * solid);
     return;
   }
 
@@ -736,7 +1018,9 @@ void facadeShade(vec3 base) {
       float dk = fract(vFacadeV.w * 5.7);
       vec3 deck = dk < 0.42 ? vec3(0.180, 0.188, 0.170)
                 : (dk < 0.72 ? vec3(0.125, 0.121, 0.116) : vec3(0.240, 0.235, 0.220));
-      deck *= 0.86 + 0.28 * h21(floor(vLocalM.xz * 0.35) + 3.0);
+      // 防水の斑。1 画素より細かくなったら消す（遠景で砂嵐にしない）。
+      float dFade = detailFade(fwidth(vLocalM.x * 0.35), 1.2);
+      deck *= 1.0 + (h21(floor(vLocalM.xz * 0.35) + 3.0) - 0.5) * 0.28 * dFade;
       // 防水シートの継ぎ目。屋上は俯瞰でいちばん長く見える面なので、
       // 薄い格子が 1 枚入るだけで「塗りつぶした板」から抜けられる。
       vec2 gp = vLocalM.xz / 1.35;
@@ -745,7 +1029,19 @@ void facadeShade(vec3 base) {
       // その筋に沿って汚れが溜まる。うっすらした斑が入るだけで、
       // 「新品の板」ではなく「使われている屋上」になる。
       vec2 dp = vLocalM.xz * 0.16 + vFacadeV.w * 13.0;
-      float stain = vnoise(dp) * 0.6 + vnoise(dp * 2.7) * 0.4;
+      float stain = mix(0.5, vnoise(dp) * 0.6 + vnoise(dp * 2.7) * 0.4,
+                        detailFade(fwidth(dp.x), 1.6));
+      // 屋上の縁を回る排水溝と、防水の立ち上がり（巻き上げ）。
+      // 陸屋根はどれも「縁から 30〜45cm 内側に溝が 1 本回っている」ので、
+      // 俯瞰では屋上ごとに二重の矩形が見える。塗った板と屋上の分かれ目はここ。
+      // 面の中心からの距離ではなく縁からの距離で引くので、
+      // 大きさの違う屋上でも溝の幅は実寸で揃う。
+      float edge = min(vScaleM.x * 0.5 - abs(vLocalM.x), vScaleM.z * 0.5 - abs(vLocalM.z));
+      float aaE = max(fwidth(edge), 0.05);
+      float gutter = smoothstep(0.28 - aaE, 0.28 + aaE, edge)
+                   * (1.0 - smoothstep(0.46 - aaE, 0.46 + aaE, edge));
+      float upstand = 1.0 - smoothstep(0.20 - aaE, 0.20 + aaE, edge);
+      deck *= (1.0 - gutter * 0.34) * (1.0 + upstand * 0.20);
       gTint = deck * (1.0 - joint * 0.30) * (1.0 - smoothstep(0.45, 1.0, stain) * 0.26) / max(base, vec3(0.05));
       gRough = 0.93 - smoothstep(0.5, 1.0, stain) * 0.12;
     } else {
@@ -856,8 +1152,25 @@ void facadeShade(vec3 base) {
       extra = slab * 0.26 + rail * 0.07 - divider * 0.10;
       // 手すりと窓の間はバルコニーの奥。影が溜まる。
       extra -= bandAA(ty, 0.45, 0.50, wy) * 0.24;
+      // 腰壁の天端キャップ（笠木）の見付と、その真下に落ちる影の 2 本。
+      // 眼高では「4cm の見切り 1 本」が素材の説得力を決める。
+      // ここがゼロだと、画面の 4 割を占める淡い帯が発泡スチロールに見える。
+      float mT = 1.0 / floorH;                    // 1m を階内の比に直す
+      extra += bandAA(ty, 0.45 - 0.045 * mT, 0.45, wy) * 0.28;
+      extra -= bandAA(ty, 0.45 - 0.115 * mT, 0.45 - 0.045 * mT, wy) * 0.26;
+      // 腰壁の縦目地（乾式パネルの継ぎ目）。1.5m ごとに 1 本。
+      extra -= rail * bandAA(fract(u / 1.5), 0.0, 0.014, fwidth(u / 1.5)) * 0.22;
+      // 笠木から垂れる雨だれ。距離で必ず消す（遠景でビデオノイズに読ませない）。
+      float bs = u * 0.7;
+      extra -= rail
+             * smoothstep(0.60, 1.0, h21(vec2(floor(bs), 15.0) + sideSeed))
+             * sin(fract(bs) * 3.14159)
+             * clamp((ty - 0.10) / 0.30, 0.0, 1.0)
+             * 0.13 * detailFade(fwidth(bs), 1.6);
+      // バルコニーの奥のガラスは庇と手すりに囲まれていて、
+      // オフィスのカーテンウォールほど強くは空を返さない。
       glassCol = vec3(0.17, 0.20, 0.24);
-      glassRough = 0.18; glassMetal = 0.74;
+      glassRough = 0.22; glassMetal = 0.56;
     } else {
       x0 = 0.36; x1 = 0.64; y0 = 0.32; y1 = 0.70;
       litRate = 0.20;
@@ -957,6 +1270,22 @@ void facadeShade(vec3 base) {
     // 階の境の水平帯
     extra += bandAA(ty, -0.02, 0.10, wy) * 0.10;
     if (ground) { y0 = 0.24; y1 = 0.70; }
+  }
+
+  // ---- 各階の見切り（キャップ 1 本・水切り 1 本）----
+  //
+  // 前回は 1 階と 2 階の境にだけ入れたので、上階が無地のスラブのままだった。
+  // 同じ 2 本を全階に流す。テクスチャは要らず、fwidth で 1 画素以下に
+  // 潰れる線なので、遠景では勝手に消える。
+  if (!ground) {
+    float mF = 1.0 / floorH;
+    // 床スラブの小口（見付）。明るい 7cm の帯。
+    extra += bandAA(ty, 0.0, 0.075 * mF, wy) * 0.09;
+    // その下端に回る水切りの影。4cm。庇の下には必ず影が溜まる。
+    extra -= bandAA(ty, 1.0 - 0.05 * mF, 1.0, wy) * 0.22;
+    // スラブ下に溜まる煤汚れ。18cm ぶんの勾配なので、1 画素がそれを
+    // 超えたら消す（遠くでは平均の壁色に戻り、ざらつきにならない）。
+    extra -= (1.0 - smoothstep(0.0, 0.18 * mF, ty)) * 0.08 * detailFade(wy, 8.0);
   }
 
   // 窓の縦横比の散らしを反映する（1 階の特別扱いより後、平均を取る前）。
@@ -1111,7 +1440,12 @@ void facadeShade(vec3 base) {
   // 部屋ごとにカーテンの有無を散らす。全部が同じ暗いガラスだと
   // 「黒い板がびっしり貼られた壁」に見えて、人の住んでいる気配が出ない。
   vec3 curtain = mix(vec3(0.46, 0.44, 0.40), vec3(0.30, 0.31, 0.33), step(0.5, cell2));
-  float hasCurtain = mix(step(cell2, 0.38), 0.38, cellFade);
+  // 住戸の掃き出し窓はレースのカーテンが下りていることのほうが多い。
+  // ここを一律 38% にしていたので、街路を斜めに見たときに
+  // バルコニーの奥のガラスが軒並み空の白をそのまま返し、
+  // 「白い紙を貼った板」に見えていた。
+  float curtainRate = (style < 1.5) ? 0.60 : 0.38;
+  float hasCurtain = mix(step(cell2, curtainRate), curtainRate, cellFade);
   glassCol = mix(glassCol, curtain, hasCurtain);
   // 窓の中の縦のグラデーション。ガラスの上半分は空を、下半分は向かいの建物と
   // 路面を映すので、1 枚の中で必ず明るさが変わる。この 1 本の勾配が入るかどうかで、
@@ -1144,8 +1478,10 @@ void facadeShade(vec3 base) {
     // 倒す量を**部屋ごとに散らす**のがここの肝。板ガラスは実際に
     // わずかに反っていて、隣り合う窓で映る空がずれる。全部が同じ角度だと、
     // どれだけ空を映しても「一様な青の格子」に戻ってしまう。
-    float tiltY = 0.10 + 0.10 * (h21(vec2(fxi, fyi) + sideSeed + 211.0) - 0.5) * 2.0;
-    float tiltU = 0.07 * (h21(vec2(fxi, fyi) + sideSeed + 233.0) - 0.5) * 2.0;
+    // 散らしは控えめにする。1 枚ごとに大きく倒すと、窓の矩形ごとに
+    // 映り込みが段で変わり、それ自体が「貼った紙」の境界として読める。
+    float tiltY = 0.09 + 0.05 * (h21(vec2(fxi, fyi) + sideSeed + 211.0) - 0.5) * 2.0;
+    float tiltU = 0.04 * (h21(vec2(fxi, fyi) + sideSeed + 233.0) - 0.5) * 2.0;
     vec3 tangent = alongZ ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
     vec3 Nw = normalize(vWorldN + (vec3(0.0, tiltY, 0.0) + tangent * tiltU) * winMat);
     float fres = fresnelAt(V, Nw);
@@ -1157,17 +1493,20 @@ void facadeShade(vec3 base) {
     // 平板」は、映り込みが足りないのではなく**一様**なのが正体）。
     // 深いグレージング角だけを強く光らせると、同じ 1 枚の中に
     // 暗いガラスと空の映り込みが同居して、初めて板から抜ける。
-    float amt = mix(0.05, 0.80, fres) * mix(1.0, 0.34, hasCurtain);
+    // 上限は 0.6 で止める。1.0 近くまで上げると、街路を斜めに見た窓が
+    // 空の白をそのまま返して「白い紙を貼った板」に戻る。
+    float amt = mix(0.05, 0.62, fres) * mix(1.0, 0.34, hasCurtain);
     // 壁にはほとんど映さない。ここを上げると、グレージング角の壁が
     // 一様に空の色でかぶり、棟ごとに散らしたクリーム色や茶色の外壁が
     // すべて同じ青白い面になってしまう（散らした意味が消える）。
     float wallAmt = fres * 0.035;
-    // 向かいの建物の映り込みのむら。グレージング角ほど強く効かせる。
-    // 反射そのものは fakeSky が返すが、それは方向だけの関数なので、
-    // 1 枚のガラスの中では滑らかにしか変わらない。窓の割りぶんの
-    // 低い周波数のむらを 1 枚重ねて、「何かが映っている」ことを読ませる。
-    float mir = 0.80 + 0.34 * sin(u * 0.52 + seed * 23.0) * sin(y * 0.40 + 1.7);
-    gRefl = fakeSky(reflect(V, Nw)) * mix(wallAmt, amt * mix(1.0, mir, fres), winMat);
+    // 映り込みの強さは**視線と法線からだけ**決める。
+    // 以前は壁のローカル座標 (u, y) に sin を掛けて
+    // 「向かいの建物のむら」を作っていたが、あれは壁に貼り付いた模様なので、
+    // カメラが動いても動かない明るい面として窓の一部に居座る。
+    // レビューの「窓の左半分だけに直線境界の明るい矩形」はこれが正体。
+    // むらは fakeSky の中で反射ベクトルの関数として持たせてある。
+    gRefl = fakeSky(reflect(V, Nw)) * mix(wallAmt, amt, winMat);
   }
   gTint = mix(vec3(1.0 + extra), glassCol / max(base, vec3(0.02)), win);
   gTint *= 1.0 + max(frame, 0.0) * 0.08 + sill * 0.22 - slabLine * 0.10;
@@ -1189,7 +1528,10 @@ void facadeShade(vec3 base) {
   float streak = smoothstep(0.62, 1.0, streakSeed)
                * sin(fract(sCell) * 3.14159)
                * clamp(1.0 - (vScaleM.y - y) / streakLen, 0.0, 1.0)
-               * (1.0 - winMat);
+               * (1.0 - winMat)
+               // 距離で消す。フェードしない縦の筋は、遠くで
+               // 「壁に走る縦スメア」＝圧縮ノイズにしか読めない。
+               * detailFade(fwidth(sCell), 1.5);
   gTint *= 1.0 - streak * 0.20;
 
   // 夜の灯り。部屋ごとにハッシュで点け、時刻で点灯率だけを動かす。
@@ -1245,6 +1587,10 @@ void facadeShade(vec3 base) {
   // 昼の窓にも桟を出す。映り込みだけだと、大きなガラスが「板」に戻る。
   gTint *= 1.0 - mix(sash, 0.0, cellFade) * 0.22 * winMat;
   gRefl *= 1.0 - mix(sash, 0.0, cellFade) * 0.5 * winMat;
+  // 映り込みは窓の縁まで届かせない。サッシと躯体の影で、実際のガラスは
+  // 必ず 2〜3cm ぶん暗い縁を持つ。この縁が無いと、明るい空を映した窓が
+  // 「壁に貼った 1 枚の白い紙」として読めてしまう（レビューの指摘そのもの）。
+  gRefl *= mix(0.45, 1.0, mix(soft, 1.0, cellFade));
   // 部屋ごとに色温度も散らす。蛍光灯の部屋と白熱灯の部屋が混ざるだけで、
   // 同じ強度でも「全部同じ照明の板」から抜けられる。
   float warm = h21(vec2(fxi, fyi) + sideSeed + 133.0);
@@ -1269,8 +1615,45 @@ void facadeShade(vec3 base) {
 }
 `;
 
-/** 立面材質を 1 つ作る。キットごとに面取り補正の有無だけが違う。 */
-function facadeMaterial(chamferFix: boolean): MeshStandardMaterial {
+/**
+ * 屋根の法線マップを接空間から視空間へ戻す。
+ *
+ * 屋根キットには `uv` 属性が無い（UV は屋根のローカル座標から毎画素作る）ので、
+ * three の法線マップの仕組みには載せられない。TBN は画面の微分から組む。
+ * 棟の稜線は明暗を塗るだけでは日陰の屋根で消えてしまうので、
+ * ここで法線として入れておく必要がある。
+ */
+const ROOF_NORMAL = /* glsl */ `
+  {
+    vec3 Nw = normalize(vWorldN);
+    vec3 q0 = dFdx(vWorldPos);
+    vec3 q1 = dFdy(vWorldPos);
+    vec2 s0 = dFdx(gRoofUV);
+    vec2 s1 = dFdy(gRoofUV);
+    vec3 q1p = cross(q1, Nw);
+    vec3 q0p = cross(Nw, q0);
+    vec3 T = q1p * s0.x + q0p * s1.x;
+    vec3 B = q1p * s0.y + q0p * s1.y;
+    float det = max(dot(T, T), dot(B, B));
+    if (det > 0.0) {
+      float sc = inversesqrt(det);
+      vec3 nW = normalize(mat3(T * sc, B * sc, Nw) * normalize(gRoofN));
+      normal = normalize((viewMatrix * vec4(nW, 0.0)).xyz);
+    }
+  }
+`;
+
+/**
+ * 立面材質を 1 つ作る。キットごとに面取り補正の有無と、屋根テクスチャの
+ * 有無だけが違う。
+ *
+ * 屋根だけ材質を分けているのは、瓦テクスチャの読み出しを
+ * 「材質の全画素で真になる分岐」の中に置くため。壁と同じ材質のまま
+ * 屋根の分岐の中で `texture2D` を呼ぶと、非一様な制御フローになって
+ * ミップ選択の導関数が保証されない。切妻・寄棟のキットはもともと
+ * InstancedMesh 1 つずつなので、材質を分けてもドローコールは増えない。
+ */
+function facadeMaterial(chamferFix: boolean, roof = false): MeshStandardMaterial {
   const m = new MeshStandardMaterial({
     color: 0xffffff,
     roughness: 0.85,
@@ -1285,6 +1668,16 @@ function facadeMaterial(chamferFix: boolean): MeshStandardMaterial {
     shader.uniforms.uSkyGround = uniforms.uSkyGround;
     shader.uniforms.uSunDir = uniforms.uSunDir;
     shader.uniforms.uSunTint = uniforms.uSunTint;
+    const roofMap = roof ? roofAlbedoTexture() : null;
+    const roofNrm = roof ? roofNormalTexture() : null;
+    const hasRoofTex = roofMap !== null && roofNrm !== null;
+    if (hasRoofTex) {
+      shader.uniforms.uRoofMap = { value: roofMap };
+      shader.uniforms.uRoofNrm = { value: roofNrm };
+      // テクスチャの平均は 1 より暗いので、ここで基準の明るさへ戻す。
+      // 戻さないと、瓦を貼った瞬間に街の屋根が一段暗くなる。
+      shader.uniforms.uRoofGain = { value: 1 / Math.max(0.05, roofTexMean()) };
+    }
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\n' + VERT_PARS)
       .replace('#include <begin_vertex>', VERT_BEGIN)
@@ -1314,7 +1707,8 @@ function facadeMaterial(chamferFix: boolean): MeshStandardMaterial {
       .replace(
         '#include <normal_fragment_maps>',
         '#include <normal_fragment_maps>\n' +
-          '  normal = normalize(mix(normal, (viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz, 0.06 * gWin));',
+          '  normal = normalize(mix(normal, (viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz, 0.06 * gWin));' +
+          (hasRoofTex ? ROOF_NORMAL : ''),
       )
       // 環境マップの強さを画素ごとに変える。材質の envMapIntensity は
       // ユニフォームなので上書きできない。IBL の結果に直接掛ける。
@@ -1323,8 +1717,9 @@ function facadeMaterial(chamferFix: boolean): MeshStandardMaterial {
         '#include <lights_fragment_maps>\n  radiance *= gEnv;',
       );
     if (chamferFix) shader.defines = { ...(shader.defines ?? {}), CHAMFER_FIX: '' };
+    if (hasRoofTex) shader.defines = { ...(shader.defines ?? {}), ROOF_TEX: '' };
   };
-  m.customProgramCacheKey = () => (chamferFix ? 'bldFacadeCF' : 'bldFacade');
+  m.customProgramCacheKey = () => (roof ? 'bldRoof' : chamferFix ? 'bldFacadeCF' : 'bldFacade');
   materials.push(m);
   return m;
 }
@@ -1871,12 +2266,15 @@ export class BuildingParts {
     this.group.name = 'buildingParts';
     const boxMat = facadeMaterial(true);
     const plainMat = facadeMaterial(false);
-    this.mats.push(boxMat, plainMat);
+    // 屋根専用。切妻・寄棟はもともと InstancedMesh 1 つずつなので、
+    // 材質を分けてもドローコールは 1 つも増えない。
+    const roofMat = facadeMaterial(false, true);
+    this.mats.push(boxMat, plainMat, roofMat);
     this.kits = {
       box: new Kit(boxGeometry(), boxMat, 4096),
       boxV: new Kit(boxVGeometry(), boxMat, 4096),
-      gable: new Kit(gableGeometry(), plainMat, 1024),
-      hip: new Kit(hipGeometry(), plainMat, 256),
+      gable: new Kit(gableGeometry(), roofMat, 1024),
+      hip: new Kit(hipGeometry(), roofMat, 256),
       cyl: new Kit(cylGeometry(), plainMat, 256),
       // 受水槽と鳥居は複数の箱を焼き固めた形。CHAMFER_FIX は
       // 「頂点が単位ボックスの角にある」ことを前提に座標を引き直すので、
@@ -2099,6 +2497,34 @@ export class BuildingParts {
     this.put('stack', x, y, z, r * 2, h, r * 2, 0, 0, color, Facade.Plain, rough, metal, 0);
   }
 
+  /**
+   * バルコニーの手すり・腰壁。3 種類の作りをシェーダで描き分ける。
+   *
+   * 箱のキットにそのまま載るので、インスタンスもドローコールも増えない。
+   * 「アルミの手すり」を 1 スパンのキットで引き伸ばしていたのをやめたのが肝で、
+   * あの作りでは子柱が建物の幅に比例して太くなり、
+   * どの種類も同じ「無地の実壁パネル」に見えてしまっていた。
+   *
+   * @param kind   0=コンクリート腰壁 / 1=アルミ手すり / 2=濃色パネル
+   * @param panelW パネル 1 枚の幅 (m)。縦目地の刻みになる。
+   */
+  parapet(
+    x: number,
+    y: number,
+    z: number,
+    w: number,
+    h: number,
+    d: number,
+    color: number | Color,
+    kind: number,
+    panelW: number,
+    seed: number,
+    rotY = 0,
+  ): void {
+    const kit: KitName = Math.max(w, h, d) < SMALL_PART_M ? 'boxV' : 'box';
+    this.put(kit, x, y, z, w, h, d, rotY, 0, color, Facade.Parapet, kind, panelW, seed);
+  }
+
   /** 手すり（落下防止柵）の 1 スパン。len は X 方向の長さ。 */
   railFrame(x: number, y: number, z: number, len: number, h: number, rotY = 0): void {
     this.put('railFrame', x, y, z, len, h, 1, rotY, 0, 0xffffff, Facade.Plain, 0.55, 0.45, 0);
@@ -2178,5 +2604,6 @@ export class BuildingParts {
   dispose(): void {
     for (const k of Object.values(this.kits)) k.dispose();
     for (const m of this.mats) m.dispose();
+    disposeRoofTextures();
   }
 }

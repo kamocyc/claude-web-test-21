@@ -121,10 +121,23 @@ export function utilityPoleGeometry(): BufferGeometry {
     // 腕金（X 方向に伸びる）
     { geom: box(ARM_HALF * 2, 0.07, 0.09), color: DARK_METAL, matrix: at(0, ARM_Y[0], 0) },
     { geom: box(ARM_HALF * 1.6, 0.07, 0.09), color: DARK_METAL, matrix: at(0, ARM_Y[1], 0) },
-    // 碍子（白い豆粒。これがあると腕金が「電気の設備」に見える）
-    { geom: box(0.09, 0.13, 0.09), color: 0xd8d4cc, matrix: at(-ARM_HALF * 0.82, ARM_Y[0] + 0.07, 0) },
-    { geom: box(0.09, 0.13, 0.09), color: 0xd8d4cc, matrix: at(0, ARM_Y[0] + 0.07, 0) },
-    { geom: box(0.09, 0.13, 0.09), color: 0xd8d4cc, matrix: at(ARM_HALF * 0.82, ARM_Y[0] + 0.07, 0) },
+    // 腕金を吊る斜材（アームタイ）。柱と腕金の間に三角形ができると、
+    // 腕金が「柱に刺さった棒」ではなく取り付けられた金物に見える。
+    { geom: box(ARM_HALF * 0.9, 0.05, 0.05), color: DARK_METAL, matrix: at(-ARM_HALF * 0.45, ARM_Y[0] - 0.24, 0, 0, 0, 0.5) },
+    { geom: box(ARM_HALF * 0.9, 0.05, 0.05), color: DARK_METAL, matrix: at(ARM_HALF * 0.45, ARM_Y[0] - 0.24, 0, 0, 0, -0.5) },
+    // 碍子（白い豆粒。これがあると腕金が「電気の設備」に見える）。
+    //
+    // 実寸より一回り大きくしてある。電線の端点はこの 3 点の位置にぴったり
+    // 合わせてあるのだが、実寸の碍子は目線のカットでも 2px 前後しかなく、
+    // **線が柱の横を素通りしている**ようにしか見えなかった。
+    // 線が「どこに留まっているか」が読めるかどうかは、線そのものより
+    // 端点にある小さな明るい点で決まる。
+    { geom: box(0.12, 0.2, 0.12), color: 0xdedad2, matrix: at(-ARM_HALF * 0.82, ARM_Y[0] + 0.07, 0) },
+    { geom: box(0.12, 0.2, 0.12), color: 0xdedad2, matrix: at(0, ARM_Y[0] + 0.07, 0) },
+    { geom: box(0.12, 0.2, 0.12), color: 0xdedad2, matrix: at(ARM_HALF * 0.82, ARM_Y[0] + 0.07, 0) },
+    // 下段の腕金にも碍子を 2 点。上段だけだと、腕金が 2 段ある意味が絵に出ない。
+    { geom: box(0.1, 0.16, 0.1), color: 0xdedad2, matrix: at(-ARM_HALF * 0.62, ARM_Y[1] + 0.07, 0) },
+    { geom: box(0.1, 0.16, 0.1), color: 0xdedad2, matrix: at(ARM_HALF * 0.62, ARM_Y[1] + 0.07, 0) },
     // 柱上変圧器
     { geom: post(0.29, 0.29, 0.78, 8), color: 0x9aa0a4, matrix: at(0.34, 6.5, 0) },
     { geom: box(0.14, 0.5, 0.12), color: DARK_METAL, matrix: at(0.18, 6.6, 0) },

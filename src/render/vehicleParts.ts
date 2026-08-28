@@ -233,6 +233,37 @@ function fourWheels(s: CarSpec, width: number): Part[] {
   return out;
 }
 
+/** ホイールアーチの陰。車体色の変調を受けるので、暗い車ではさらに沈む。 */
+const ARCH = 0x3f4348;
+
+/**
+ * ホイールアーチ（タイヤ上の凹み）。
+ *
+ * 車を「石鹸箱」から救うのは、実のところ窓とこれの 2 つしかない。
+ * 実車の側面は、腰から下がタイヤの上で半円に切り欠かれていて、その中が
+ * 必ず暗い。切り欠きが無いと、どんなに面取りしても側面が 1 枚の板に見える。
+ *
+ * 本当に穴を開けると三角形が跳ね上がるので、**タイヤより一回り大きい
+ * 暗いレンズ形の板をタイヤの外側へ差し込む**。板は車体を貫いて左右へ
+ * 同時に出るので（`doorSeams` と同じ手口）、1 軸につき箱 1 つ、
+ * 1 台 24 三角形で 4 輪ぶんのアーチが付く。
+ * 前後端の高さを絞る（`hf`/`hb`）とレンズ形になり、タイヤの周りに
+ * 暗い縁が残って、真横から見た輪郭が弧として読める。
+ */
+function wheelArches(s: CarSpec): BoxSpec[] {
+  return [s.frontZ, s.rearZ].map((z) => ({
+    // タイヤの外側へ確実に出す。車輪はもともと車体幅より 1.5cm ほど外にある。
+    w: s.width + 0.09,
+    h: s.wheelR * 1.9,
+    d: s.wheelR * 2 + 0.22,
+    y: s.wheelR + 0.12,
+    z,
+    hf: 0.18,
+    hb: 0.18,
+    tint: ARCH,
+  }));
+}
+
 /**
  * ドアの分割線。
  *
@@ -242,6 +273,21 @@ function fourWheels(s: CarSpec, width: number): Part[] {
  */
 function doorSeams(width: number, y: number, h: number, zs: readonly number[]): BoxSpec[] {
   return zs.map((z) => ({ w: width + 0.02, h, d: 0.025, y, z, tint: SEAM }));
+}
+
+/**
+ * ピラー（窓と窓の間の柱）。
+ *
+ * 側面のガラスは 1 本の長い帯で焼いてあるので、そのままだと窓が
+ * 「側面に貼った黒い帯」にしかならない。実車の側面が窓に見えるのは、
+ * B ピラー・C ピラーで帯が 2〜3 枚に割れているからである。
+ * 車体色の薄い板をガラスより 1.5mm だけ外へ差し込むと、
+ * 左右同時に柱が立つ（`doorSeams` と同じ手口。箱 1 つ = 12 三角形）。
+ *
+ * @param w ガラスの帯の幅。これに少し足した幅で差し込む。
+ */
+function pillars(w: number, y: number, h: number, zs: readonly number[]): BoxSpec[] {
+  return zs.map((z) => ({ w: w + 0.03, h, d: 0.075, y, z }));
 }
 
 /** サイドミラー。車体から直に生やして支柱を省く（12 三角形 × 2）。 */
@@ -277,13 +323,24 @@ function bake(parts: Part[]): BufferGeometry {
     const glass = mergeParts(glassParts);
     const nSolid = solid.getAttribute('position').count;
     const nGlass = glass.getAttribute('position').count;
+    // ガラス 1 枚ごとの頂点数。上下の階調は**窓 1 枚ずつ**で取らないと、
+    // 車体でいちばん高い窓（フロントガラス）に引きずられて、
+    // 低いところにある側面窓が「全部下端」になってしまう。
+    // `mergeParts` は渡した順に繋ぐので、この数だけで境目が分かる。
+    // 箱は索引付きなので、非索引化したあとの頂点数を数える。
+    const spans = glassParts.map((q) =>
+      q.geom.index ? q.geom.index.count : q.geom.getAttribute('position').count,
+    );
     g = mergeParts([{ geom: solid }, { geom: glass }]);
     solid.dispose();
     glass.dispose();
     const mark = new Float32Array(nSolid + nGlass);
     mark.fill(1, nSolid);
-    g.setAttribute(GLASS_ATTRIBUTE, new BufferAttribute(mark, 1));
-    curveGlass(g, mark);
+    const attr = new BufferAttribute(mark, 1);
+    g.setAttribute(GLASS_ATTRIBUTE, attr);
+    // 法線を反らせるついでに、印へ「窓の中の高さ」を書き足す（0..1 を 1 に加算）。
+    curveGlass(g, mark, nSolid, spans);
+    attr.needsUpdate = true;
   }
   // 下ほど暗くする。車の下は実際に影になるので、これだけで「浮き」が消える。
   applyVerticalAO(g, 0.62, 1.06, 1.5);
@@ -301,12 +358,18 @@ function bake(parts: Part[]): BufferGeometry {
  * 路面が横に流れる。ここでは面を割らずに **法線だけ**を円筒状に反らせる。
  * 頂点も三角形も 1 つも増えないのに、反射の階調が出る。
  */
-function curveGlass(g: BufferGeometry, mark: Float32Array): void {
+function curveGlass(
+  g: BufferGeometry,
+  mark: Float32Array,
+  nSolid: number,
+  spans: readonly number[],
+): void {
   const pos = g.getAttribute('position');
   const nor = g.getAttribute('normal');
   if (!pos || !nor) return;
-  // 車体半幅 0.85m ぶんで法線が 0.6 ぶん傾く＝半径 1.4m 前後の湾曲。
-  const CURVE = 0.6;
+  // 車体半幅 0.85m ぶんで法線が 0.42 ぶん傾く＝半径 2m 前後の湾曲。
+  // 0.6 では反りが強すぎて、真後ろから見たリアガラスが「磨いた円筒」に見えた。
+  const CURVE = 0.42;
   const HALF = 0.85;
   /**
    * 上下の反り。
@@ -319,29 +382,37 @@ function curveGlass(g: BufferGeometry, mark: Float32Array): void {
    * 空 → 地平 → 路面の 3 段が縦に並ぶ。
    */
   const CURVE_V = 0.36;
-  // 上下の基準はガラス全体の上端・下端から取る（部品ごとの中心は分からない）。
-  let yMin = Infinity;
-  let yMax = -Infinity;
-  for (let i = 0; i < pos.count; i++) {
-    if (mark[i] !== 1) continue;
-    const y = pos.getY(i);
-    if (y < yMin) yMin = y;
-    if (y > yMax) yMax = y;
-  }
-  const yMid = (yMin + yMax) / 2;
-  const yHalf = Math.max(0.05, (yMax - yMin) / 2);
-  for (let i = 0; i < pos.count; i++) {
-    if (mark[i] !== 1) continue;
-    const t = Math.max(-1, Math.min(1, pos.getX(i) / HALF));
-    const u = Math.max(-1, Math.min(1, (pos.getY(i) - yMid) / yHalf));
-    let nx = nor.getX(i) + CURVE * t;
-    let ny = nor.getY(i) + CURVE_V * u;
-    let nz = nor.getZ(i);
-    const len = Math.hypot(nx, ny, nz) || 1;
-    nx /= len;
-    ny /= len;
-    nz /= len;
-    nor.setXYZ(i, nx, ny, nz);
+  // 上下の基準は**窓 1 枚ごと**に取る。車全体で取ると、いちばん高い
+  // フロントガラスに正規化が引きずられて、側面窓が一様に「下端」に潰れる。
+  let base = nSolid;
+  for (const span of spans) {
+    let yMin = Infinity;
+    let yMax = -Infinity;
+    for (let i = base; i < base + span; i++) {
+      const y = pos.getY(i);
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
+    }
+    const yMid = (yMin + yMax) / 2;
+    const yHalf = Math.max(0.05, (yMax - yMin) / 2);
+    for (let i = base; i < base + span; i++) {
+      const t = Math.max(-1, Math.min(1, pos.getX(i) / HALF));
+      const u = Math.max(-1, Math.min(1, (pos.getY(i) - yMid) / yHalf));
+      let nx = nor.getX(i) + CURVE * t;
+      let ny = nor.getY(i) + CURVE_V * u;
+      let nz = nor.getZ(i);
+      const len = Math.hypot(nx, ny, nz) || 1;
+      nx /= len;
+      ny /= len;
+      nz /= len;
+      nor.setXYZ(i, nx, ny, nz);
+      // **印そのものに窓の高さを載せる。** 反りだけでは側面窓（法線が ±X）の
+      // 反射ベクトルが面内で動かず、1 枚が一色の平板のままだった。
+      // 1 + (0..1) にしておけば、フラグメント側で「ガラスか否か」と
+      // 「窓の上下」を varying 1 本から取り出せる（`agentMaterial`）。
+      mark[i] = 1 + (u + 1) / 2;
+    }
+    base += span;
   }
   nor.needsUpdate = true;
 }
@@ -371,6 +442,8 @@ function keiParts(): Part[] {
     { w: 0.15, h: 0.4, d: 0.1, x: -0.63, y: s.tailY, z: -s.length / 2 + 0.02, tint: TAIL_LENS },
     ...mirrors(0.85, 1.22, 0.72),
     ...doorSeams(s.width, 0.62, 0.72, [0.3, -0.78]),
+    ...wheelArches(s),
+    ...pillars(s.width - 0.09, 1.29, 0.68, [0.06, -0.95]),
   ];
   return [...boxes(specs), ...fourWheels(s, 0.17)];
 }
@@ -403,6 +476,8 @@ function sedanParts(): Part[] {
     { w: 0.86, h: 0.14, d: 0.08, y: 0.68, z: s.length / 2 - 0.08, tint: 0x30343a },
     ...mirrors(0.92, 1.02, 0.66),
     ...doorSeams(s.width, 0.6, 0.62, [0.42, -0.9]),
+    ...wheelArches(s),
+    ...pillars(s.width - 0.1, 1.13, 0.46, [-0.12, -1.0]),
   ];
   return [...boxes(specs), ...fourWheels(s, 0.19)];
 }
@@ -415,7 +490,9 @@ function vanParts(): Part[] {
     // 上屋。
     { w: s.width - 0.06, h: 0.82, d: 4.05, y: 1.52, z: -0.14, c: 0.06, wt: 0.95 },
     // 側面の窓の帯。車体より少し広くして面を出す。
-    { w: s.width + 0.02, h: 0.5, d: 3.5, y: 1.56, z: -0.34, tint: GLASS },
+    // 後端はリアガラス（z = -2.11）に届かせない。帯の後ろの蓋とリアガラスが
+    // 2cm 差で重なると、真後ろから見たときに 1 枚の巨大なガラス板に見える。
+    { w: s.width + 0.02, h: 0.5, d: 3.1, y: 1.56, z: -0.26, tint: GLASS },
     // 立ったフロントガラス。
     { w: s.width - 0.1, h: 0.92, d: 0.07, y: 1.5, z: 2.03, rx: -0.16, tint: GLASS },
     { w: s.width - 0.14, h: 0.66, d: 0.07, y: 1.58, z: -2.11, rx: 0.06, tint: GLASS },
@@ -431,6 +508,8 @@ function vanParts(): Part[] {
     ...mirrors(0.88, 1.3, 1.62),
     // スライドドアの見切り。
     ...doorSeams(s.width, 1.0, 1.5, [0.9, -1.1]),
+    ...wheelArches(s),
+    ...pillars(s.width + 0.02, 1.56, 0.52, [0.56, -0.9]),
   ];
   return [...boxes(specs), ...fourWheels(s, 0.18)];
 }
@@ -469,6 +548,8 @@ function wagonParts(): Part[] {
     { w: 0.9, h: 0.16, d: 0.08, y: 0.74, z: s.length / 2 - 0.06, tint: 0x30343a },
     ...mirrors(0.95, 1.18, 0.78),
     ...doorSeams(s.width, 0.72, 0.78, [0.42, -0.92]),
+    ...wheelArches(s),
+    ...pillars(s.width - 0.1, 1.29, 0.52, [0.0, -1.15]),
   ];
   return [...boxes(specs), ...fourWheels(s, 0.2)];
 }
@@ -502,6 +583,7 @@ function keiTruckParts(): Part[] {
     { w: 0.16, h: 0.22, d: 0.08, x: 0.56, y: s.tailY, z: -s.length / 2 + 0.02, tint: TAIL_LENS },
     { w: 0.16, h: 0.22, d: 0.08, x: -0.56, y: s.tailY, z: -s.length / 2 + 0.02, tint: TAIL_LENS },
     ...mirrors(0.86, 1.46, 1.44),
+    ...wheelArches(s),
   ];
   return [...boxes(specs), ...fourWheels(s, 0.15)];
 }
@@ -682,7 +764,24 @@ export function beamGeometry(): BufferGeometry {
 /** 車種ごとの光の板の置き方（前端の z・幅・届く距離）。 */
 export function carBeamSpec(kind: CarKind): { z: number; width: number; length: number; y: number } {
   const s = CAR_SPECS[kind];
-  return { z: s.length / 2 + 0.6, width: s.width * 3.2, length: 13, y: 0.03 };
+  return { z: s.length / 2 + 0.6, width: s.width * 3.4, length: 14, y: 0.03 };
+}
+
+/**
+ * **停まっている車**が路面に落とす光の板。
+ *
+ * 夜のカットに映る車のほとんどは走行中ではなく路肩に停まった車で、
+ * これまでそちらには光の板を一切置いていなかった。結果、灯りの点いた車の
+ * 前方だけが真っ暗のままで「白い矩形を 2 つ貼った箱」に見えていた。
+ *
+ * かといって走行車と同じ 14m の板を全部に置くと、光溜まりが前後で重なって
+ * **路肩が一本の光の帯**になる。停車中はロービームで、しかも車間より短ければ
+ * 隣とは繋がらない。長さを 1/3 に切り詰め、色（＝instanceColor）でさらに
+ * 落として、1 台ずつ独立した光溜まりとして置く。
+ */
+export function carIdleBeamSpec(kind: CarKind): { z: number; width: number; length: number; y: number } {
+  const s = CAR_SPECS[kind];
+  return { z: s.length / 2 + 0.4, width: s.width * 2.3, length: 4.8, y: 0.03 };
 }
 
 // ---- バス ------------------------------------------------------------------
@@ -702,6 +801,9 @@ export function busGeometry(): BufferGeometry {
     { w: BUS_W, h: 1.62, d: BUS_LEN, y: 1.6, c: 0.09, wf: 0.97, wb: 0.97 },
     // 側面の窓の帯。車体より少し外に出して、窓が「はまっている」ように見せる。
     { w: BUS_W + 0.03, h: 0.88, d: BUS_LEN - 0.7, y: 1.98, tint: GLASS },
+    // 窓柱。帯を 4 枚に割ると、真横のバスが「黒い帯を巻いた箱」から
+    // 「窓の並んだバス」になる（`pillars` の注記）。
+    ...pillars(BUS_W + 0.03, 1.98, 0.9, [2.2, 0.0, -2.2]),
     // フロントガラス（大きく、わずかに前傾）。
     { w: BUS_W - 0.14, h: 1.26, d: 0.08, y: 1.92, z: half - 0.02, rx: -0.06, tint: GLASS },
     // リアガラス。
@@ -843,6 +945,8 @@ export function truckBeamSpec(): { z: number; width: number; length: number; y: 
 
 const L = TRAIN_CAR_LENGTH_M;
 const TRAIN_W = 2.9;
+/** 電車の全幅 (m)。接地影の大きさを決めるのに使う。 */
+export const TRAIN_WIDTH_M = TRAIN_W;
 /** 車体の帯。`theme.ts` の TRAIN_HEAD_COLOR を車体色で割った変調係数。 */
 const TRAIN_STRIPE = 0x4a76a8;
 const ROOF = 0xbfc4c9;
@@ -864,6 +968,9 @@ function trainCommon(): Part[] {
     { w: TRAIN_W, h: 2.72, d: L, y: 2.0, c: 0.1, wt: 0.98 },
     // 側面の窓の帯。
     { w: TRAIN_W + 0.04, h: 0.94, d: L - 2.4, y: 2.62, tint: GLASS },
+    // 戸袋と窓柱。20m 級の車体に 1 本の黒い帯だけだと、真横から見た編成が
+    // 「黒い線の入った長い箱」にしかならない。4 本立てると扉と窓の割付が読める。
+    ...pillars(TRAIN_W + 0.04, 2.62, 0.96, [6.0, 2.0, -2.0, -6.0]),
     // 帯（ラインカラー）。腰の高さに 1 本通す。
     { w: TRAIN_W + 0.05, h: 0.3, d: L, y: 1.3, tint: TRAIN_STRIPE },
     // 屋根。上をすぼめて丸屋根にする。

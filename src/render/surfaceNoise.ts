@@ -136,8 +136,19 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
       )
       .replace(
         '#include <map_fragment>',
-        `float surfFade = 1.0 - smoothstep(uSurfFade * 0.5, uSurfFade, distance(cameraPosition, vSurfPos));
-        vec2 surfUv = vSurfPos.xz / uSurfNoise.x;
+        `vec2 surfUv = vSurfPos.xz / uSurfNoise.x;
+        // 画面上でノイズ 1 周期が何画素あるかを微分で測り、1 画素を割ったら振幅を 0 にする。
+        //
+        // 距離だけで消していたのでは足りない。目線の高さでは路面も地面も
+        // 視線に対してほぼ寝ているので、カメラから 30m の地点でも
+        // 画面上では 1 周期が 1 画素を割る。そこに振幅を残すと、
+        // 標本化できない周波数がそのまま**フィルタの掛かっていない白い点**として
+        // 出る（画面全体に散る「ビデオノイズ」の正体）。
+        // fwidth は隣の画素との差なので、傾きでも距離でも同じ尺度で効く。
+        vec2 surfDx = vec2(fwidth(surfUv.x), fwidth(surfUv.y));
+        float surfPix = max(surfDx.x, surfDx.y);
+        float surfSharp = 1.0 - smoothstep(0.22, 0.8, surfPix);
+        float surfFade = (1.0 - smoothstep(uSurfFade * 0.5, uSurfFade, distance(cameraPosition, vSurfPos))) * surfSharp;
         float surfN = snFbm(surfUv) - 0.5;
         // 勾配は隣を 2 回引いて差分で取る。専用のノイズ微分を書くより安い。
         float surfNx = snFbm(surfUv + vec2(0.16, 0.0)) - 0.5;
@@ -153,14 +164,18 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
           vec2 seamD = abs(fract(seamP + 0.5) - 0.5) * uSurfSeam.x;
           float seamNear = min(seamD.x, seamD.y);
           // 目地は近景専用。ノイズより早く（半分の距離で）消す。
-          float seamFade = 1.0 - smoothstep(uSurfFade * 0.16, uSurfFade * 0.42, distance(cameraPosition, vSurfPos));
+          float seamFade = (1.0 - smoothstep(uSurfFade * 0.16, uSurfFade * 0.42, distance(cameraPosition, vSurfPos))) * surfSharp;
           surfSeam = (1.0 - smoothstep(uSurfSeam.y * 0.35, uSurfSeam.y, seamNear)) * seamFade;
         }`,
       )
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-        roughnessFactor = clamp(roughnessFactor + surfN * uSurfNoise.z * 2.0 * surfFade, 0.04, 1.0);`,
+        // 下限を 0.04 から 0.35 に上げた。ノイズの谷で粗さが 0 に近づくと、
+        // 鏡面ローブが 1 画素に収束して**空の輝度がそのまま点として出る**
+        // （引きの画で地面に散っていた白い点＝firefly）。
+        // 路面も地面もコンクリートも、実物の粗さが 0.35 を下回ることはない。
+        roughnessFactor = clamp(roughnessFactor + surfN * uSurfNoise.z * 2.0 * surfFade, 0.35, 1.0);`,
       )
       .replace(
         '#include <normal_fragment_begin>',
@@ -179,7 +194,7 @@ export function applySurfaceNoise(mat: MeshStandardMaterial, opts: SurfaceNoiseO
         // 暗いだけの線は「描いた線」に見えるが、粗さが変わると溝に見える。
         float surfSeamUp = surfSeam * surfUp;
         diffuseColor.rgb *= 1.0 - surfSeamUp * uSurfSeam.z;
-        roughnessFactor = clamp(roughnessFactor + surfSeamUp * 0.22, 0.04, 1.0);`,
+        roughnessFactor = clamp(roughnessFactor + surfSeamUp * 0.22, 0.35, 1.0);`,
       );
 
     if (specular < 1) {

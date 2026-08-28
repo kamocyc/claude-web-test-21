@@ -530,13 +530,22 @@ function balconies(
   // 手すりの作りを棟ごとに 3 通りから引く。
   // 日本の集合住宅の立面はここでほとんど決まるので、全棟が同じ白い腰壁だと、
   // どれだけ量塊を散らしても「白い水平帯を積んだバウムクーヘン」が並ぶ。
-  // 0=コンクリートの腰壁 / 1=アルミの手すり（透ける）/ 2=濃色パネルの低い腰壁。
+  // 0=コンクリートの腰壁 / 1=アルミの手すり / 2=濃色パネル。
+  //
+  // 3 種に分けたのに絵で読めなかったのは、どれも `e.box`（＝無地の塗り面）と
+  // 1 スパンの柵キットの引き伸ばしで描いていたから。
+  // 天端の笠木も目地も無く、柵の子柱は建物の幅に比例して太くなっていた。
+  // いまは `e.parapet` に種別を渡して、材質側で笠木・目地・子柱・枠を描く。
   const kind = Math.floor(rnd(hash, 401) * 3);
   tmpA.copy(ctx.wall).multiplyScalar(0.92);
   // 腰壁の色は躯体から引く。純白の板を回すと、その帯だけが日を受けて
   // 建物の中でいちばん明るくなり、階の繰り返しがかえって強調される。
   tmpB.copy(ctx.wall).multiplyScalar(kind === 2 ? 0.52 : 0.86);
-  const railH = kind === 2 ? 0.78 : 1.05;
+  // アルミの手すりは背が高く、濃色パネルは低い。高さでも作りの差が出る。
+  const railH = kind === 2 ? 0.82 : kind === 1 ? 1.08 : 1.02;
+  // 腰壁のパネル割り。棟ごとに散らすと、同じ種類でも目地の間隔が変わる。
+  const panelW = 1.2 + rnd(hash, 403) * 1.4;
+  const seed = (hash % 251) / 251;
   for (let i = 1; i < floors; i++) {
     const y = baseY + floorH * i;
     for (const s of sides) {
@@ -547,13 +556,18 @@ function balconies(
       e.box(px, y - 0.17, pz, alongX ? len : depth, 0.17, alongX ? depth : len, tmpA, 0.9, 0.03);
       const rx = x + (alongX ? 0 : s * (dist + depth - 0.06));
       const rz = z + (alongX ? s * (dist + depth - 0.06) : 0);
-      if (kind === 1) {
-        // アルミの手すり。透けるぶん水平帯が細くなり、
-        // 同じ階数でも腰壁の棟より軽い立面に見える。インスタンス数は腰壁と同じ。
-        e.railFrame(rx, y, rz, len, 1.05, alongX ? 0 : Math.PI / 2);
-      } else {
-        e.box(rx, y, rz, alongX ? len : 0.12, railH, alongX ? 0.12 : len, tmpB, 0.8, 0.08);
-      }
+      e.parapet(
+        rx,
+        y,
+        rz,
+        alongX ? len : 0.12,
+        railH,
+        alongX ? 0.12 : len,
+        tmpB,
+        kind,
+        panelW,
+        seed,
+      );
     }
   }
 }
@@ -1513,7 +1527,9 @@ function forestry(ctx: BuildCtx): void {
     const pz = cz + rz * d * 0.8;
     const h = 3.2 + rnd(hash, 220 + i) * 2.4;
     e.cyl(px, gy, pz, 0.16, h * 0.4, 0x6b5540, 0.95, 0.02);
-    e.hip(px, gy + h * 0.3, pz, 2.2, h * 0.8, 2.2, 0x36703f);
+    // 樹冠に寄棟のキットを流用している。葺き足に負の値を渡して、
+    // 屋根の材質に「ここは瓦ではない」と伝える（棟瓦の載った木になってしまう）。
+    e.hip(px, gy + h * 0.3, pz, 2.2, h * 0.8, 2.2, 0x36703f, 0, -1);
   }
 }
 

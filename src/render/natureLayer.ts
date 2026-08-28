@@ -13,7 +13,7 @@ import type { Simulation } from '@sim/simulation';
 import { neighbor, tileX, tileY } from '@sim/world/tiles';
 import { surface } from './materials';
 import { InstancePool } from './instancePool';
-import { LOT_PROPS, SHRUB_SEASON, hash2, mixHex } from './groundPalette';
+import { GROUND, LOT_PROPS, SHRUB_SEASON, hash2, mixHex } from './groundPalette';
 import { CARRIAGE_HALF, WALK_OUTER } from './roadLayer';
 import {
   bambooGeometry,
@@ -102,6 +102,11 @@ const TRUNK_LOD_DISTANCE = 600;
  *
  * 塀も物置も 2m 前後の物なので、これより引くと数画素に潰れて
  * 「地面に散った点」にしかならない。街区を見下ろす距離までで十分。
+ *
+ * 700m まで伸ばすことも試したが、やめた。その距離では 1 画素が 0.7m あり、
+ * 駐車マスの白線も物置の柱も**画素の網に当たったところだけが塗られる点**になる。
+ * 街区の内側を埋めたくて足した物が、そのまま「地面に散った白い粒」という
+ * 別の指摘に化ける。埋めるのは、物が物として見える距離までにする。
  */
 const LOT_PROP_LOD_DISTANCE = 620;
 
@@ -427,7 +432,20 @@ export class NatureLayer {
       // 数える周と置く周で必ず同じ判定を通す（ここで枝分かれが食い違うと、
       // 区画ごとの容量と実際に置く数がずれる）。
       if (zone >= Zone.ResidentialLow && zone <= Zone.IndustrialHeavy) {
-        if (place) this.putLotProps(world, i, cx, cz, gy, h, season);
+        if (place) this.putLotProps(world, i, cx, cz, gy, h, season, zone);
+        continue;
+      }
+
+      // --- 街区の裏の空き地 ---
+      //
+      // 用途地域が指定されていないのに、隣が建物になっているタイル。
+      // 街区の内側（中庭）はほぼこれで、ここが素の草地のままだと、
+      // 引きの画で**ブロックの真ん中がオリーブ灰の無地に抜ける**。
+      // 実際の街区の内側は、塀で仕切られた駐車スペース・物置・室外機置場で
+      // 埋まっていて、無地の地面が見えることはまず無い。
+      // 3 枚に 1 枚は木と低木に譲る（庭木の無い裏庭も不自然なので）。
+      if (zone === Zone.None && (h >>> 4) % 3 !== 0 && this.nextToBuilt(world, i)) {
+        if (place) this.putBackLot(cx, cz, gy, h, season);
         continue;
       }
 
@@ -577,11 +595,14 @@ export class NatureLayer {
   }
 
   /**
-   * 空き地の設え。塀・生垣・物置・駐車パッド。
+   * 空き地の設え。塀・生垣・物置・駐車マス・室外機・資材置場。
    *
    * 形はすべて 1 種類の面取り箱で、拡大率だけで作り分ける
    * （`lotPropGeometry`）。ドローコールを 1 本に抑えるためで、
    * 塀のように薄く長い物と物置のように厚い物を同じ箱で兼ねられる。
+   * **1 区画あたりの箱を増やしてもドローコールは 1 本のまま**なので、
+   * 「街区の中庭が無地のオリーブ灰」という指摘に対しては、
+   * 物の種類と 1 区画あたりの点数を増やすのがいちばん安い答えになる。
    *
    * 敷地の境界は「道路に面した辺」に置く。道路に接していない奥の敷地は
    * ハッシュで辺を決める。全部の辺を囲うと升目になるので、必ず 1 辺だけ。
@@ -594,6 +615,7 @@ export class NatureLayer {
     gy: number,
     h: number,
     season: number,
+    zone: number,
   ): void {
     // 道路に面した辺を探す。見つからなければハッシュで決める。
     let edge = -1;
@@ -613,11 +635,35 @@ export class NatureLayer {
     const run = TILE_M * 0.84;
     const thin = 0.24;
 
-    switch (key % 4) {
+    // 工業地の敷地には資材とコンテナが積んである。用途で置く物を分けると、
+    // 街区ごとに空き地の見え方が変わって、区画の性格が絵から読める
+    // （住宅地の更地に鉄コンテナが積んであると、それだけで嘘になる）。
+    const works = zone === Zone.IndustrialLight || zone === Zone.IndustrialHeavy;
+    switch (works ? 4 + (key % 2) : key % 4) {
       case 0: {
-        // 月極駐車場。砕石を敷いた板と、奥側の低いブロック塀。
+        // 月極駐車場。砕石を敷いた板、区画の白線、奥側の低いブロック塀。
         this.color.setHex(LOT_PROPS.gravel).multiplyScalar(0.92 + ((key >>> 7) % 18) / 100);
         this.putBox(cx, gy + 0.01, cz, TILE_M * 0.82, 0.09, TILE_M * 0.82, this.color);
+        // 駐車マスの白線。1 台 2.5m 幅なので、10m のタイルにちょうど 4 台ぶん入る。
+        // 実寸の 12cm ではなく 24cm で引いてある。街区を見下ろす距離では
+        // 12cm は 1 画素の 1/3 しかなく、**線ではなく点線状の粒**になる。
+        // 塗料の色を砕石に寄せてあるので、太らせても白い帯には見えない。
+        // **中庭が無地に見える原因は、面積の大きい物が 1 枚も無かったこと**ではなく、
+        // 面の中に線が 1 本も無かったことのほうにある。線を 3 本引くだけで
+        // 「砕石の板」が「駐車場」になる。
+        this.color.setHex(LOT_PROPS.stall).multiplyScalar(0.9 + ((key >>> 3) % 16) / 100);
+        for (let k = -1; k <= 1; k++) {
+          const off = k * 2.5;
+          this.putBox(
+            alongX ? cx + off : cx,
+            gy + 0.06,
+            alongX ? cz : cz + off,
+            alongX ? 0.24 : TILE_M * 0.66,
+            0.05,
+            alongX ? TILE_M * 0.66 : 0.24,
+            this.color,
+          );
+        }
         const back = (edge + 2) & 3;
         this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.9 + ((key >>> 11) % 20) / 100);
         this.putBox(
@@ -636,6 +682,26 @@ export class NatureLayer {
         const pal = SHRUB_SEASON[season] ?? SHRUB_SEASON[Season.Summer]!;
         this.color.copy(mixHex(pal.dark, pal.light, ((key >>> 9) % 100) / 100));
         this.putBox(bx, gy, bz, alongX ? run : 0.8, 1.0 + ((key >>> 13) % 30) / 100, alongX ? 0.8 : run, this.color);
+        // 生垣の内側に自転車置場。波板の屋根と細い柱 2 本。
+        // 柱が無いと目線の高さで屋根が宙に浮くので、そこだけは省けない。
+        const rx = cx - OUT_X[edge]! * 2.2;
+        const rz = cz - OUT_Z[edge]! * 2.2;
+        this.color.setHex(LOT_PROPS.shed).multiplyScalar(0.94 + ((key >>> 21) % 12) / 100);
+        this.putBox(rx, gy + 2.0, rz, alongX ? 4.6 : 2.2, 0.12, alongX ? 2.2 : 4.6, this.color);
+        // 柱は屋根より暗い色で、少し太らせる。細く明るい柱は、街区を
+        // 見下ろす距離では 1 画素を割って「白い粒」にしかならない。
+        this.color.multiplyScalar(0.62);
+        for (let k = -1; k <= 1; k += 2) {
+          this.putBox(
+            rx + (alongX ? k * 2.0 : 0.9),
+            gy,
+            rz + (alongX ? 0.9 : k * 2.0),
+            0.18,
+            2.0,
+            0.18,
+            this.color,
+          );
+        }
         break;
       }
       case 2: {
@@ -646,12 +712,71 @@ export class NatureLayer {
         const sz = ((key >>> 17) % 2 === 0 ? 1 : -1) * TILE_M * 0.26;
         this.color.setHex((key >>> 19) % 3 === 0 ? LOT_PROPS.shedAlt : LOT_PROPS.shed);
         this.putBox(cx + sx, gy, cz + sz, 2.5, 2.0 + ((key >>> 21) % 8) / 10, 1.8, this.color);
+        // 室外機置場。物置の反対側の隅に 2〜3 台並べる。
+        // 日本の敷地の隅にはたいていこれが据えてある。
+        this.color.setHex(LOT_PROPS.unit).multiplyScalar(0.92 + ((key >>> 25) % 14) / 100);
+        const n = 2 + ((key >>> 13) % 2);
+        for (let k = 0; k < n; k++) {
+          this.putBox(
+            cx - sx + (alongX ? (k - (n - 1) / 2) * 1.05 : 0),
+            gy,
+            cz - sz + (alongX ? 0 : (k - (n - 1) / 2) * 1.05),
+            alongX ? 0.85 : 0.4,
+            0.65,
+            alongX ? 0.4 : 0.85,
+            this.color,
+          );
+        }
         break;
       }
-      default: {
+      case 3: {
         // ブロック塀だけ。高さを散らすと、同じ塀が並ぶ反復が消える。
         this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.88 + ((key >>> 11) % 24) / 100);
         this.putBox(bx, gy, bz, alongX ? run : thin, 1.3 + ((key >>> 23) % 60) / 100, alongX ? thin : run, this.color);
+        // 更地に残った基礎（解体跡）と、その脇に積んだ土嚢の山。
+        // 「何も無い草地」と「まだ建っていない敷地」を分けるのは、
+        // 塀ではなくこういう**中途半端に残った物**だと思う。
+        this.color.setHex(LOT_PROPS.gravel).multiplyScalar(0.86 + ((key >>> 5) % 20) / 100);
+        this.putBox(cx, gy + 0.01, cz, 5.4, 0.16, 4.2, this.color);
+        this.color.setHex(LOT_PROPS.crate).multiplyScalar(0.9 + ((key >>> 17) % 18) / 100);
+        this.putBox(cx + 3.0, gy, cz - 2.6, 1.6, 0.7, 1.4, this.color);
+        break;
+      }
+      case 4: {
+        // 構内の資材置場。パレットとコンテナを段違いに積む。
+        this.color.setHex(LOT_PROPS.gravel).multiplyScalar(0.9 + ((key >>> 7) % 16) / 100);
+        this.putBox(cx, gy + 0.01, cz, TILE_M * 0.88, 0.1, TILE_M * 0.88, this.color);
+        for (let k = 0; k < 3; k++) {
+          const kh = (key >>> (k * 5 + 3)) >>> 0;
+          const px = cx + ((kh % 100) / 100 - 0.5) * TILE_M * 0.6;
+          const pz = cz + (((kh >>> 7) % 100) / 100 - 0.5) * TILE_M * 0.6;
+          this.color
+            .setHex(kh % 3 === 0 ? LOT_PROPS.crateAlt : LOT_PROPS.crate)
+            .multiplyScalar(0.88 + ((kh >>> 13) % 22) / 100);
+          this.putBox(px, gy, pz, 2.2 + ((kh >>> 17) % 14) / 10, 1.1 + ((kh >>> 19) % 16) / 10, 1.8, this.color);
+        }
+        break;
+      }
+      default: {
+        // 構内の駐車場（従業員用）。トラックが据わる幅で線を引く。
+        this.color.setHex(GROUND.lotPaved).multiplyScalar(0.93 + ((key >>> 7) % 14) / 100);
+        this.putBox(cx, gy + 0.01, cz, TILE_M * 0.9, 0.1, TILE_M * 0.9, this.color);
+        this.color.setHex(LOT_PROPS.stall).multiplyScalar(0.9 + ((key >>> 3) % 16) / 100);
+        for (let k = -1; k <= 1; k++) {
+          const off = k * 3.2;
+          this.putBox(
+            alongX ? cx + off : cx,
+            gy + 0.07,
+            alongX ? cz : cz + off,
+            alongX ? 0.26 : TILE_M * 0.72,
+            0.05,
+            alongX ? TILE_M * 0.72 : 0.26,
+            this.color,
+          );
+        }
+        // 構内の隅に受電設備（キュービクル）。工場の敷地の記号。
+        this.color.setHex(LOT_PROPS.unit).multiplyScalar(0.9 + ((key >>> 25) % 16) / 100);
+        this.putBox(cx + TILE_M * 0.3, gy, cz + TILE_M * 0.3, 1.8, 1.9, 1.1, this.color);
         break;
       }
     }
@@ -672,6 +797,111 @@ export class NatureLayer {
     this.quat.identity();
     this.mat.compose(this.pos, this.quat, this.scl);
     this.lotProps.push(this.mat, color);
+  }
+
+  /**
+   * 街区の裏の空き地の設え。
+   *
+   * `putLotProps` と分けてあるのは、こちらが「建てる予定の無い土地」だから。
+   * 更地の設え（駐車マスや資材置場）ではなく、**隣の家からはみ出してきた物**
+   * ―― 塀・物置・室外機・物干し ―― を置くほうが街区の内側らしくなる。
+   */
+  private putBackLot(
+    cx: number,
+    cz: number,
+    gy: number,
+    h: number,
+    season: number,
+  ): void {
+    // XOR の結果は符号付きになりうるので必ず符号なしに戻す。
+    // 負のままだと `key % 4` が負になり、方向表の添字が外れて座標が NaN になる。
+    const key = ((h >>> 7) ^ 0x2f6c1a3b) >>> 0;
+    const edge = key % 4;
+    const alongX = edge === 0 || edge === 2;
+    const bx = cx + OUT_X[edge]! * (TILE_M / 2 - 0.4);
+    const bz = cz + OUT_Z[edge]! * (TILE_M / 2 - 0.4);
+    const run = TILE_M * 0.86;
+
+    // 境界のブロック塀。裏の空き地でいちばん確実にあるのがこれ。
+    this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.86 + ((key >>> 5) % 26) / 100);
+    this.putBox(bx, gy, bz, alongX ? run : 0.22, 1.1 + ((key >>> 9) % 70) / 100, alongX ? 0.22 : run, this.color);
+
+    switch ((key >>> 11) % 3) {
+      case 0: {
+        // 裏の駐車スペース。舗装した板と、車 1 台ぶんの白線 2 本。
+        this.color.setHex(LOT_PROPS.gravel).multiplyScalar(0.9 + ((key >>> 15) % 18) / 100);
+        this.putBox(cx, gy + 0.01, cz, TILE_M * 0.7, 0.08, TILE_M * 0.7, this.color);
+        this.color.setHex(LOT_PROPS.stall).multiplyScalar(0.92 + ((key >>> 3) % 14) / 100);
+        for (let k = -1; k <= 1; k += 2) {
+          this.putBox(
+            alongX ? cx + k * 1.3 : cx,
+            gy + 0.05,
+            alongX ? cz : cz + k * 1.3,
+            alongX ? 0.22 : TILE_M * 0.56,
+            0.05,
+            alongX ? TILE_M * 0.56 : 0.22,
+            this.color,
+          );
+        }
+        break;
+      }
+      case 1: {
+        // 物置と室外機。日本の裏庭の記号。
+        this.color.setHex((key >>> 17) % 3 === 0 ? LOT_PROPS.shedAlt : LOT_PROPS.shed);
+        this.putBox(
+          cx - OUT_X[edge]! * 2.4,
+          gy,
+          cz - OUT_Z[edge]! * 2.4,
+          alongX ? 2.6 : 1.7,
+          1.9 + ((key >>> 19) % 9) / 10,
+          alongX ? 1.7 : 2.6,
+          this.color,
+        );
+        this.color.setHex(LOT_PROPS.unit).multiplyScalar(0.92 + ((key >>> 23) % 14) / 100);
+        for (let k = 0; k < 2; k++) {
+          this.putBox(
+            cx + (alongX ? (k - 0.5) * 1.05 : 2.6),
+            gy,
+            cz + (alongX ? 2.6 : (k - 0.5) * 1.05),
+            alongX ? 0.85 : 0.4,
+            0.62,
+            alongX ? 0.4 : 0.85,
+            this.color,
+          );
+        }
+        break;
+      }
+      default: {
+        // 庭。刈り込んだ植え込みを 2 株と、低い縁石。
+        const pal = SHRUB_SEASON[season] ?? SHRUB_SEASON[Season.Summer]!;
+        this.color.copy(mixHex(pal.dark, pal.light, ((key >>> 21) % 100) / 100));
+        for (let k = 0; k < 2; k++) {
+          const kh = (key >>> (k * 6 + 3)) >>> 0;
+          const size = 1.0 + ((kh >>> 5) % 12) / 10;
+          this.putBox(
+            cx + ((kh % 100) / 100 - 0.5) * TILE_M * 0.5,
+            gy,
+            cz + (((kh >>> 7) % 100) / 100 - 0.5) * TILE_M * 0.5,
+            size,
+            size * 0.9,
+            size,
+            this.color,
+          );
+        }
+        this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.98);
+        this.putBox(cx, gy, cz + TILE_M * 0.3, TILE_M * 0.6, 0.24, 0.2, this.color);
+        break;
+      }
+    }
+  }
+
+  /** 隣接 4 タイルに建物が載っているか。街区の内側（中庭）の判定に使う。 */
+  private nextToBuilt(world: Simulation['world'], i: number): boolean {
+    for (let d = 0; d < 4; d++) {
+      const nb = neighbor(i, d);
+      if (nb >= 0 && world.buildingRef[nb] !== 0) return true;
+    }
+    return false;
   }
 
   /** 隣接 4 タイルにその地形があるか。里山の縁の判定に使う。 */

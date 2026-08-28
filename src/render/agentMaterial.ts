@@ -66,7 +66,7 @@ export const SKIN_ATTRIBUTE = 'aSkin';
  */
 const GLASS_TINT = 'vec3(0.030, 0.034, 0.042)';
 /** ガラスの粗さと金属度。反射は自前で足すので、環境マップは補助に留める。 */
-const GLASS_ROUGHNESS = '0.10';
+const GLASS_ROUGHNESS = '0.18';
 const GLASS_METALNESS = '0.65';
 /**
  * ガラスだけ環境マップを強く拾わせる倍率。
@@ -77,7 +77,7 @@ const GLASS_METALNESS = '0.65';
  * 環境マップ（焼いた空）の寄与を 1 より上に取って、
  * 車の向きごとに違う明るさが乗るようにしておく。
  */
-const GLASS_ENV_GAIN = '1.6';
+const GLASS_ENV_GAIN = '1.0';
 
 /**
  * ガラスの反射。
@@ -93,6 +93,11 @@ const GLASS_ENV_GAIN = '1.6';
  * を明示的に足す。上を向いている面は空の青、水平を向いている面は地平の
  * 明るい帯、下を向いている面は路面の暗さを映すので、1 枚のガラスの中に
  * 必ず階調が生まれる。ガラスが「ガラスに見える」条件はこれだけで足りる。
+ *
+ * **全体の量は控えめに。** 反射を強く取ると、正午に真後ろから見た
+ * リアガラスが「磨いた金属板」になって車体より明るくなる。指摘は逆で、
+ * 求められているのは「1 枚の**暗い**ポリゴンとして車体から分離すること」。
+ * 明るいのは上端だけでよく、下半分は車内の暗さが勝って当然である。
  */
 const GLASS_REFLECT = /* glsl */ `
 	{
@@ -106,10 +111,10 @@ const GLASS_REFLECT = /* glsl */ `
 		// 面が真横を向いていると面内でほとんど変化せず、結局 1 枚が一色になる
 		//（前回「反りを足した」のが効かなかったのはここ）。窓の上端は空を、
 		// 下端は路面と暗い車内を映すので、上下で 4 倍の明度差を直接与える。
-		refl *= 0.26 + 1.12 * gUp;
+		refl *= 0.16 + 0.80 * gUp;
 		// 視線が浅いほど強く映る（フレネル）。縁が光るとガラスの厚みが出る。
 		float fres = pow( 1.0 - clamp( dot( vDir, nrm ), 0.0, 1.0 ), 4.0 );
-		totalEmissiveRadiance += gMask * refl * ( 0.30 + 1.15 * fres );
+		totalEmissiveRadiance += gMask * refl * ( 0.24 + 0.95 * fres );
 	}
 `;
 
@@ -206,7 +211,7 @@ export function agentSurface(o: AgentSurfaceOptions): AgentSurface {
         // ただし窓の下半分には掛けない（下端まで空を映すと平板に戻る）。
         .replace(
           '#include <lights_fragment_maps>',
-          `#include <lights_fragment_maps>\n\tradiance *= mix(1.0, ${GLASS_ENV_GAIN} * (0.30 + 0.85 * gUp), gMask);`,
+          `#include <lights_fragment_maps>\n\tradiance *= mix(1.0, ${GLASS_ENV_GAIN} * (0.25 + 0.75 * gUp), gMask);`,
         );
     }
     // 夜の持ち上げと、ガラスの反射。どちらも法線が確定した後でないと書けないので、

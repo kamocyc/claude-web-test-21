@@ -157,7 +157,9 @@ export class BuildingLayer {
       const roofBase = style.roofs[Math.floor(rnd(hash, 71) * style.roofs.length) % style.roofs.length]!;
       // 屋根は壁ほど散らさない。同じ街区で屋根の色相まで暴れると、
       // 「色を散らした」ではなく「配色が壊れている」に見える。
-      scatterColor(roofBase, hash ^ 0x5bf03, this.roof, 0.55);
+      // 俯瞰では画面の 4 割が屋根なので、色相 ±6°・明度 ±8% は欲しい。
+      // 瓦の起伏はテクスチャが持つので、ここは棟ごとの「焼きの違い」だけ。
+      scatterColor(roofBase, hash ^ 0x5bf03, this.roof, 0.7);
       // 金属葺きだけ鈍く光らせる。同じ切妻でも材の違いが読めるようになる。
       const tin = TIN_ROOFS.has(roofBase);
       ctx.roofRough = tin ? 0.42 : 0.79;

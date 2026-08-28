@@ -6,6 +6,7 @@ import {
   CylinderGeometry,
   Matrix4,
   MeshBasicMaterial,
+  type MeshStandardMaterial,
   Object3D,
   PlaneGeometry,
   Quaternion,
@@ -145,12 +146,15 @@ const FACE_ROT = [0, -Math.PI / 2, Math.PI, Math.PI / 2] as const;
 /**
  * 電線の色。
  *
- * 低圧配電線は黒い被覆なので暗くて正しいのだが、0x3a3d42 に金属度 0.35 を
- * 掛けていたときは拡散反射が 3 割削られたうえに、太さが 1px を割る距離では
- * 被覆率のぶんさらに暗く合成されて、**空や屋根の上を走る黒い糸くず**に見えていた。
- * 金属度を落として拡散を返し、色も一段持ち上げる。
+ * 低圧配電線は黒い被覆だが、**中性の黒**で置くと絵が壊れる。夕方のカットでは
+ * 画面じゅうが暖色に転んでいるので、そこに彩度ゼロの暗い線が走ると
+ * 「後からペンで描き足した」ようにしか見えない（前回の指摘の落書き）。
+ * 焦茶（#4A423A）に寄せると、被覆の色としても嘘にならないまま、
+ * 周りの光と同じ色相の中に収まる。
+ * 金属度も 0.35 から落としてある。金属度を持たせるほど拡散反射が削られて、
+ * 日陰の線が真っ黒に沈む ―― 実物の被覆は樹脂であって金属ではない。
  */
-const WIRE_COLOR = 0x55565a;
+const WIRE_COLOR = 0x4a423a;
 /** 電線 1 本のたわみ（水平距離に対する比）。 */
 const WIRE_SAG = 0.055;
 /**
@@ -162,8 +166,13 @@ const WIRE_SAG = 0.055;
  * （夕方の空を背景にした電線がいちばん目立っていた）。
  * 実物の低圧配電線の外径は 1cm 前後だが、それだと遠景で消えるので少し太らせる。
  * 円柱にすると太さが距離で縮み、法線があるので光も乗る。
+ *
+ * 半径を 5cm から 3.5cm へ絞った。前回 1px の線から円柱に替えたときに
+ * 「遠景で消える」ことを恐れて太らせすぎ、夕方のカットでは**太さ一定の
+ * 真っ黒なストロークが画面を横切る落書き**になっていた。
+ * 電線は空を細かく切り取る繊細な線であって、絵の主役ではない。
  */
-const WIRE_RADIUS = 0.05;
+const WIRE_RADIUS = 0.035;
 /** カテナリーの分割数。近景でしか描かなくなったので 1 段増やして折れを消す。 */
 const WIRE_SEGMENTS = 4;
 /**
@@ -182,6 +191,16 @@ const WIRE_SEGMENTS = 4;
  * 引いた画で無理に残す価値は無い。
  */
 const WIRE_LOD_DISTANCE = 190;
+/**
+ * 電線が薄れ始めるカメラ距離 (m)。
+ *
+ * 画面上の太さが 1px を割った線を**不透明のまま**描くと、ラスタライザは
+ * 「当たった画素を全部塗る」ので、実際より太くて真っ黒な線が出る
+ * （前回の指摘の「黒いマジック書き」）。被覆率が 1 を割るぶんだけ
+ * 不透明度を落とせば、それは面積の保存であって手加減ではない。
+ * 距離で太さを細らせるのと同じ効果を、線が消える手前まで連続して掛けられる。
+ */
+const WIRE_FADE_DISTANCE = 70;
 
 /**
  * 路面標示を 1 本ずつ描くのをやめるカメラ距離 (m)。
@@ -214,13 +233,27 @@ const WEAR_LOD_DISTANCE = 260;
 /**
  * 横断歩道の塗料。車線の白線よりさらに一段暗い。
  * 横断歩道は轍が直接乗るので実物でもいちばん早く摩耗する。
+ *
+ * 白線と揃えて一段落としてある。舗装を実測のアルベドへ戻したうえで
+ * 以前の塗料色を残すと、路面と標示の明度比が 11 倍のままになり、
+ * 交差点だけが「黒地に白の縞」として漫画的に浮く。
+ * 実物の路面標示（linear 0.30 前後）と舗装（0.08）の比は 4 倍程度。
  */
-const CROSSWALK_COLOR = 0xa5a399;
+const CROSSWALK_COLOR = 0x8e8c84;
 /**
  * 遠景で縞のかわりに敷く矩形の色。
- * 縞の被覆率（幅 0.55m / 間隔 1.25m ＝ 約 44%）で舗装と塗料を混ぜた値。
+ *
+ * 縞の被覆率（幅 0.55m / 間隔 1.25m ＝ 約 44%）に、摩耗で欠けるぶんを見込んで
+ * 舗装と塗料を混ぜた値。**舗装より少し明るい灰**に収束させるのが要点で、
+ * ここが路面と離れていると、中距離では縞が見えないまま
+ * 「交差点ごとに置かれた色の違う枕」だけが街じゅうに並ぶ。
+ * 舗装 linear 0.082 に対して 0.10 ―― 「そこだけ少し白茶けている」程度で、
+ * 面積比どおりの 0.16 には**わざと届かせない**。この矩形は交差点の周りを
+ * 八角形に囲む形で並ぶので、面積比に忠実な明るさにすると、
+ * 縞が見えない距離では「明るい環に囲まれた暗い座布団」という
+ * 図形そのものが街じゅうに数百個反復してしまう。
  */
-const CROSSWALK_FAR_COLOR = 0x62635c;
+const CROSSWALK_FAR_COLOR = 0x5a5b54;
 
 /**
  * 夜、街灯が路面に落とす光の大きさ (m) と強さ。
@@ -287,12 +320,16 @@ export class RoadLayer {
 
   private readonly materials: Material[] = [];
   private readonly lampHeadMat: MeshBasicMaterial;
+  /** 電線。距離で不透明度を動かすので持っておく。 */
+  private readonly wireMat: MeshStandardMaterial;
   private readonly poolMat: MeshBasicMaterial;
   private readonly vendingGlowMat: MeshBasicMaterial;
 
   private lastEpoch = -1;
   private lastNetwork = -1;
   private night = -1;
+  /** 街灯が点いているか。`grow()` の後に表示を掛け直すために持っておく。 */
+  private lit = false;
   /** 直近に適用した LOD（毎フレーム visible を触らずに済ませるため）。 */
   private detailFar = false;
   private markingsShown = true;
@@ -472,6 +509,9 @@ export class RoadLayer {
       blending: AdditiveBlending,
       depthWrite: false,
       toneMapped: false,
+      // 既定の 1 で作らない。加算の板は「見えないはずのときに全強度で残る」のが
+      // いちばん怖い壊れ方なので、点灯側（setNight）が値を入れるまでは 0 にしておく。
+      opacity: 0,
     });
     // 路面に貼り付ける板なので、深度を数テクセルぶん手前に押す。
     // 高さのオフセット（Y_POOL）だけだと、斜面では舗装の三角形が
@@ -489,7 +529,16 @@ export class RoadLayer {
     // --- 電線 ---
     // 細い円柱を 1 区間 1 インスタンスで敷く。線ではなく立体なので、
     // 遠近で太さが変わり、SMAA も素直に効いてジャギーが出ない。
-    const wireMat = surface({ color: WIRE_COLOR, roughness: 0.72, metalness: 0.18, envMapIntensity: 0.35 });
+    // 金属度を落として拡散を返す。被覆線は金属ではなく黒い樹脂で、
+    // 金属度を持たせるほど拡散反射が削られて、日陰では真っ黒に沈む。
+    // 色も冷たい灰から**枯れた焦茶**へ寄せた。夕方の低い日射の下では、
+    // 中性の灰は周りの暖色から浮いて「後から描き足した線」に見える。
+    const wireMat = surface({ color: WIRE_COLOR, roughness: 0.78, metalness: 0.04, envMapIntensity: 0.3 });
+    // 距離で被覆率ぶんだけ薄める（WIRE_FADE_DISTANCE を参照）。
+    // 深度は書かない。細い円柱が深度を書くと、後ろの半透明が抜ける。
+    wireMat.transparent = true;
+    wireMat.depthWrite = false;
+    this.wireMat = wireMat;
     this.materials.push(wireMat);
     // 中心が原点・+Y に高さ 1 の円柱。断面は 4 角形で十分（遠景では 1px 前後）。
     const wireGeom = new CylinderGeometry(WIRE_RADIUS, WIRE_RADIUS, 1, 4, 1, true);
@@ -542,10 +591,32 @@ export class RoadLayer {
     this.markingsShown = camDistance < MARKING_FAR_CUTOFF;
     this.wearShown = camDistance < WEAR_LOD_DISTANCE;
     this.wiresShown = camDistance < WIRE_LOD_DISTANCE;
+    // 画面上の太さが 1px を割ったぶんだけ薄める。0.25 を下限にしてあるのは、
+    // 消える直前まで「そこに線がある」ことは伝えたいため。
+    const t = Math.min(1, Math.max(0, (camDistance - WIRE_FADE_DISTANCE) / (WIRE_LOD_DISTANCE - WIRE_FADE_DISTANCE)));
+    this.wireMat.opacity = 1 - t * 0.75;
     this.applyDetail();
   }
 
+  /**
+   * 夜の発光物（灯具・光溜まり・自販機）の表示。
+   *
+   * **`mesh.visible` を直接触ってはいけない**のがここの肝。`InstancePool.grow()`
+   * はメッシュを作り直すので、直接立てたフラグは容量が伸びた瞬間に既定の
+   * `true` へ戻る。ところが `setNight()` は `nightAmount` が変わったときしか
+   * 走らないので、**正午に街が育って grow が起きると、加算の光溜まりが
+   * 不透明度 1（材質の既定値）のまま昼の歩道の上で光り続ける**。
+   * 07 の昼のアーケード下に出ていた「光源の無い黄緑の滲み」がこれだった。
+   * プール側の `setVisible` は grow を跨いで状態を保つので、そちらを使う。
+   */
+  private applyNight(): void {
+    this.lampHead.setVisible(this.lit);
+    this.lightPool.setVisible(this.lit);
+    this.vendingGlow.setVisible(this.lit);
+  }
+
   private applyDetail(): void {
+    this.applyNight();
     this.marking.setVisible(!this.detailFar);
     this.markingFar.setVisible(this.detailFar && this.markingsShown);
     this.wear.setVisible(this.wearShown);
@@ -563,11 +634,9 @@ export class RoadLayer {
   private setNight(night: number): void {
     if (Math.abs(night - this.night) < 0.01) return;
     this.night = night;
-    const lit = night > 0.02;
-    this.lampHead.mesh.visible = lit;
-    this.lightPool.mesh.visible = lit;
-    this.vendingGlow.mesh.visible = lit;
-    if (!lit) return;
+    this.lit = night > 0.02;
+    this.applyNight();
+    if (!this.lit) return;
     this.lampHeadMat.opacity = Math.min(1, night * 1.4);
     // 光の板の強さ。以前はここを 0.92 まで上げていて、24m 角の光溜まりが
     // 隣同士で重なった結果、路面が「発光するベージュの絨毯」になっていた。
@@ -750,12 +819,20 @@ export class RoadLayer {
         : cls === RoadClass.Avenue
           ? PAVEMENT.avenue
           : PAVEMENT.street;
-    const jitter = 0.86 + ((h >>> 9) % 100) / 100 * 0.3;
+    // 散らしの幅を ±15% から ±7% に絞った。アルベドを実測へ戻すと、
+    // 同じ ±15% でも絶対値の差が 2.4 倍に効いてくる。俯瞰では
+    // タイル 1 枚が数画素なので、それは「舗装のむら」ではなく
+    // **道路が市松に塗り分けられている**ように見える。
+    const jitter = 0.93 + ((h >>> 9) % 100) / 100 * 0.14;
     const y = gy + Y_ASPHALT;
 
-    // 中央（交差点そのもの）。車が旋回するところは骨材が出て色が抜けるので、
-    // 交差点だけ一段明るい舗装色にする。上から見たときに交差点の位置が
-    // 標示に頼らず読めるようになる。
+    // 中央（交差点そのもの）。
+    //
+    // 以前はここだけ一段明るい `PAVEMENT.junction` を敷いていた（旋回で骨材が
+    // 出るという理屈）。だが標示が LOD で消える中距離になると、交差点ごとの
+    // 色差だけが残って、街に数百個の斑点が規則正しく並ぶ。
+    // 交差点の位置は横断歩道と歩道の切れ目が伝えればよく、舗装の色を
+    // 変える必要は無い。隣接する腕とまったく同じ色にする。
     this.color.setHex(conn === 0b1111 ? PAVEMENT.junction : base).multiplyScalar(jitter);
     this.place(this.asphalt, cx, y, cz, half * 2, half * 2, 0, this.color);
     this.color.setHex(base).multiplyScalar(jitter);

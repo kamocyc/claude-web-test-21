@@ -26,6 +26,7 @@ import {
   TERRAIN_HEIGHT_SCALE,
   TILE_M,
   TRAIN_CARS,
+  TRAIN_CAR_LENGTH_M,
   TRAIN_DRAW_DISTANCE_M,
   VEHICLE_DRAW_DISTANCE_M,
 } from '@shared/constants';
@@ -69,10 +70,12 @@ import {
   BUS_BODY_M,
   BUS_WIDTH_M,
   TRUCK_BODY_M,
+  TRAIN_WIDTH_M,
   TRUCK_WIDTH_M,
   busGeometry,
   busLampGeometry,
   carBeamSpec,
+  carIdleBeamSpec,
   carConeSpec,
   carGeometry,
   carHalfWidth,
@@ -120,6 +123,21 @@ const WALK_SURFACE_M = 0.38;
 
 /** これより暗くなったら灯りを点ける（`atmosphereAt().nightAmount`）。 */
 const LAMP_ON = 0.12;
+/**
+ * 点灯が全開になるまでの `nightAmount` の幅。
+ *
+ * 「夜の深さ」と「灯りの明るさ」を同じ曲線に乗せていたのが 04（18:12）で
+ * 灯りが点いていなかった原因だった。18:12 の `nightAmount` は 0.44 なので
+ * しきい値 0.12 は越えていて、灯りのインスタンスは**置かれていた**。
+ * ところが明るさが `0.28 + 0.36 × 1.32 ≒ 0.76` にしかならず、
+ * 夕方のブルームのしきい値（1.15 前後）を大きく下回るので滲まず、
+ * 露出 1.1・日射 1.35 の明るい路上では白い矩形として沈んでいた。
+ *
+ * 実際の前照灯は「だんだん明るくなる」ものではなく、点けた瞬間から一定である。
+ * 変わるのは周りの明るさとの差だけである。点灯そのものは短い幅で立ち上げ切り、
+ * 夜の深さ（車体の持ち上げ・接地影・光溜まりの濃さ）とは別の曲線に分ける。
+ */
+const LAMP_RAMP = 0.2;
 
 /**
  * 手足を持つ人の上限と、そこまでの距離 (m)。
@@ -202,13 +220,16 @@ const PARK_CHANCE_PCT: Record<number, number> = {
  * 「リンクをどこまで進めたか」しか持っていないので、同じリンクに詰まった
  * 車どうしがめり込むことがある。描画側で最後に間隔を強制する。
  */
-const MIN_HEADWAY_RATIO = 0.25;
+const MIN_HEADWAY_RATIO = 0.34;
 /**
  * 車間の下限 (m)。比率だけだと、全長 3.4m の軽で 85cm しか空かない。
  * 目線の高さで車列を真後ろから見ると、1m を切った隙間は路面が一切見えず
  * 「1 本の長い塊」に潰れてしまう。停止時の実際の車間もこのくらいある。
+ *
+ * 1.3m でも足りなかった。消失点方向に並ぶ列では車間が遠近で潰れるので、
+ * 実距離で 2m 近く空いていないと「隙間ゼロの数珠つなぎ」に見える。
  */
-const MIN_HEADWAY_M = 1.3;
+const MIN_HEADWAY_M = 2.0;
 
 /**
  * 車間を空けるために 1 台を後ろへ下げてよい最大量 (m)。
@@ -244,6 +265,16 @@ const SIZE_JITTER_Y = 0.05;
  */
 const PARK_YAW_JITTER = 0.052;
 const DRIVE_YAW_JITTER = 0.02;
+/**
+ * 走行中の車の、車線内での左右の揺らぎ (m)。±0.22m。
+ *
+ * 車間を空けても、**全車が同じ横位置に並んでいる**と、消失点方向に見た車列は
+ * 1 本の押し出し形状に潰れて「隙間ゼロの数珠つなぎ」に見えたままだった。
+ * 実際の車は車線の中でこのくらい左右にばらついていて、そのばらつきこそが
+ * 前の車の輪郭を後ろの車から切り離している。向きの揺らぎ（±0.6°）だけでは
+ * 車体 4m ぶんで 4cm しか動かず、この役には立たない。
+ */
+const DRIVE_LATERAL_JITTER = 0.44;
 
 /** 路肩の枠のうち、はじめから空けておく割合 (%)。理由は `tryShoulder` の注記に。 */
 const EMPTY_SLOT_PCT = 27;
@@ -397,6 +428,8 @@ export class AgentLayer {
   private trainLod = false;
   /** 車種ごとの光の板・円錐・尾灯の照り返しの置き方（車体の座標系での相対行列）。 */
   private readonly carBeamLocal: Matrix4[] = [];
+  /** 停まっている車の、短く弱い光溜まり（`carIdleBeamSpec` の注記）。 */
+  private readonly carIdleLocal: Matrix4[] = [];
   private readonly carConeLocal: Matrix4[] = [];
   private readonly carPoolLocal: Matrix4[] = [];
   private readonly truckBeamLocal: Matrix4;
@@ -414,6 +447,8 @@ export class AgentLayer {
    */
   private readonly beamWhite = new Color(1, 1, 1);
   private readonly beamRed = new Color(0.8, 0.11, 0.07);
+  /** 停車中の光溜まり。走行中の半分の濃さにして、路肩が光の帯にならないようにする。 */
+  private readonly beamIdle = new Color(0.5, 0.5, 0.5);
 
   /** 接地影。車も人もここに 1 枚ずつ置く（1 ドローコール）。 */
   private readonly shadows = new GroundShadows(MAX_SHADOWS);
@@ -553,6 +588,7 @@ export class AgentLayer {
         lit: 0,
       });
       this.carBeamLocal.push(beamLocal(carBeamSpec(kind)));
+      this.carIdleLocal.push(beamLocal(carIdleBeamSpec(kind)));
       this.carConeLocal.push(coneLocal(carConeSpec(kind)));
       this.carPoolLocal.push(poolLocal(carConeSpec(kind)));
     }
@@ -695,14 +731,18 @@ export class AgentLayer {
     // 灯りの明るさそのものを大気に合わせて上げ下げする。
     // 真偽値で切り替えると、日没の 1 分間に街じゅうの灯りが一斉に点いて不自然になる。
     const on = Math.max(0, Math.min(1, (this.nightAmount - LAMP_ON) / (1 - LAMP_ON)));
+    // 灯り本体だけは別の曲線。薄暮に入った時点で点け切る（`LAMP_RAMP` の注記）。
+    const lit = Math.max(0, Math.min(1, (this.nightAmount - LAMP_ON) / LAMP_RAMP));
     // **1 を超えさせる**のが肝。ブルームのしきい値は夜でも 1.03 前後にあり、
     // 灯りのジオメトリはいちばん明るい前照灯でも焼いた色が 1.0 で頭打ちなので、
     // これまで滲みを 1 度も越えていなかった（＝夜の車が「小さな白い長方形を
     // 貼った箱」にしかならなかった）。トーンマッピングを通さない材質なので、
     // ここで 1.6 まで持ち上げれば前照灯と尾灯だけが確実にブルームに拾われる。
     // 室内灯は焼いた色が暗い（0x6a5230）ので、持ち上げてもしきい値は越えない。
-    for (const m of this.lampMaterials) m.color.setScalar(0.28 + on * 1.32);
-    this.beamMaterial.opacity = on * 0.3;
+    for (const m of this.lampMaterials) m.color.setScalar(0.28 + lit * 1.36);
+    // 路面の光と空中の円錐は「夜の深さ」側。夕方の明るい路面に光溜まりが
+    // 乗ると、点いていない街灯の下まで濡れたように光ってしまう。
+    this.beamMaterial.opacity = on * 0.34;
     this.coneMaterial.opacity = on * 0.1;
     // 夜の車体・人が真っ黒なシルエットに潰れるのを、街灯を拾っている想定の
     // 弱い自発光で戻す。灯りの点灯と同じカーブに乗せて、夕方に段が出ないようにする。
@@ -973,14 +1013,21 @@ export class AgentLayer {
 
     // 足元の接地影。人が浮いて見えるのは、影マップの解像度と normalBias で
     // 必ず抜ける「足元の数十 cm」が空いているせい。
+    //
+    // 大きさが命。前は肩幅 ×1.3（＝差し渡し 55cm）しか敷いていなかったが、
+    // 人の胴と靴もちょうどそのくらいの幅がある。**板が体の真下に完全に
+    // 隠れてしまい、1 枚も置いていないのと同じ絵になっていた**
+    //（車の影が効いて人の影が効かなかったのはこの一点の違い）。
+    // 外周のアルファは 0 まで落ちるので、靴の外へ十分はみ出す大きさに取って
+    // 初めて「足元が路面に付いている」と読める。強さも車と揃える。
     this.shadows.add(
       x,
       y + 0.02,
       z,
       heading,
-      PED_SHOULDER_M * 1.3 * sxz,
-      PED_SHOULDER_M * 1.7 * sxz,
-      this.shadowStrength(d2) * 0.85,
+      PED_SHOULDER_M * 2.15 * sxz,
+      PED_SHOULDER_M * 2.5 * sxz,
+      this.shadowStrength(d2),
     );
 
     if (near && this.animCount < MAX_ANIMATED_PEDS) {
@@ -1061,6 +1108,22 @@ export class AgentLayer {
       this.cones.setMatrixAt(this.coneCount, this.mat2);
       this.coneCount++;
     }
+  }
+
+  /**
+   * 停まっている車の、短く弱い光溜まりを 1 枚。
+   *
+   * 走行中の 3 つ 1 組（前・尾灯・円錐）と違って板 1 枚だけにする。
+   * 停車中の車は路肩に密に並ぶので、円錐まで置くと路肩全体が霧の帯になり、
+   * 尾灯の照り返しまで置くと今度は後ろの車の光溜まりと重なる。
+   * `this.mat` に車体の行列が入っている状態で呼ぶこと。
+   */
+  private addIdleBeam(local: Matrix4): void {
+    if (this.nightAmount <= LAMP_ON || this.beamCount >= MAX_VISIBLE_VEHICLES) return;
+    this.mat2.multiplyMatrices(this.mat, local);
+    this.beams.setMatrixAt(this.beamCount, this.mat2);
+    this.beams.setColorAt(this.beamCount, this.beamIdle);
+    this.beamCount++;
   }
 
   /**
@@ -1174,10 +1237,13 @@ export class AgentLayer {
       // 停める側は車ごとのハッシュで選び、埋まっていれば反対側へ回る。
       // 走行車両が来ている車線には置かない（重なって 1 台が 2 台に割れて見える）。
       const want = hash & 0x10000 ? 1 : -1;
+      // 通りの向きは枠を取る前に要る（連なりを断ち切る判定に使う）。
+      const conn = sim.world.roadConn(access);
+      const alongZ = (conn & 0b0101) !== 0 || conn === 0;
       let side = 0;
       for (const cand of [want, -want] as const) {
         if (this.busy.has(access * 2 + (cand > 0 ? 1 : 0))) continue;
-        if (this.tryShoulder(access, cand)) {
+        if (this.tryShoulder(access, cand, alongZ)) {
           side = cand;
           break;
         }
@@ -1188,8 +1254,6 @@ export class AgentLayer {
       const fleet = this.cars[kind]!;
       if (fleet.count >= MAX_VISIBLE_VEHICLES) continue;
 
-      const conn = sim.world.roadConn(access);
-      const alongZ = (conn & 0b0101) !== 0 || conn === 0;
       this.placeParked(sim, access, wx, wz, alongZ, side, sim.world.road[access]!, kind, hash, d2);
     }
   }
@@ -1200,11 +1264,29 @@ export class AgentLayer {
    * **1 タイル 1 側につき 1 台まで**にするのが要点。タイルは 10m しかないので、
    * 2 台入れると必ず車間が 1m を切り、タイル境界をまたぐ組はさらに詰まる。
    * 「消失点まで隙間なく一列、しかも互いに貫入」の正体はここだった。
+   *
+   * @param alongZ 通りが Z 方向に走っているか。連なりを断ち切るのに使う。
    */
-  private tryShoulder(tile: number, side: number): boolean {
+  private tryShoulder(tile: number, side: number, alongZ: boolean): boolean {
     const used = this.parkSlots.get(tile) ?? 0;
     const bit = side > 0 ? 2 : 1;
     if (used & bit) return false;
+    // **必ず 3 台で列を断ち切る。**
+    //
+    // 下の 27% は独立な抽選なので、確率的には 4 台に 1 台空くが、
+    // 逆に言えば 6 台続けて埋まることが 15% の頻度で起きる。目線の高さで
+    // 車列を真後ろから見ると、6 台の連なりは車間 2m が全部潰れて
+    // 1 本の塊に見える（夜の右車線に残っていた数珠つなぎがこれ）。
+    // 通りに沿った 4 タイルに 1 つを問答無用で空け、位相は
+    // 「通り × 左右」ごとにハッシュで決める。こうすると連なりは
+    // 必ず 3 台以内に切れ、しかも切れ目の位置は通りごとに違う。
+    const along = alongZ ? tileY(tile) : tileX(tile);
+    const across = alongZ ? tileX(tile) : tileY(tile);
+    const phase = tileHash(across * 2 + (side > 0 ? 1 : 0), alongZ ? 41 : 42) % 4;
+    if ((along + phase) % 4 === 0) {
+      this.parkSlots.set(tile, used | bit);
+      return false;
+    }
     // **枠のうち一定割合は最初から潰しておく。**
     //
     // 1 タイル 1 側 1 台にしても、市街地では自宅と職場の車で枠がほぼ全部埋まる。
@@ -1265,10 +1347,13 @@ export class AgentLayer {
     fleet.count++;
     this.addVehicleShadow(yaw, carHalfWidth(kind) * 2, carLength(kind), d2);
     // 夜は一部だけ灯りを点ける（`PARKED_LIT_PCT` の理由はそちらの注記に）。
-    // 路面への光は付けない。停まっている車の光溜まりが重なると、
-    // 路肩が一本の光の帯になってしまう。
+    // 灯した車には路面の光溜まりも必ず付ける。**灯りだけ点けて前が暗い**のが
+    // 「白い矩形を 2 つ貼った箱」の正体で、夜のカットに映る車の大半は
+    // 走行中ではなくこちらなので、ここに無いと街路のどこにも光溜まりが出ない。
+    // 隣と繋がらないよう、板は走行中の 1/3 の長さ・半分の濃さにしてある。
     if (this.nightAmount > LAMP_ON && (hash >>> 3) % 100 < PARKED_LIT_PCT) {
       this.addLamps(fleet, MAX_VISIBLE_VEHICLES);
+      this.addIdleBeam(this.carIdleLocal[kind]!);
     }
     this.clearVehicleScale();
   }
@@ -1353,7 +1438,7 @@ export class AgentLayer {
       if (h % 100 >= chance) continue;
       // **駐車枠はシミュレーション由来の駐車車両と共有する。**
       // 別々に置き場所を決めると、同じ路肩に 2 台が重なって 1 台が 2 台に割れる。
-      if (!this.tryShoulder(tile, side)) continue;
+      if (!this.tryShoulder(tile, side, alongZ)) continue;
       if (this.busy.has(tile * 2 + (side > 0 ? 1 : 0))) continue;
       const hash = (h >>> 3) ^ Math.imul(tile, 0x27d4eb2d);
       const kind = this.pickCarKind(hash);
@@ -1470,6 +1555,20 @@ export class AgentLayer {
           fleet.body.setMatrixAt(fleet.count, this.mat);
           this.color.setHex(TRAIN_BODY_COLOR);
           fleet.body.setColorAt(fleet.count, this.color);
+          // 電車にも足元の影を敷く。車と人だけ敷いていると、線路の上の車両だけが
+          // バラストから浮いて見える（影マップが抜けるのは車幅の物でも同じ）。
+          // 高さは車の流儀（車体の原点）ではなく**枕木の上面**に合わせる。
+          // 車両の原点はレール面（枕木の 14cm 上）なので、そのまま敷くと
+          // 影の板だけが道床から浮いた位置で切り立つ。
+          this.shadows.add(
+            this.railPose.x,
+            this.pos.y - 0.12,
+            this.railPose.z,
+            this.railPose.heading,
+            TRAIN_WIDTH_M,
+            TRAIN_CAR_LENGTH_M * 0.92,
+            this.shadowStrength(dx * dx + dz * dz),
+          );
           this.addLamps(fleet, MAX_VISIBLE_TRAIN_CARS);
           // 前照灯は「編成の先頭かどうか」で決める。畳んだときも点いたままにする。
           if (carIdx === 0) this.addBeam(this.trainBeamLocal, this.trainConeLocal, this.trainPoolLocal);
@@ -1627,9 +1726,14 @@ export class AgentLayer {
         // 消失点まで伸びる列が 1 本の定規に見える。
         + (((v * 2654435761) >>> 20) % 32) / 32 * DRIVE_YAW_JITTER - DRIVE_YAW_JITTER / 2;
       this.quat.setFromAxisAngle(this.axisY, heading);
-      // 左側通行。対向車が別の車線を流れる
-      const ox = this.laneOffsetX(heading, LANE_OFFSET_M);
-      const oz = this.laneOffsetZ(heading, LANE_OFFSET_M);
+      // 左側通行。対向車が別の車線を流れる。
+      // 横位置は車ごとに少し散らす（`DRIVE_LATERAL_JITTER` の注記）。
+      const lane =
+        LANE_OFFSET_M +
+        (((v * 2654435761) >>> 12) % 64) / 64 * DRIVE_LATERAL_JITTER -
+        DRIVE_LATERAL_JITTER / 2;
+      const ox = this.laneOffsetX(heading, lane);
+      const oz = this.laneOffsetZ(heading, lane);
       this.pos.set(px + ox, this.groundAt(sim, px + ox, pz + oz) + ROAD_SURFACE_M, pz + oz);
       const owner = tr.owner[v]!;
       // 寸法を数 % 振る。とくにトラックは形が 1 種類しか無いので、

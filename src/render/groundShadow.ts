@@ -2,6 +2,7 @@ import {
   BufferAttribute,
   BufferGeometry,
   Color,
+  DoubleSide,
   InstancedMesh,
   Matrix4,
   MeshBasicMaterial,
@@ -56,13 +57,22 @@ function shadowGeometry(): BufferGeometry {
     col.push(1, 1, 1, 1);
     nor.push(0, 1, 0);
   };
-  // 三角形の頂点は **k+1 → k の順**に積む。
+  // 巻き方向は **面ごとに** 検算して積む。
   //
   // 板は XZ 平面に寝ているので、角度の増える向き（cos t, 0, sin t）に
-  // 並べると (v1-v0)×(v2-v0) が **-Y** を向く。WebGL の表裏は法線属性ではなく
-  // 巻き方向で決まるので、素直に積むと影の板は全部「裏向き」になり、
-  // 既定の `FrontSide` では 1 枚残らず背面カリングで消える
-  // （置いた数だけ行列は書いているのに、画面には一切出ない）。
+  // 素直に並べると (v1-v0)×(v2-v0) が **-Y** を向く。WebGL の表裏は法線属性
+  // ではなく巻き方向で決まるので、裏向きに積んだ面は既定の `FrontSide` では
+  // 背面カリングで 1 枚残らず消える（行列は書いているのに画面に出ない）。
+  //
+  // 前回ここを直したとき、**中心の扇だけ**を直して外周のリングを直し忘れた。
+  // その結果、残っていたのは半径 0.28 のハードエッジの円板だけで、
+  //
+  //   - 車 … 円板が車体幅の半分ほどあるので、車体の外へ出て影として読めた
+  //   - 人 … 円板の差し渡しが 15cm しかなく、**靴と胴の真下に完全に隠れた**
+  //
+  // ということが起きていた。「車には付いたが人には 1 枚も無い」の正体はこれで、
+  // 板を大きくするだけでは直らない（ぼかしのリングごと消えているため）。
+  // リングは (内 k → 外 k → 外 k+1) と (内 k → 外 k+1 → 内 k+1) が表向き。
   for (let k = 0; k < SEGMENTS; k++) {
     // 中心 → 内側リング
     center();
@@ -70,11 +80,11 @@ function shadowGeometry(): BufferGeometry {
     push(INNER_R, INNER_A, k);
     // 内側リング → 外周（外周のアルファ 0 でぼかす）
     push(INNER_R, INNER_A, k);
-    push(1, 0, k + 1);
     push(1, 0, k);
-    push(INNER_R, INNER_A, k);
-    push(INNER_R, INNER_A, k + 1);
     push(1, 0, k + 1);
+    push(INNER_R, INNER_A, k);
+    push(1, 0, k + 1);
+    push(INNER_R, INNER_A, k + 1);
   }
   const g = new BufferGeometry();
   g.setAttribute('position', new BufferAttribute(new Float32Array(pos), 3));
@@ -106,6 +116,10 @@ export class GroundShadows {
       transparent: true,
       // 路面に寝かせる板なので、深度は書かない（後ろの車体が消える）。
       depthWrite: false,
+      // 表裏どちらからでも描く。巻き方向を 1 か所間違えるだけで影が全滅する
+      // （実際に一度そうなった）事故を、材質の側でも起こらないようにしておく。
+      // 坂の上の車を下から見上げる画でも、板が消えずに残る。
+      side: DoubleSide,
       toneMapped: false,
       opacity: 0.5,
     });
