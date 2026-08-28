@@ -8,8 +8,9 @@
  * グラフィックの良し悪しは数字では測れないので、実際に絵を見て直すための足場。
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, cpSync, symlinkSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { execSync } from 'node:child_process';
 
@@ -42,13 +43,33 @@ const SHOTS = [
   { name: '08-eyelevel-night', dist: 118, azim: 0.02, elev: 6.5, hour: 20.5 },
 ];
 
+/**
+ * ソースを一時ディレクトリへ複製してから dev サーバを立てる。
+ *
+ * 撮影中に誰かがソースを触ると vite の HMR がページを読み込み直し、
+ * その時点で window.__game が消えて撮影が落ちる（複数人で同時に
+ * 作業していると必ず起きる）。複製の上で撮れば、撮影は今のソースの
+ * スナップショットに対して最後まで走る。
+ */
+function isolateSources() {
+  const dir = mkdtempSync(join(tmpdir(), 'shot-'));
+  for (const entry of ['src', 'index.html', 'package.json', 'tsconfig.json', 'vite.config.ts']) {
+    if (existsSync(entry)) cpSync(entry, join(dir, entry), { recursive: true });
+  }
+  // node_modules は複製すると重いのでリンクで済ませる
+  symlinkSync(resolve('node_modules'), join(dir, 'node_modules'), 'dir');
+  return dir;
+}
+
+const workDir = process.env.SHOT_NO_ISOLATE ? process.cwd() : isolateSources();
+
 // すでに立っている dev サーバがあれば使い回す（撮影のたびに 1 秒待たない）
 let server = null;
 let serverLog = '';
 const alreadyUp = await fetch(`http://localhost:${port}/`).then((r) => r.ok).catch(() => false);
 if (!alreadyUp) {
   server = spawn(process.execPath, [resolve('node_modules/vite/bin/vite.js'), '--port', String(port), '--strictPort'], {
-    cwd: process.cwd(),
+    cwd: workDir,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   });
@@ -141,4 +162,5 @@ try {
 } finally {
   if (browser) await browser.close();
   if (server) server.kill('SIGTERM');
+  if (workDir !== process.cwd()) rmSync(workDir, { recursive: true, force: true });
 }
