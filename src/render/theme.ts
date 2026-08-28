@@ -214,7 +214,7 @@ const RC_WALLS = [
   0xd2ccc0, 0xaeb6b8, 0xc0b09a, 0xd6d0c4, 0xa4a09a, 0xbec6c6, 0xcab89e, 0xb0a08e,
   // 濃いタイル貼り。明るいコンクリートばかりだと、中層の街区が
   // 「淡青灰とクリームの 2 色」に見えてしまう。
-  0x8f8b82, 0x7f8a90, 0x9a8a76, 0x8a9490,
+  0x8f8b82, 0x7f8a90, 0x9a8a76, 0x8e8c88,
 ];
 
 export const MESH_STYLES: Record<string, MeshStyle> = {
