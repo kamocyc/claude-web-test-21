@@ -329,32 +329,50 @@ export class Renderer {
     // 太陽（夜は月）。注視点を基準に置くことで、影の解像度を街の見えている
     // 範囲に集中させる。マップ全体を 1 枚の影マップで覆うと 1 タイルあたり
     // 数ピクセルしか無くなり、影がただのギザギザになる。
-    const dist = 1200;
+    // 光源までの距離は影の範囲に追随させる。固定 1200m のままだと、
+    // 引いたときに手前の建物が正射影の near より手前に来て、
+    // その建物だけ影を落とさなくなる。
+    const sunDistance = Math.max(1200, this.rig.distance * 2.2);
     this.sun.position.set(
-      this.rig.target.x + this.sunDir.x * dist,
-      this.rig.target.y + this.sunDir.y * dist,
-      this.rig.target.z + this.sunDir.z * dist,
+      this.rig.target.x + this.sunDir.x * sunDistance,
+      this.rig.target.y + this.sunDir.y * sunDistance,
+      this.rig.target.z + this.sunDir.z * sunDistance,
     );
     this.sun.target.position.copy(this.rig.target);
     this.sun.target.updateMatrixWorld();
     this.sun.color.copy(atmo.sunColor);
     this.sun.intensity = atmo.sunIntensity;
 
-    // 影の範囲はカメラの引き具合に合わせる。寄っているときは狭く鋭く、
-    // 引いているときは広く（そのぶん粗く）。
-    const span = Math.max(140, Math.min(1500, this.rig.distance * 1.15));
+    // 影の範囲はカメラの引き具合に合わせる。
+    //
+    // 以前は「距離 1600 を超えたら影を切る」ことにしていたが、俯瞰こそ
+    // 落ち影で街区のリズムが出るカットで、そこに影が 1 本も無いのが
+    // いちばん大きな減点だった。粗い影でも、無いよりはるかに良い。
+    // そこで、引いたら影マップを 4096 に上げて範囲を広げ、
+    // 日が出ているあいだは切らないことにした。
+    const span = Math.max(110, Math.min(2200, this.rig.distance * 0.95));
+    const wantSize = this.rig.distance > 420 ? 4096 : 2048;
+    if (this.sun.shadow.mapSize.width !== wantSize) {
+      this.sun.shadow.mapSize.set(wantSize, wantSize);
+      // 解像度を変えたら、確保済みのデプステクスチャは作り直させる
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+    }
     const cam = this.sun.shadow.camera;
     if (cam.right !== span) {
       cam.left = -span;
       cam.right = span;
       cam.top = span;
       cam.bottom = -span;
-      cam.near = 200;
-      cam.far = 2600;
+      cam.near = 50;
+      cam.far = sunDistance + span * 2.5;
       cam.updateProjectionMatrix();
+      // テクセルが粗いほど深度の食い違いが大きくなるので、
+      // 押し出し量も範囲に比例させる。固定値だと、引いたときに
+      // 壁と地面の境目に細い光の筋（peter-panning の裏返し）が出る。
+      this.sun.shadow.normalBias = Math.max(0.5, (span * 2) / wantSize * 2.2);
     }
-    // 影が届かないほど引いたら、影自体を切る（描く意味が無いうえに重い）
-    this.sun.castShadow = this.rig.distance < 1600 && atmo.sunIntensity > 0.2;
+    this.sun.castShadow = atmo.sunIntensity > 0.2;
 
     this.hemi.color.copy(atmo.skyLight);
     this.hemi.groundColor.copy(atmo.groundLight);
