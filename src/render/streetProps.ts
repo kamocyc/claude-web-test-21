@@ -11,7 +11,7 @@ import {
   Vector3,
 } from 'three';
 import { applyVerticalAO, mergeParts, type Part } from './materials';
-import { CURB_COLOR, GUTTER_COLOR, WALKWAY_COLOR } from './groundPalette';
+import { CURB_COLOR, GUTTER_APRON_COLOR, GUTTER_COLOR, WALKWAY_COLOR } from './groundPalette';
 
 /**
  * 街路の小物。
@@ -230,13 +230,19 @@ export function busStopGeometry(): BufferGeometry {
  */
 export function walkwaySectionGeometry(): BufferGeometry {
   const parts: Part[] = [
-    // 平板（本体）。上面がわずかに内側へ傾いていると水が流れそうに見えるが、
-    // 1 タイル 10m ではその傾きは 1px にもならないので平らでよい。
-    { geom: box(0.86, 1, 1), color: WALKWAY_COLOR, matrix: at(0.07, 0, 0) },
-    // 縁石（車道側の 1 本）。歩道より明るく、上端に光が乗る。
-    { geom: box(0.14, 1.06, 1), color: CURB_COLOR, matrix: at(-0.43, 0, 0) },
-    // 側溝の蓋。縁石のさらに車道側に、暗い帯として出す。
-    { geom: box(0.13, 0.42, 1), color: GUTTER_COLOR, matrix: at(-0.56, 0, 0) },
+    // --- 車道側から順に ---
+    // (1) L 型側溝の平部。車道と同じ高さから 5cm ほど立ち上がるコンクリート。
+    //     ここが 1 段目。以前は「暗い帯（グレーチング）」を 1 枚置いただけで、
+    //     断面が縁石の 1 段しか無く、遠目には板を置いたのと変わらなかった。
+    { geom: box(0.3, 0.26, 1), color: GUTTER_APRON_COLOR, matrix: at(-0.62, 0, 0) },
+    // (2) 側溝の目地。1 段目と縁石の間に走る細い暗がり。
+    //     この線 1 本があるだけで、断面が「2 段」に読めるようになる。
+    { geom: box(0.07, 0.3, 1), color: GUTTER_COLOR, matrix: at(-0.475, 0, 0) },
+    // (3) 縁石。2 段目。車道側の面が日陰になり、上端に光の線が乗る。
+    { geom: box(0.16, 1.06, 1), color: CURB_COLOR, matrix: at(-0.37, 0, 0) },
+    // (4) 歩道の平板。縁石の上端より 4cm 低い。ここに段差があると、
+    //     縁石が「歩道と一体の板」ではなく別の部材に見える。
+    { geom: box(0.72, 0.96, 1), color: WALKWAY_COLOR, matrix: at(0.14, 0, 0) },
   ];
   return applyVerticalAO(mergeParts(parts), 0.55, 1.05, 1.2);
 }
@@ -274,9 +280,14 @@ export function lightPoolTexture(size = 64): DataTexture {
       const dx = (x - c) / c;
       const dy = (y - c) / c;
       const r = Math.sqrt(dx * dx + dy * dy);
-      // 中心の平坦部 + 外側のなだらかな裾。裾が短いと「丸いシール」になる。
+      // 中心が明るく、外へ急に落ちる。
+      //
+      // 以前は裾を長く引いていた（`a*a*(0.45+0.55*a)`）。裾が長いと隣の街灯の
+      // 光と足し合わさって、街路が「切れ目のない発光する帯」になる。
+      // 実際の街灯は灯具の真下がいちばん明るく、10m も離れれば目に見えて暗い。
+      // 4 乗に近い落ち方にすると、灯の下だけが明るいプールになる。
       const a = Math.max(0, 1 - r);
-      const v2 = a * a * (0.45 + 0.55 * a);
+      const v2 = a * a * (0.18 + 0.82 * a * a);
       const i = (y * size + x) * 4;
       data[i] = 255;
       data[i + 1] = 255;

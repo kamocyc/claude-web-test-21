@@ -12,7 +12,7 @@ import {
   Quaternion,
   Vector3,
 } from 'three';
-import { chamferedUnitBox, mergeParts, place, tintGeometry, type Part } from './materials';
+import { applyVerticalAO, chamferedUnitBox, mergeParts, place, tintGeometry, type Part } from './materials';
 
 /**
  * 建物の部品キットと、立面（ファサード）を描くための材質。
@@ -66,6 +66,50 @@ export const Facade = {
    * 文字が回り込んで、縁が色付いて見えてしまう。
    */
   SignBlade: 8,
+  /**
+   * 1 階の店構え（frontage キット）。
+   * p1=種別（0 商業/1 事務所エントランス/2 住宅ポーチ/3 シャッター/4 雑居ビルの入口）,
+   * p2=テナント 1 区画の間口 (m), p3=種。
+   *
+   * 目線の高さで街が「歩ける街」に見えるかどうかは、上階の窓ではなく
+   * ここ 1 層で決まる。壁と同じ窓帯を 1 階にも流していたのが、
+   * 前回いちばん大きな減点だった。
+   */
+  Front: 9,
+} as const;
+
+/**
+ * 店構えキットの部品 ID。焼き込んだ頂点カラーの R をそのまま識別子に使う。
+ *
+ * `new Color(0xcccccc)` は sRGB → 作業色空間の変換が掛かって 0.8 にならないので、
+ * 必ず `setRGB`（既定で作業色空間＝線形）で作る。ここがずれると
+ * シェーダの分岐が 1 つ手前にずれ、庇が看板帯として描かれる。
+ */
+const FRONT_ID = {
+  /** 開口面（ガラス・扉・シャッター）。 */
+  panel: new Color().setRGB(1.0, 1.0, 1.0),
+  /** 庇。 */
+  canopy: new Color().setRGB(0.8, 0.8, 0.8),
+  /** 端の柱。 */
+  pier: new Color().setRGB(0.6, 0.6, 0.6),
+  /** 庇の前縁の看板帯。 */
+  fascia: new Color().setRGB(0.4, 0.4, 0.4),
+  /** 腰の見切り・沓摺。 */
+  base: new Color().setRGB(0.2, 0.2, 0.2),
+};
+
+/** 1 階の店構えの種別。`frontage()` に渡す。 */
+export const FrontKind = {
+  /** 商業：全面ガラスのショップフロントと庇。 */
+  Shop: 0,
+  /** 事務所：エントランスホールとキャノピー。 */
+  Office: 1,
+  /** 住宅：玄関ポーチ。 */
+  Porch: 2,
+  /** 工場・倉庫：シャッターと搬入口。 */
+  Shutter: 3,
+  /** 雑居ビル：テナント看板の並ぶ入口。 */
+  Tenant: 4,
 } as const;
 
 /** これより小さい部品は、上下の面取りを省いた軽い箱で描く (m)。 */
@@ -76,9 +120,24 @@ const CHAMFER_M = 0.11;
 /** 単位ボックスを作るときの面取り比。頂点の判別に使うのでシェーダと共有する。 */
 const CHAMFER_U = 0.06;
 
-/** 材質共有のためのユニフォーム。時刻で動くのは夜の量だけ。 */
+/**
+ * 材質共有のためのユニフォーム。
+ *
+ * 夜の量に加えて、空の色と太陽の向きを配る。
+ * ガラスの映り込みを環境マップ任せにしていたが、あれは屋外の平均輝度を
+ * 返すだけで、窓を 2 倍に拡大しても「一様なグレーブルーの平板」にしかならない。
+ * 空色を直接受け取って `reflect()` で引けば、同じコストで
+ * 「上半分に空、下半分に向かいの建物」が映るガラスになる。
+ */
 const uniforms = {
   uNight: { value: 0 },
+  /** 天頂色・地平色・地上（向かいの建物と路面）の色。 */
+  uSkyZenith: { value: new Color(0x2a68b8) },
+  uSkyHorizon: { value: new Color(0xcadbe8) },
+  uSkyGround: { value: new Color(0x2a2a28) },
+  /** 太陽の向き（ワールド・正規化済み）と、映り込みに載せる日射色。 */
+  uSunDir: { value: new Vector3(0.4, 0.7, 0.55) },
+  uSunTint: { value: new Color(0xfff6e8) },
 };
 
 const materials: MeshStandardMaterial[] = [];
@@ -91,6 +150,8 @@ varying vec3 vScaleM;
 varying vec4 vFacadeV;
 varying float vViewDepth;
 varying vec3 vPartTint;
+varying vec3 vWorldPos;
+varying vec3 vWorldN;
 `;
 
 const VERT_BEGIN = /* glsl */ `
@@ -125,22 +186,80 @@ vFacadeV = aFacade;
 #else
   vPartTint = vec3(1.0);
 #endif
+// フェイク反射のためのワールド座標と法線。
+// 法線はインスタンスのスケールで割ってから回す（逆転置行列の対角版）。
+// 割らずに回すと、縦に引き伸ばした壁の法線が上を向いて、
+// 壁全面が空を映してしまう。
+vec4 wPos = vec4(pLocal, 1.0);
+vec3 objN = normal / max(iScale, vec3(1e-4));
+vec4 wNrm = vec4(objN, 0.0);
+#ifdef USE_INSTANCING
+  wPos = instanceMatrix * wPos;
+  wNrm = instanceMatrix * wNrm;
+#endif
+vWorldPos = (modelMatrix * wPos).xyz;
+vWorldN = normalize((modelMatrix * wNrm).xyz);
 `;
 
 const FRAG_PARS = /* glsl */ `
 uniform float uNight;
+uniform vec3 uSkyZenith;
+uniform vec3 uSkyHorizon;
+uniform vec3 uSkyGround;
+uniform vec3 uSunDir;
+uniform vec3 uSunTint;
 varying vec3 vLocalM;
 varying vec3 vObjN;
 varying vec3 vScaleM;
 varying vec4 vFacadeV;
 varying float vViewDepth;
 varying vec3 vPartTint;
+varying vec3 vWorldPos;
+varying vec3 vWorldN;
 
 vec3 gTint; float gRough; float gMetal; vec3 gEmis;
 /** 環境マップの映り込みの倍率。窓だけ強くして「空を映すガラス」にする。 */
 float gEnv;
 /** その画素が窓かどうか 0..1。法線を少し上に倒して映り込みを壁と分ける。 */
 float gWin;
+/** フェイク反射で足す色。ガラスの証明はこれ 1 本にかかっている。 */
+vec3 gRefl;
+
+/**
+ * 反射方向から空の色を引く。
+ *
+ * 環境マップは「その場の平均的な明るさ」しか返さないので、窓を拡大しても
+ * 一様な板にしかならなかった。ここでは反射ベクトルの Y だけを見て
+ * 地平 → 天頂を引き、地平より下は向かいの建物と路面の色にする。
+ * これだけで、1 枚の窓の中に「上は空、下は街」という縦の勾配が入り、
+ * 見上げた窓と見下ろした窓で色が変わる。
+ */
+vec3 fakeSky(vec3 R) {
+  float t = R.y;
+  vec3 sky = mix(uSkyHorizon, uSkyZenith, smoothstep(0.0, 0.62, t));
+  // 地平のすぐ下は「向かいの建物の日の当たった上半分」なので、実際にはかなり明るい。
+  // ここを黒に寄せると、見下ろした窓がすべて黒い板になって元に戻ってしまう。
+  vec3 grd = mix(uSkyGround, uSkyHorizon, smoothstep(-0.55, -0.01, t));
+  vec3 c = (t > 0.0) ? sky : grd;
+  // 太陽のギラつき。窓が 1 枚だけ白く光る瞬間があると、一気にガラスになる。
+  float s = max(dot(R, uSunDir), 0.0);
+  c += uSunTint * pow(s, 180.0) * 2.6;
+  // 雲の帯。反射の中に低周波のむらが 1 つ入るだけで「塗った青」から抜ける。
+  c *= 1.0 + 0.16 * sin(R.x * 7.0 + R.z * 5.0) * smoothstep(0.05, 0.5, t);
+  return c;
+}
+
+/**
+ * フレネル項。視線と面がなす角が浅いほど強い。
+ * 街路に立って両側のビルを見ると、壁はほとんど真横 ＝ 深いグレージング角なので、
+ * この項が効くかどうかで「ガラス張りのビルの並ぶ通り」に見えるかが決まる。
+ */
+float fresnelAt(vec3 V, vec3 N) {
+  // 指数は物理値（5）より寝かせてある。ガラスの反射率は 45 度でまだ 5% しかなく、
+  // 物理どおりに落とすと、街を歩く距離で見る窓がほとんど反射しない＝板に戻る。
+  // 絵として「ガラスに見える」ことを優先して、立ち上がりを早くしてある。
+  return pow(1.0 - clamp(dot(-V, N), 0.0, 1.0), 2.6);
+}
 
 float h21(vec2 p) {
   vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
@@ -215,9 +334,290 @@ float signGlyphs(vec2 p, float n, float sd, float aa) {
   return ink;
 }
 
+
+/**
+ * 看板・日除け・テナント表示のアクセント色。
+ * 原色のべた塗りではなく、白地に載る色として選んである（看板キットと同じ考え方）。
+ */
+vec3 accentOf(float h) {
+  return h < 0.17 ? vec3(0.72, 0.26, 0.22)
+       : h < 0.34 ? vec3(0.78, 0.52, 0.16)
+       : h < 0.50 ? vec3(0.17, 0.42, 0.64)
+       : h < 0.66 ? vec3(0.28, 0.46, 0.28)
+       : h < 0.83 ? vec3(0.40, 0.30, 0.54)
+                  : vec3(0.16, 0.54, 0.40);
+}
+
+/**
+ * 1 階の店構え（frontage キット）を描く。
+ *
+ * 部品の種別は焼き込んだ頂点カラーの R で持つ
+ * （1.0 開口面 / 0.8 庇 / 0.6 柱 / 0.4 看板帯 / 0.2 腰見切り）。
+ * vColor はインスタンス色が掛かった後の値なので使えない。
+ *
+ * 用途ごとに 1 階の表情を変えるのが目的なので、分岐は種別ごとに素直に書く。
+ * ここは目線の高さで画面のいちばん手前に来る 1 層で、
+ * 上階の窓 100 個より 1 階の 1 枚のガラスの方が絵に効く。
+ */
+void frontShade(vec3 base) {
+  float kind = vFacadeV.y;
+  float bayW = max(vFacadeV.z, 1.6);
+  float sd = vFacadeV.w;
+  float id = vPartTint.r;
+  vec3 n = vObjN;
+  float ax = abs(n.x), ay = abs(n.y), az = abs(n.z);
+  float pw = max(vScaleM.x, 0.1);
+  float ph = max(vScaleM.y, 0.1);
+  float u = vLocalM.x;
+  float py = vLocalM.y;
+  float yn = clamp(py / ph, 0.0, 1.0);
+
+  gTint = vec3(1.0); gRough = 0.86; gMetal = 0.05; gEmis = vec3(0.0);
+  gEnv = 1.0; gWin = 0.0; gRefl = vec3(0.0);
+
+  // テナントの割付。間口ごとに独立した乱数を引く。
+  float t = (u + pw * 0.5) / bayW;
+  float ti = floor(t);
+  float tf = fract(t);
+  float ha = h21(vec2(ti, 3.0) + sd * 41.0);
+  float hb = h21(vec2(ti, 17.0) + sd * 41.0);
+  float hc = h21(vec2(ti, 29.0) + sd * 41.0);
+  vec3 accent = accentOf(ha);
+  // 2 割ほどの区画は閉まっている。全部が同じだけ光ると「光る帯」に戻る。
+  float closed = step(0.79, hc) * step(kind, 0.5);
+
+  // ---- 庇 ----
+  if (id > 0.7 && id < 0.9) {
+    float under = step(n.y, -0.5);
+    // 下面は必ず暗い。庇は、この落ち影を作るために付けている。
+    gTint = vec3(mix(1.04, 0.30, under));
+    gRough = 0.80; gMetal = 0.06;
+    // 庇の下の帯照明。夜の歩道の足元がここで読める。
+    gEmis = vec3(1.0, 0.94, 0.82) * under * uNight * 0.34 * (1.0 - closed * 0.85)
+          * step(kind, 0.5);
+    return;
+  }
+  // ---- 看板帯（庇の前縁）----
+  if (id > 0.3 && id < 0.5) {
+    gRough = 0.5; gMetal = 0.05;
+    float faceOut = step(0.55, az);
+    // 帯の中の縦位置（キットで y=0.78..0.95 に焼いてある）
+    float fv = clamp((yn - 0.78) / 0.17, 0.0, 1.0);
+    vec2 p = vec2(fv, tf);
+    float aa = max(fwidth(p.x), fwidth(p.y)) * 0.9 + 0.008;
+    float fade = smoothstep(40.0, 95.0, vViewDepth);
+    float ink = mix(signGlyphs(p, 4.0, sd + ti * 0.37, aa), 0.28, fade) * faceOut;
+    vec3 plate = mix(vec3(0.90, 0.89, 0.85), accent, ink);
+    // 事務所・住宅の 1 階には店名の看板は出ない。無地のアルミの帯にする。
+    plate = mix(vec3(0.62, 0.63, 0.62), plate, step(kind, 0.5) + step(3.5, kind));
+    gTint = plate / max(base, vec3(0.02));
+    gEmis = plate * faceOut * (0.05 + uNight * 0.95 * (1.0 - closed * 0.9))
+          * (step(kind, 0.5) + step(3.5, kind));
+    return;
+  }
+  // ---- 腰の見切り（御影石・タイル）----
+  if (id < 0.3) {
+    gTint = vec3(0.34) / max(base, vec3(0.02));
+    gRough = 0.55; gMetal = 0.12;
+    return;
+  }
+  // ---- 端の柱 ----
+  if (id < 0.7) {
+    // 目地を 1 本入れて、塗った板ではなくタイル貼りの柱に見せる。
+    float joint = bandAA(fract(py / 0.6), 0.0, 0.06, fwidth(py / 0.6));
+    gTint = vec3(0.90 - joint * 0.14) * mix(0.72, 1.0, yn);
+    gRough = 0.8; gMetal = 0.05;
+    return;
+  }
+
+  // ---- 開口面（ここが 1 階の表情そのもの）----
+  bool faceOut = az > max(ax, ay) && n.z > 0.0;
+  if (!faceOut) {
+    // 板の小口。枠のアルミ。
+    gTint = vec3(0.34) / max(base, vec3(0.02));
+    gRough = 0.4; gMetal = 0.6;
+    return;
+  }
+
+  vec3 col = vec3(0.5);
+  float glassMask = 0.0;      // 反射を掛ける範囲
+  vec3 emis = vec3(0.0);
+  float rough = 0.85, metal = 0.05;
+
+  // 方立（サッシの縦桟）。0.95m ピッチ。
+  float mull = bandAA(fract(u / 0.95), 0.0, 0.05, fwidth(u / 0.95));
+  // テナントの境の柱
+  float pier = bandAA(tf, 0.0, 0.07, fwidth(t));
+
+  if (kind < 0.5) {
+    // ---- 商業：全面ガラスのショップフロント ----
+    float sill = 0.32;                       // 腰の高さ
+    float head = ph * 0.80;                  // ガラスの上端
+    float g = step(sill, py) * (1.0 - step(head, py)) * (1.0 - pier);
+    // 店内。奥に行くほど暗く、什器の水平線が入る。
+    float shelf = bandAA(fract((py - sill) / 0.66), 0.0, 0.12, fwidth(py / 0.66));
+    vec3 inside = vec3(0.15, 0.155, 0.16) * (1.0 - shelf * 0.30);
+    // 奥の壁。天井近くが明るい（照明が天井にある）。
+    inside += vec3(0.13, 0.12, 0.10) * smoothstep(sill, head, py);
+    // 客・什器の影。区画ごとに 1 つ入るだけで、ガラスの奥に空間ができる。
+    float fx = 0.22 + 0.56 * fract(hb * 11.0);
+    float fig = (1.0 - smoothstep(0.045, 0.085, abs(tf - fx)))
+              * (1.0 - smoothstep(0.42, 0.62, (py - sill) / max(head - sill, 0.1)));
+    inside *= 1.0 - fig * 0.6;
+    // 入口の自動ドア。区画の右寄りに 1 か所。
+    float door = step(0.60, tf) * (1.0 - step(0.88, tf));
+    inside = mix(inside, inside * 0.72, door * step(py, head * 0.92));
+    // のれん・タペストリ。ガラスの上 1/5 に色帯が入る。
+    float noren = step(head * 0.78, py) * (1.0 - step(head, py)) * step(0.55, hb);
+    inside = mix(inside, accent * 0.55, noren * 0.85);
+    col = mix(vec3(0.72, 0.71, 0.68), inside, g);          // 枠は明るいアルミ
+    col = mix(col, vec3(0.20, 0.20, 0.19), (1.0 - step(sill, py)));   // 腰壁（御影石）
+    // テナントの境の柱と方立を強く出す。ここで帯が切れることで、
+    // 光る 1 本の帯ではなく「並んだ店」として数えられるようになる。
+    col *= 1.0 - mull * g * 0.40 - pier * 0.45;
+    glassMask = g * (1.0 - mull * 0.8);
+    rough = mix(0.7, 0.14, glassMask);
+    metal = mix(0.08, 0.22, glassMask);
+    // 夜の売り場。純白ではなく、業種で色を変えた光を「滲ませて」出す。
+    vec3 litC = ha < 0.42 ? vec3(1.00, 0.95, 0.84)
+              : (ha < 0.74 ? vec3(1.00, 0.72, 0.44) : accent + vec3(0.35));
+    // 夜の売り場は街路でいちばん明るいが、上限は 1.4 前後で止める。
+    // 隣り合う店が全部 2 を超えると、ブルームで店の切れ目が溶けて
+    // 商店街が「1 枚の白い板」に戻ってしまう。
+    float glow = (0.14 + uNight * 0.95) * (1.0 - closed * 0.88);
+    // 内部の階調をそのまま発光に持ち込む（一様に光らせない）。
+    emis = litC * g * glow * (0.45 + 0.85 * smoothstep(sill, head, py)) * (1.0 - fig * 0.7);
+    emis += accent * noren * (0.1 + uNight * 0.5);
+  } else if (kind < 1.5) {
+    // ---- 事務所：エントランスホール ----
+    float sill = 0.18;
+    float head = ph * 0.88;
+    float g = step(sill, py) * (1.0 - step(head, py));
+    // ホールの奥。床と天井が見え、中央に受付のカウンター。
+    vec3 inside = vec3(0.13, 0.14, 0.155);
+    inside += vec3(0.10, 0.10, 0.11) * smoothstep(head * 0.55, head, py);
+    inside += vec3(0.07) * (1.0 - smoothstep(sill, sill + 0.9, py));
+    // 自動ドアの 2 枚建て。中央に縦の枠が 2 本。
+    float cx = abs(u) / max(pw * 0.5, 0.1);
+    float doorFrame = (1.0 - smoothstep(0.02, 0.05, abs(cx - 0.20)))
+                    + (1.0 - smoothstep(0.02, 0.05, abs(cx - 0.02)));
+    inside = mix(inside, vec3(0.30), clamp(doorFrame, 0.0, 1.0) * step(py, 2.3));
+    col = mix(vec3(0.40, 0.41, 0.42), inside, g);
+    col *= 1.0 - bandAA(fract(u / 1.45), 0.0, 0.05, fwidth(u / 1.45)) * 0.30;
+    glassMask = g;
+    rough = mix(0.6, 0.10, g);
+    metal = mix(0.15, 0.25, g);
+    emis = vec3(0.92, 0.94, 0.98) * g * (0.10 + uNight * 0.85)
+         * (0.5 + 0.9 * smoothstep(sill, head, py));
+  } else if (kind < 2.5) {
+    // ---- 住宅：玄関ポーチ ----
+    //
+    // 寸法は実寸で書く。相対で書くと、間口 3m の家でも 8m の家でも
+    // 「間口の半分が扉」になって、玄関の大きさで家の大きさが読めなくなる。
+    float ux = abs(u);
+    float door = (1.0 - step(0.47, ux)) * (1.0 - step(2.05, py));
+    // 木目の縦線が入った玄関扉
+    float grain = bandAA(fract(u / 0.11), 0.0, 0.5, fwidth(u / 0.11));
+    vec3 doorC = vec3(0.26, 0.19, 0.13) * (0.92 + grain * 0.12);
+    // 扉の脇の小窓（型ガラス）
+    float side = step(0.58, ux) * (1.0 - step(0.84, ux))
+               * step(0.85, py) * (1.0 - step(1.9, py));
+    col = mix(vec3(0.88), doorC, door);
+    col = mix(col, vec3(0.55, 0.58, 0.56), side);
+    // 引き手（縦長のハンドル）
+    col *= 1.0 - (1.0 - smoothstep(0.015, 0.03, abs(ux - 0.34)))
+                 * step(0.95, py) * (1.0 - step(1.35, py)) * door * 0.55;
+    glassMask = side * 0.6;
+    rough = 0.72; metal = 0.04;
+    emis = vec3(1.0, 0.86, 0.62) * side * uNight * 0.5;
+    // 玄関灯。扉の脇の壁に 1 つ。夜の住宅地はこれが点いているかで生活感が変わる。
+    float lamp = (1.0 - smoothstep(0.06, 0.10, abs(ux - 1.02)))
+               * (1.0 - smoothstep(0.07, 0.11, abs(py - 2.0)));
+    emis += vec3(1.0, 0.88, 0.66) * lamp * (0.08 + uNight * 1.5);
+    col = mix(col, vec3(0.95, 0.90, 0.80), lamp);
+  } else if (kind < 3.5) {
+    // ---- 工場・倉庫：シャッターと搬入口 ----
+    float rail = (1.0 - smoothstep(0.44, 0.47, abs(u) / max(pw * 0.5, 0.1)));
+    // 折板シャッターの横スジ。0.11m ピッチ。
+    float rib = fract(py / 0.11);
+    float shade = bandAA(rib, 0.0, 0.45, fwidth(py / 0.11));
+    col = vec3(0.52, 0.53, 0.53) * (0.86 + shade * 0.26);
+    // 下端の水切りと、上部の巻き取りボックス
+    col *= 1.0 - (1.0 - step(0.18, py)) * 0.35;
+    col = mix(col, vec3(0.40, 0.41, 0.41), step(ph * 0.86, py));
+    // 通用口（片側の小さな鉄扉）
+    float un = (u + pw * 0.5) / pw;
+    float pdoor = step(0.03, un) * (1.0 - step(0.13, un)) * (1.0 - step(2.0, py));
+    col = mix(col, vec3(0.30, 0.33, 0.34), pdoor);
+    // 錆と汚れ。搬入口の下端は必ず擦れている。
+    col *= 1.0 - vnoise(vec2(u * 1.4, py * 1.4)) * 0.10;
+    col *= 1.0 - rail * 0.18;
+    rough = 0.62; metal = 0.42;
+    emis = vec3(1.0, 0.93, 0.78) * pdoor * uNight * 0.25;
+  } else {
+    // ---- 雑居ビル：テナント看板の並ぶ入口 ----
+    //
+    // 日本の雑居ビルの 1 階は「狭くて暗い階段の入口」「その脇のテナント表示板」
+    // 「端の自動販売機」の 3 つで出来ている。全部を実寸で置く。
+    float ux = u + pw * 0.5;                 // 左端からの距離 (m)
+    float entX = pw * 0.62;                  // 入口の中心（やや右寄り）
+    float ent = (1.0 - step(1.25, abs(ux - entX))) * (1.0 - step(ph * 0.78, py));
+    vec3 inside = vec3(0.075, 0.075, 0.08);
+    // 奥の階段。斜めの明暗が 1 本入ると、奥行きのある穴に見える。
+    float stair = bandAA(fract(py * 1.6 + (ux - entX) * 0.8), 0.0, 0.5, 0.3);
+    inside *= 0.7 + stair * 0.9;
+    // テナント表示板。幅 1.1m の板に、階数ぶんの小さな行が縦に積む。
+    float bx0 = max(entX - 2.7, 0.25);
+    float bxm = (1.0 - step(1.1, abs(ux - bx0 - 0.55)));
+    float rows = 6.0;
+    float bTop = min(ph * 0.7, 3.0);
+    float bt = clamp((py - 0.85) / max(bTop - 0.85, 0.3), 0.0, 0.999);
+    float ri = floor(bt * rows);
+    float rowT = fract(bt * rows);
+    float hr = h21(vec2(ri, 7.0) + sd * 53.0);
+    vec3 plate = mix(vec3(0.86, 0.85, 0.82), accentOf(hr), 0.18);
+    float gap = bandAA(rowT, 0.08, 0.92, fwidth(rowT));
+    float boardM = bxm * step(0.85, py) * (1.0 - step(bTop, py));
+    vec2 gp = vec2(clamp(rowT, 0.0, 1.0), clamp((ux - bx0) / 1.1, 0.0, 1.0));
+    float aa2 = max(fwidth(gp.x), fwidth(gp.y)) * 0.9 + 0.01;
+    float ink = signGlyphs(gp, 3.0, sd + ri * 0.29, aa2);
+    plate = mix(plate, accentOf(hr) * 0.55, ink);
+    plate *= mix(0.35, 1.0, gap);
+    col = vec3(0.42, 0.42, 0.41);
+    // 入口まわりの壁は磨いた石。雑居ビルの足元はたいていこれ。
+    col *= 0.9 + 0.2 * vnoise(vec2(ux * 3.0, py * 3.0));
+    col = mix(col, inside, ent);
+    col = mix(col, plate, boardM);
+    // 自動販売機（右端）。日本の雑居ビルの足元には必ず 1 台ある。
+    float vm = (1.0 - step(0.55, abs(ux - (pw - 0.9)))) * (1.0 - step(1.9, py));
+    vec3 vmC = mix(accent, vec3(0.85), 0.25);
+    float vmWin = step(0.85, py) * (1.0 - step(1.72, py));
+    col = mix(col, mix(vmC, vec3(0.95, 0.93, 0.86), vmWin), vm);
+    rough = 0.66; metal = 0.1;
+    emis = vec3(0.95, 0.92, 0.86) * boardM * (0.05 + uNight * 0.9) * mix(0.4, 1.0, gap);
+    emis += vec3(1.0, 0.95, 0.88) * vm * vmWin * (0.22 + uNight * 1.7);
+    emis += vec3(1.0, 0.88, 0.70) * ent * stair * uNight * 0.28;
+  }
+
+  gTint = col / max(base, vec3(0.02));
+  gRough = rough; gMetal = metal;
+  gEmis = emis;
+  gWin = glassMask;
+  // ガラスに空を映す。1 階は目線の高さなので、ここの映り込みが
+  // いちばん近くで見られる。フレネルで縁を明るくすると板から抜ける。
+  if (glassMask > 0.001) {
+    vec3 V = normalize(vWorldPos - cameraPosition);
+    vec3 Nw = normalize(vWorldN);
+    // 上限は上階の窓より低く抑える。1 階のガラスは街路を斜めに見ることが多く、
+    // 上階と同じだけ映すと反射で真っ白になって、せっかく描いた店内が消える。
+    // ショップフロントは「中が見えること」が値打ちなので、映り込みは脇役でよい。
+    gRefl = fakeSky(reflect(V, Nw)) * mix(0.10, 0.52, fresnelAt(V, Nw)) * glassMask;
+  }
+}
+
 void facadeShade(vec3 base) {
   gTint = vec3(1.0); gRough = 0.9; gMetal = 0.03; gEmis = vec3(0.0);
-  gEnv = 1.0; gWin = 0.0;
+  gEnv = 1.0; gWin = 0.0; gRefl = vec3(0.0);
   float style = vFacadeV.x;
   vec3 n = vObjN;
   float ax = abs(n.x), ay = abs(n.y), az = abs(n.z);
@@ -233,7 +633,7 @@ void facadeShade(vec3 base) {
   }
 
   // ---- 看板 ----
-  if ((style > 4.5 && style < 5.5) || style > 7.5) {
+  if ((style > 4.5 && style < 5.5) || (style > 7.5 && style < 8.5)) {
     gRough = 0.44; gMetal = 0.0;
     // 上下面まで光らせると板が発光する塊になるので、立面だけ光らせる。
     float face = 1.0 - step(0.6, ay);
@@ -277,13 +677,29 @@ void facadeShade(vec3 base) {
     gMetal = max(edge, 1.0 - board) * 0.7;
     gRough = mix(0.44, 0.32, max(edge, 1.0 - board));
     // 夜は文字が地より強く光る（内照式の看板の見え方）。
-    float glow = vFacadeV.y + vFacadeV.z * uNight;
-    gEmis = col * face * panel * glow * (1.0 - edge * 0.85) * mix(0.75, 1.35, ink);
+    //
+    // 全体の強さは 0.6 倍に落としてある。以前は板が丸ごと 255 に飽和して、
+    // 街路の夜が「白い長方形の連なり」になっていた。
+    // 内照式の看板は蛍光灯を中に並べたものなので、実際には板の中に
+    // 縦方向のむらがあり、縁は暗い。そのむらを入れれば、
+    // 強さを落としても「光っている看板」に見える。
+    float glow = (vFacadeV.y + vFacadeV.z * uNight) * 0.6;
+    // 中の蛍光灯の筋（板の長手に沿った 3 本）と、縁に向かう落ち込み。
+    float lamp = 0.82 + 0.28 * abs(sin((lenH > vScaleM.y ? p.x : p.y) * 9.42));
+    float vign = smoothstep(0.0, 0.16, min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y)));
+    gEmis = col * face * panel * glow * (1.0 - edge * 0.85)
+          * mix(0.7, 1.4, ink) * lamp * mix(0.45, 1.0, vign);
+    return;
+  }
+
+  // ---- 1 階の店構え ----
+  if (style > 8.5) {
+    frontShade(base);
     return;
   }
 
   // ---- 屋根（瓦・折板）----
-  if (style > 6.5) {
+  if (style > 6.5 && style < 7.5) {
     gRough = vFacadeV.y; gMetal = vFacadeV.z;
     float p = (az >= ax) ? vLocalM.z : vLocalM.x;
     float pitchStep = max(vFacadeV.w, 0.15);
@@ -338,11 +754,28 @@ void facadeShade(vec3 base) {
   float wallLen = alongZ ? vScaleM.z : vScaleM.x;
   float otherLen = alongZ ? vScaleM.x : vScaleM.z;
   float y = vLocalM.y;
-  float floorH = max(vFacadeV.y, 1.2);
+  // 階高が負の棟は「1 階に店構えのキットが載っている」印。
+  // 絶対値には「どの面に載っているか」も埋め込んである（floorH*10 + 面 + 1）。
+  // 属性を 1 つ増やすとインスタンスの帯域が 1 棟あたり 4 バイト増えるので、
+  // 使っていない符号と小数第 1 位に押し込む。
+  float p1 = vFacadeV.y;
+  float frontFace = -1.0;
+  float floorH;
+  if (p1 < 0.0) {
+    float v = -p1;
+    frontFace = mod(v, 10.0) - 1.0;
+    floorH = max((v - (frontFace + 1.0)) * 0.1, 1.2);
+  } else {
+    floorH = max(p1, 1.2);
+  }
+  // いま描いている面の向き（0=+Z, 1=+X, 2=-Z, 3=-X）。
+  float myFace = alongZ ? (n.x > 0.0 ? 1.0 : 3.0) : (n.z > 0.0 ? 0.0 : 2.0);
+  bool hasFront = frontFace >= 0.0 && abs(myFace - frontFace) < 0.5;
   float seed = vFacadeV.w;
-  // スパンは棟ごとに ±12% 散らす。窓割りの周期が街区で完全に揃うと、
-  // 同じ立面が横に並んでコピーに見える。
-  float bay = max(vFacadeV.z, 0.8) * (0.88 + 0.24 * fract(seed * 17.3));
+  // スパンは棟ごとに ±26% 散らす。窓割りの周期が街区で揃っていると、
+  // 高さだけ違う同じ立面が横に並んでコピーに見える。
+  // ここを広げるのが「同一の押し出し箱が並ぶ」への一番効く手当てになる。
+  float bay = max(vFacadeV.z, 0.8) * (0.74 + 0.52 * fract(seed * 17.3));
   float faceSign = alongZ ? step(0.0, n.x) : step(0.0, n.z);
   float sideSeed = seed * 13.0 + (alongZ ? 3.0 : 41.0) + faceSign * 7.0;
   bool longSide = wallLen >= otherLen - 0.05;
@@ -370,6 +803,13 @@ void facadeShade(vec3 base) {
   // 1 セルが 1 画素より小さくなったら、部屋ごとのばらつきは平均に寄せる。
   // 寄せずに step のまま描くと、隣り合う画素が別の部屋を引いて画面が砂嵐になる。
   float cellFade = clamp(max(wx, wy) * 1.6 - 0.2, 0.0, 1.0);
+
+  // 窓の縦横比も棟ごとに振る。割付ピッチだけ変えても、窓の形が同じだと
+  // 「同じ立面を横に伸ばしただけ」に見える。細長い窓の棟・横長の棟が
+  // 混ざって初めて、街区の情報量が高さの数字より増える。
+  float shapeSel = fract(seed * 31.7);
+  float wNarrow = (shapeSel - 0.5) * 0.16;   // 窓幅 ∓16%
+  float wTall = (fract(seed * 53.1) - 0.5) * 0.14;
 
   float x0 = 0.18, x1 = 0.82, y0 = 0.26, y1 = 0.78;
   // 灯りの範囲。窓と別に持つ（バルコニーの手すりの裏は光らない）。
@@ -450,7 +890,7 @@ void facadeShade(vec3 base) {
       // 強さも店ごとに散らす。全部が同じ輝度なのが「板」に見える最大の理由。
       // 赤・水色の看板だけは少し抑える。彩度の高い色を同じ強さで出すと、
       // 街区がネオン街に寄りすぎて、住宅と商店の区別が付かなくなる。
-      litI = (1.4 + 1.2 * h21(vec2(ti, 6.0) + seed * 29.0)) * (bh > 0.76 ? 0.78 : 1.0);
+      litI = (1.05 + 0.85 * h21(vec2(ti, 6.0) + seed * 29.0)) * (bh > 0.76 ? 0.78 : 1.0);
       glow = 1.0;
       // テナントの境の柱。ここで帯が切れることで「光る板」ではなく
       // 「並んだ店」に見える。切れ目の数がそのまま店の数として読める。
@@ -510,6 +950,25 @@ void facadeShade(vec3 base) {
     if (ground) { y0 = 0.24; y1 = 0.70; }
   }
 
+  // 窓の縦横比の散らしを反映する（1 階の特別扱いより後、平均を取る前）。
+  if (x0 < 1.5) {
+    float mx = (x0 + x1) * 0.5, hx = (x1 - x0) * 0.5 * (1.0 - wNarrow);
+    float my = (y0 + y1) * 0.5, hy = (y1 - y0) * 0.5 * (1.0 - wTall);
+    x0 = mx - hx; x1 = mx + hx; y0 = my - hy; y1 = my + hy;
+  }
+
+  // 1 階に店構えのキットが載っている棟は、壁側の 1 階に窓を描かない。
+  // 描いてしまうと、キットの柱や庇の隙間から上階と同じ窓帯が覗いて、
+  // せっかく作り分けた 1 階が「上階と同じ壁」に戻ってしまう。
+  if (ground && hasFront) {
+    x0 = 2.0; x1 = 2.0;
+    lx0 = -9.0; ly0 = -9.0;
+    litRate = 0.0;
+    band = 0.0; pier = 0.0;
+    // 腰の御影石だけ残す。ここに横線が 1 本あると、キットとの取り合いが締まる。
+    extra = -bandAA(y, 0.0, 0.55, fwidth(y)) * 0.24;
+  }
+
   // 遠景の「平均的な壁」。窓 1 つが 1 画素に満たなくなったら、
   // 格子を描いても被覆率に潰れるだけなので、この平均へ寄せていく。
   //
@@ -525,8 +984,13 @@ void facadeShade(vec3 base) {
   vec3 avgEmis = litCol * cov * litRate * uNight * glow * litI;
   float farMix = smoothstep(150.0, 380.0, vViewDepth);
   if (farMix > 0.999) {
-    gTint = avgTint; gRough = avgRough; gMetal = avgMetal; gEmis = avgEmis;
-    gEnv = mix(1.0, 1.8, cov); gWin = cov;
+    gTint = avgTint; gRough = avgRough; gMetal = avgMetal; gEmis = avgEmis * 0.72;
+    gEnv = mix(1.0, 1.25, cov); gWin = cov;
+    // 遠景でも空は映る。むしろ遠くのビル群が空を返すことで、
+    // 街が霞の中でただの灰色の塊に潰れるのを防げる。
+    vec3 V = normalize(vWorldPos - cameraPosition);
+    vec3 Nw = normalize(vWorldN);
+    gRefl = fakeSky(reflect(V, Nw)) * (0.06 + 0.5 * fresnelAt(V, Nw)) * cov;
     return;
   }
 
@@ -570,11 +1034,40 @@ void facadeShade(vec3 base) {
   // その段差がそのまま粗さに乗ると、光沢の強い窓面で細かい格子状のノイズになる。
   float winMat = step(0.5, win);
   gRough = mix(wallRough, glassRough, winMat);
-  gMetal = mix(wallMetal, mix(glassMetal, glassMetal * 0.4, hasCurtain), winMat);
-  // 窓の画素だけ環境マップを強く引く。空が焼いてあるので、南面と東面で
-  // 映り込む空の明るさが変わり、同じ「青いガラス」が向きごとに別の色になる。
-  gEnv = mix(1.0, mix(1.8, 1.2, hasCurtain), winMat);
+  // 金属度は落とす。映り込みを環境マップ（＝屋外の平均輝度）から取るのをやめ、
+  // 下で空を直接引くので、両方を強く出すと二重になって白く飛ぶ。
+  gMetal = mix(wallMetal, mix(glassMetal, glassMetal * 0.4, hasCurtain) * 0.5, winMat);
+  gEnv = mix(1.0, mix(1.25, 0.8, hasCurtain), winMat);
   gWin = winMat;
+
+  // ---- ガラスに空を映す ----
+  //
+  // 「窓を 2 倍に拡大すると一様なグレーブルーの平板」がここの直し先。
+  // 反射方向の Y から空色を引き、フレネルで縁を明るくする。
+  // 見上げる窓（反射が下を向く）は向かいの建物の暗い色、
+  // 見下ろす窓（反射が上を向く）は空 — 1 棟の中で縦に階調が付く。
+  {
+    vec3 V = normalize(vWorldPos - cameraPosition);
+    // 窓の法線をわずかに倒す。壁と同じ法線だと、窓と壁がまったく
+    // 同じ空を映して、どれだけ磨いても「壁に貼った青い紙」から抜けない。
+    //
+    // 倒す量を**部屋ごとに散らす**のがここの肝。板ガラスは実際に
+    // わずかに反っていて、隣り合う窓で映る空がずれる。全部が同じ角度だと、
+    // どれだけ空を映しても「一様な青の格子」に戻ってしまう。
+    float tiltY = 0.10 + 0.10 * (h21(vec2(fxi, fyi) + sideSeed + 211.0) - 0.5) * 2.0;
+    float tiltU = 0.07 * (h21(vec2(fxi, fyi) + sideSeed + 233.0) - 0.5) * 2.0;
+    vec3 tangent = alongZ ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 Nw = normalize(vWorldN + (vec3(0.0, tiltY, 0.0) + tangent * tiltU) * winMat);
+    float fres = fresnelAt(V, Nw);
+    // ガラスは 4% から始まり、グレージング角で 9 割近くまで上がる。
+    // カーテンの下りた窓は拡散面なので、反射は控えめにする。
+    float amt = mix(0.18, 0.94, fres) * mix(1.0, 0.34, hasCurtain);
+    // 壁にはほとんど映さない。ここを上げると、グレージング角の壁が
+    // 一様に空の色でかぶり、棟ごとに散らしたクリーム色や茶色の外壁が
+    // すべて同じ青白い面になってしまう（散らした意味が消える）。
+    float wallAmt = fres * 0.035;
+    gRefl = fakeSky(reflect(V, Nw)) * mix(wallAmt, amt, winMat);
+  }
   gTint = mix(vec3(1.0 + extra), glassCol / max(base, vec3(0.02)), win);
   gTint *= 1.0 + max(frame, 0.0) * 0.08 + sill * 0.22 - slabLine * 0.10;
   // 落ち影 ×0.55、水切り ×1.25。この 2 本が窓を壁から引っ込ませる。
@@ -606,25 +1099,70 @@ void facadeShade(vec3 base) {
   // 部屋ごとに明るさを散らす。全部同じ輝度だと LED パネルに見える。
   // 上限を 1 の少し上で止める。ここを 1.3 まで振ると、いちばん明るい部屋が
   // トーンマッピングの肩で白へ飽和し、せっかく散らした電球色が消えてしまう。
-  lit *= 0.35 + 0.78 * h21(vec2(fxi, fyi) + sideSeed + 91.0);
+  lit *= 0.32 + 0.62 * h21(vec2(fxi, fyi) + sideSeed + 91.0);
   float litMask = (lx0 < -1.0) ? win : bandAA(tx, lx0, lx1, wx) * bandAA(ty, ly0, ly1, wy);
   litMask *= 1.0 - pier;
+
+  // ---- 窓の中の階調 ----
+  //
+  // 夜の窓が 255 のベタ塗りに見えるのは、輝度が高いからではなく
+  // 1 枚の中が一様だから。実際の部屋は天井付近が明るく、窓台に近いほど暗く、
+  // 家具と人が抜けを作る。その勾配を入れると、同じ輝度でも「飛んだ白」に見えない。
+  float rx = clamp((tx - x0) / max(x1 - x0, 1e-3), 0.0, 1.0);
+  float ry = clamp((ty - y0) / max(y1 - y0, 1e-3), 0.0, 1.0);
+  // 天井が明るく、床側が落ちる。
+  float room = mix(0.38, 1.0, ry * ry);
+  // 部屋の奥は暗い。中央ほど奥まで見えるので、中央を落とす。
+  room *= 1.0 - 0.22 * sin(rx * 3.14159);
+  // 3〜4 割の部屋に人影・家具のシルエットを入れる。
+  float fh = h21(vec2(fxi, fyi) + sideSeed + 177.0);
+  float fx2 = 0.22 + 0.56 * fract(fh * 7.0);
+  float fig = (1.0 - smoothstep(0.09, 0.16, abs(rx - fx2)))
+            * (1.0 - smoothstep(0.45, 0.72, ry))
+            * step(0.58, fh);
+  room *= 1.0 - fig * 0.62;
+  // カーテンの下りた部屋は面で光る。縦の襞だけ入れて、平板にはしない。
+  float fold = 0.82 + 0.18 * sin(rx * 34.0);
+  room = mix(room, fold, hasCurtain * 0.75);
+  // 窓の縁は必ず暗い（サッシと躯体の影）。ここが 1 になっていると、
+  // どれだけ中を作り込んでも輪郭の立った白い矩形にしか見えない。
+  float soft = bandAA(rx, 0.06, 0.94, wx / max(x1 - x0, 1e-3))
+             * bandAA(ry, 0.05, 0.95, wy / max(y1 - y0, 1e-3));
+  room *= mix(0.34, 1.0, soft);
+  // 引き違いサッシの召し合わせ（窓の中の縦桟）。
+  //
+  // 掃き出し窓は 2〜3 枚建てで、真ん中に必ず桟が入る。
+  // これが無いと、幅 2.5m の窓が夜に「1 枚の白い矩形」として抜けてしまう。
+  // 昼も、桟が 1 本入るだけでガラスの大きさの見当が付く。
+  float paneW = max(x1 - x0, 1e-3);
+  float panes = max(1.0, floor(paneW * bay / 0.95 + 0.35));
+  float sashF = rx * panes;
+  float sash = 1.0 - bandAA(fract(sashF), 0.045, 0.955, wx * panes / paneW);
+  // 遠景では階調が 1 画素を割るので平均へ寄せる（ちらつき防止）。
+  room = mix(room * (1.0 - sash * 0.55), 0.70, cellFade);
+  litMask *= room;
+  // 昼の窓にも桟を出す。映り込みだけだと、大きなガラスが「板」に戻る。
+  gTint *= 1.0 - mix(sash, 0.0, cellFade) * 0.22 * winMat;
+  gRefl *= 1.0 - mix(sash, 0.0, cellFade) * 0.5 * winMat;
   // 部屋ごとに色温度も散らす。蛍光灯の部屋と白熱灯の部屋が混ざるだけで、
   // 同じ強度でも「全部同じ照明の板」から抜けられる。
   float warm = h21(vec2(fxi, fyi) + sideSeed + 133.0);
   vec3 roomCol = mix(litCol, litCol * vec3(0.90, 0.95, 1.10), smoothstep(0.55, 1.0, warm) * 0.8);
   gEmis = roomCol * litMask * lit * glow * litI;
   // 店舗の看板帯。窓とは別に、業種の色でまとまった面を光らせる。
-  gEmis += litCol * band * (0.10 + uNight * litI * 0.7);
+  gEmis += litCol * band * (0.08 + uNight * litI * 0.5);
   // 店の売り場は昼でも中が明るい。ガラス面が黒く沈むと閉店した街に見える。
   if (style > 2.5 && style < 3.5 && ground) gEmis += litCol * win * 0.10;
+
+  // 遠景の平均にも階調ぶんの目減りを反映する（近景と遠景で明るさが跳ねない）。
+  avgEmis *= 0.72;
 
   // 距離に応じて平均へ寄せる
   gTint = mix(gTint, avgTint, farMix);
   gRough = mix(gRough, avgRough, farMix);
   gMetal = mix(gMetal, avgMetal, farMix);
   gEmis = mix(gEmis, avgEmis, farMix);
-  gEnv = mix(gEnv, mix(1.0, 1.8, cov), farMix);
+  gEnv = mix(gEnv, mix(1.0, 1.25, cov), farMix);
   gWin = mix(gWin, cov, farMix);
 }
 `;
@@ -640,6 +1178,11 @@ function facadeMaterial(chamferFix: boolean): MeshStandardMaterial {
   m.envMapIntensity = 0.92;
   m.onBeforeCompile = (shader) => {
     shader.uniforms.uNight = uniforms.uNight;
+    shader.uniforms.uSkyZenith = uniforms.uSkyZenith;
+    shader.uniforms.uSkyHorizon = uniforms.uSkyHorizon;
+    shader.uniforms.uSkyGround = uniforms.uSkyGround;
+    shader.uniforms.uSunDir = uniforms.uSunDir;
+    shader.uniforms.uSunTint = uniforms.uSunTint;
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\n' + VERT_PARS)
       .replace('#include <begin_vertex>', VERT_BEGIN)
@@ -660,15 +1203,16 @@ function facadeMaterial(chamferFix: boolean): MeshStandardMaterial {
       )
       .replace(
         '#include <emissivemap_fragment>',
-        '#include <emissivemap_fragment>\n  totalEmissiveRadiance += gEmis;',
+        '#include <emissivemap_fragment>\n  totalEmissiveRadiance += gEmis + gRefl;',
       )
-      // 窓の法線を壁面法線と真上の間で 0.15 だけ倒す。
-      // 完全に壁と同じ法線だと、窓と壁が同じ方向の空を映してしまい、
-      // どれだけ粗さを下げても「壁に貼った青い紙」から抜けられない。
+      // 窓の法線を壁面法線と真上の間でわずかに倒す。
+      // 映り込みそのものは gRefl が受け持つようになったので、ここは
+      // 「窓だけ空からの回り込みを少し多く受ける」ぶんだけに抑える。
+      // 大きく倒すと、どの向きの壁の窓も同じ明るさになって階調が消える。
       .replace(
         '#include <normal_fragment_maps>',
         '#include <normal_fragment_maps>\n' +
-          '  normal = normalize(mix(normal, (viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz, 0.12 * gWin));',
+          '  normal = normalize(mix(normal, (viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz, 0.06 * gWin));',
       )
       // 環境マップの強さを画素ごとに変える。材質の envMapIntensity は
       // ユニフォームなので上書きできない。IBL の結果に直接掛ける。
@@ -688,12 +1232,50 @@ export function setBuildingNight(night: number): void {
   uniforms.uNight.value = night;
 }
 
+/**
+ * 空の色と太陽の向きを全材質に配る。
+ *
+ * ガラスの映り込みを環境マップ任せにしていたのをやめ、
+ * シェーダが `reflect()` で直接空を引くようにしたので、
+ * 空側の状態をここから渡す必要がある。
+ * 渡すのはフレームに 1 回・ユニフォーム 5 個だけなので、コストは無い。
+ */
+export function setBuildingSky(
+  zenith: Color,
+  horizon: Color,
+  sunDir: Vector3,
+  sunColor: Color,
+  sunIntensity: number,
+): void {
+  uniforms.uSkyZenith.value.copy(zenith);
+  uniforms.uSkyHorizon.value.copy(horizon);
+  // 地平より下に映るのは向かいの建物と路面。
+  // 真っ黒にすると、見下ろした窓が全部「黒い板」になって元の木阿弥なので、
+  // コンクリートの壁が返すぶんだけ残す（地平色の 1/3 前後）。
+  uniforms.uSkyGround.value.copy(horizon).multiplyScalar(0.5);
+  uniforms.uSunDir.value.copy(sunDir).normalize();
+  // 日射色に強さを載せる。曇天のような弱い光でガラスがギラつくと嘘に見える。
+  uniforms.uSunTint.value.copy(sunColor).multiplyScalar(Math.min(1.4, sunIntensity * 0.5));
+}
+
 // ---------------------------------------------------------------- キットの形
 
 /** 白い頂点カラーを持たせる（vertexColors:true の材質に載せるため）。 */
 function white(g: BufferGeometry): BufferGeometry {
   tintGeometry(g, 0xffffff);
   return g;
+}
+
+/**
+ * 部品単位の擬似 AO を焼いた面取り箱。
+ *
+ * `Facade.Plain` のシェーダはインスタンス全体の相対高さで陰影を付けるので、
+ * 焼き固めたキット（室外機の列・受水槽）では**組み全体**が下から明るくなるだけで、
+ * 1 台ずつの足元は暗くならない。部品ごとに焼いておくと、
+ * 並んだ室外機の 1 台 1 台に接地の暗がりが付き、「置いた設備」に見える。
+ */
+function aoBox(): BufferGeometry {
+  return applyVerticalAO(chamferedUnitBox(CHAMFER_U), 0.66, 1.06, 1.7);
 }
 
 /** 面取り箱。壁の量塊と大きな部品に使う（44 三角形）。 */
@@ -847,8 +1429,11 @@ function cylGeometry(seg = 10): BufferGeometry {
  */
 function tankGeometry(): BufferGeometry {
   const box = chamferedUnitBox(CHAMFER_U);
+  const ao = aoBox();
   const parts: Part[] = [
-    { geom: box, matrix: place(0, 0.42, 0, 1, 0.54, 0.72), color: 0xffffff },
+    // 架台の下に落ちる影。屋上の設備で一番背が高いので、接地が読めないと浮く。
+    { geom: box, matrix: place(0, 0.003, 0, 1.22, 0.005, 0.98), color: 0x1a1a18 },
+    { geom: ao, matrix: place(0, 0.42, 0, 1, 0.54, 0.72), color: 0xffffff },
     // 天端のマンホールと通気管
     { geom: box, matrix: place(0.18, 0.96, 0, 0.2, 0.06, 0.2), color: 0xb0b0b0 },
     { geom: box, matrix: place(-0.3, 0.96, 0.2, 0.05, 0.16, 0.05), color: 0x9a9a9a },
@@ -858,7 +1443,7 @@ function tankGeometry(): BufferGeometry {
   // この筋交いが 1 本入っているかで決まる。
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) {
-      parts.push({ geom: box, matrix: place(sx * 0.42, 0, sz * 0.3, 0.09, 0.44, 0.09), color: 0x8e9296 });
+      parts.push({ geom: ao, matrix: place(sx * 0.42, 0, sz * 0.3, 0.09, 0.44, 0.09), color: 0x8e9296 });
     }
     parts.push({ geom: box, matrix: place(sx * 0.42, 0.36, 0, 0.07, 0.06, 0.68), color: 0x8e9296 });
     // 中間の水平材（振れ止め）
@@ -875,6 +1460,7 @@ function tankGeometry(): BufferGeometry {
   parts.push({ geom: box, matrix: place(0.52, 0.02, 0.1, 0.03, 0.9, 0.03), color: 0xa4a8ac });
   const g = mergeParts(parts);
   box.dispose();
+  ao.dispose();
   return g;
 }
 
@@ -889,15 +1475,21 @@ function tankGeometry(): BufferGeometry {
  */
 function acRowGeometry(): BufferGeometry {
   const box = chamferedUnitBox(CHAMFER_U);
+  const ao = aoBox();
   const parts: Part[] = [
     // 架台（コンクリート基礎 2 本）
-    { geom: box, matrix: place(0, 0, -0.3, 1.0, 0.07, 0.12), color: 0x9a9892 },
-    { geom: box, matrix: place(0, 0, 0.3, 1.0, 0.07, 0.12), color: 0x9a9892 },
+    { geom: ao, matrix: place(0, 0, -0.3, 1.0, 0.07, 0.12), color: 0x9a9892 },
+    { geom: ao, matrix: place(0, 0, 0.3, 1.0, 0.07, 0.12), color: 0x9a9892 },
   ];
+  // 接地の暗がり。屋上に置いた設備が「貼り付いて」見えるのは、
+  // 足元に影が無いから。実体の落ち影は距離が出ると影マップの解像度に負けるので、
+  // キットの中に一回り大きい暗い板を焼き込んでおく。
+  // インスタンスは 1 つも増えない。
+  parts.unshift({ geom: box, matrix: place(0, 0.004, 0.02, 1.24, 0.006, 1.12), color: 0x1a1a18 });
   for (let i = -1; i <= 1; i++) {
     const x = i * 0.335;
     // 本体
-    parts.push({ geom: box, matrix: place(x, 0.07, 0, 0.30, 0.83, 0.68), color: 0xdadcd8 });
+    parts.push({ geom: ao, matrix: place(x, 0.07, 0, 0.30, 0.83, 0.68), color: 0xdadcd8 });
     // ファンのガード（正面の凹んだ丸枠のつもり。暗く落として穴に見せる）
     parts.push({ geom: box, matrix: place(x, 0.28, 0.345, 0.22, 0.42, 0.02), color: 0x44484a });
     // 天端のルーバー
@@ -905,6 +1497,7 @@ function acRowGeometry(): BufferGeometry {
   }
   const g = mergeParts(parts);
   box.dispose();
+  ao.dispose();
   return g;
 }
 
@@ -919,8 +1512,9 @@ function stackGeometry(): BufferGeometry {
   cyl.translate(0, 0.5, 0);
   const c = cyl.toNonIndexed();
   const parts: Part[] = [
+    { geom: box, matrix: place(0, 0.004, 0, 1.35, 0.006, 1.35), color: 0x1a1a18 }, // 接地の暗がり
     { geom: box, matrix: place(0, 0, 0, 0.85, 0.10, 0.85), color: 0x8e918c }, // 立ち上がり
-    { geom: c, matrix: place(0, 0.08, 0, 0.52, 0.72, 0.52), color: 0xc6cacc }, // 筒
+    { geom: c, matrix: place(0, 0.08, 0, 0.52, 0.72, 0.52), color: 0xc6cacc }, // 筒（下が暗い）
     { geom: c, matrix: place(0, 0.78, 0, 0.78, 0.10, 0.78), color: 0xaeb2b4 }, // 傘
     { geom: c, matrix: place(0, 0.88, 0, 0.30, 0.12, 0.30), color: 0xc6cacc }, // 頂部
   ];
@@ -996,6 +1590,45 @@ function signBladeGeometry(): BufferGeometry {
     parts.push({ geom: box, matrix: place(0, 0.2 + (s + 1) * 0.28, 0.66, 0.05, 0.05, 0.34), color: 0x33363a });
   }
   parts.push({ geom: box, matrix: place(0, 0.2, 0.84, 0.06, 0.62, 0.04), color: 0x33363a });
+  const g = mergeParts(parts);
+  box.dispose();
+  return g;
+}
+
+/**
+ * 1 階の店構え（frontage）。
+ *
+ * 目線の高さのカットで点が伸びなかった本体がここだった。
+ * 上階と同じ窓帯を 1 階にも流していたので、店舗も入口も庇も無く、
+ * 「歩ける街」に見えなかった。
+ *
+ * 作り分けは**キットを増やさず 1 つの形で**やる。
+ * 庇・端の柱・腰見切り・看板帯・開口面の 5 部品を焼き固めた 1 インスタンスを
+ * 建物の正面に 1 つ置き、開口面の絵（ガラス／自動ドア／玄関扉／シャッター／
+ * テナント板）はシェーダが種別で描き分ける。
+ * こうすると、用途ごとに 5 通りの 1 階を持ちながら、
+ * ドローコールは 1、1 棟あたりのインスタンスも 1 しか増えない。
+ *
+ * 単位: X = 間口、Y = 1 階の階高、Z = 出（張り出し）。
+ * z=0 が壁面で、+Z が街路の側。
+ */
+function frontGeometry(): BufferGeometry {
+  const box = chamferedUnitBox(0.03);
+  const parts: Part[] = [
+    // 開口面。壁面のすぐ手前に置き、柱と庇が前に出ることで「後退した入口」に見せる。
+    { geom: box, matrix: place(0, 0.02, 0.055, 0.88, 0.86, 0.06), color: FRONT_ID.panel },
+    // 腰の見切り（御影石）と沓摺。1 階の足元に横線が 1 本入ると、床と壁が分かれる。
+    { geom: box, matrix: place(0, 0, 0.105, 0.94, 0.05, 0.2), color: FRONT_ID.base },
+    // 庇。出が深いほど下に落ちる影が濃くなる。この影が「軒下」を作る。
+    { geom: box, matrix: place(0, 0.86, 0.365, 1.0, 0.045, 0.72), color: FRONT_ID.canopy },
+    // 庇の前縁に下がる看板帯（店名のサイン）。夜の街路の光はここが主役になる。
+    // 庇の小口より 3cm ほど前に出す。面が揃っていると庇に隠れて文字が出ない。
+    { geom: box, matrix: place(0, 0.78, 0.735, 0.99, 0.17, 0.06), color: FRONT_ID.fascia },
+  ];
+  // 端の柱。左右に 1 本ずつ前へ出すと、開口が奥に引っ込んで見える。
+  for (const s of [-1, 1]) {
+    parts.push({ geom: box, matrix: place(s * 0.472, 0, 0.27, 0.056, 1.0, 0.52), color: FRONT_ID.pier });
+  }
   const g = mergeParts(parts);
   box.dispose();
   return g;
@@ -1111,7 +1744,8 @@ export type KitName =
   | 'stack'
   | 'railFrame'
   | 'signFace'
-  | 'signBlade';
+  | 'signBlade'
+  | 'front';
 
 const tmpMat = new Matrix4();
 const tmpPos = new Vector3();
@@ -1150,6 +1784,9 @@ export class BuildingParts {
       railFrame: new Kit(railFrameGeometry(), plainMat, 2048),
       signFace: new Kit(signFaceGeometry(), plainMat, 512),
       signBlade: new Kit(signBladeGeometry(), plainMat, 1024),
+      // 1 階の店構え。1 棟 1 インスタンス・1 ドローコールで
+      // 用途ごとに 5 通りの 1 階を描き分ける。
+      front: new Kit(frontGeometry(), plainMat, 4096),
     };
     for (const k of Object.values(this.kits)) this.group.add(k.mesh);
   }
@@ -1296,9 +1933,38 @@ export class BuildingParts {
   }
 
   /**
+   * 1 階の店構え。(x,y,z) は壁面・地盤面の間口中心。
+   *
+   * `rotY` はその面の向き（`faceRot`）。キットは +Z が街路側なので、
+   * 面の回転をそのまま渡せばよい。
+   *
+   * @param kind  `FrontKind.*`
+   * @param bayW  テナント 1 区画の間口 (m)。看板とガラスの割付がこの刻みになる。
+   */
+  frontage(
+    x: number,
+    y: number,
+    z: number,
+    w: number,
+    h: number,
+    depth: number,
+    kind: number,
+    bayW: number,
+    seed: number,
+    color: number | Color,
+    rotY = 0,
+  ): void {
+    this.put('front', x, y, z, w, h, depth, rotY, 0, color, Facade.Front, kind, bayW, seed);
+  }
+
+  /**
    * 屋上の室外機の列（架台付き）。w は列の長さ。
    * 色は白から少しずらせるようにしてある。新品と古びたものが混ざると、
    * 同じキットを並べても「置かれた設備」に見える。
+   *
+   * 粗さ・金属度も呼び出し側から渡す。屋上が「同じ淡いグレーの
+   * 2〜3 種類のプリミティブ」に見えていたのは形の問題ではなく、
+   * 塗装鋼板もステンレスも FRP も同じ材質で描いていたから。
    */
   acRow(
     x: number,
@@ -1309,13 +1975,24 @@ export class BuildingParts {
     d: number,
     rotY = 0,
     color: number | Color = 0xffffff,
+    rough = 0.55,
+    metal = 0.35,
   ): void {
-    this.put('acRow', x, y, z, w, h, d, rotY, 0, color, Facade.Plain, 0.55, 0.35, 0);
+    this.put('acRow', x, y, z, w, h, d, rotY, 0, color, Facade.Plain, rough, metal, 0);
   }
 
   /** 屋上の円筒排気筒。 */
-  stack(x: number, y: number, z: number, r: number, h: number, color: number | Color = 0xffffff): void {
-    this.put('stack', x, y, z, r * 2, h, r * 2, 0, 0, color, Facade.Plain, 0.5, 0.55, 0);
+  stack(
+    x: number,
+    y: number,
+    z: number,
+    r: number,
+    h: number,
+    color: number | Color = 0xffffff,
+    rough = 0.5,
+    metal = 0.55,
+  ): void {
+    this.put('stack', x, y, z, r * 2, h, r * 2, 0, 0, color, Facade.Plain, rough, metal, 0);
   }
 
   /** 手すり（落下防止柵）の 1 スパン。len は X 方向の長さ。 */
@@ -1374,9 +2051,19 @@ export class BuildingParts {
     this.put('hip', x, y, z, w, h, d, rotY, 0, color, Facade.Roof, rough, metal, pitch);
   }
 
-  /** 屋上の受水槽。 */
-  tank(x: number, y: number, z: number, w: number, h: number, d: number, color: number | Color): void {
-    this.put('tank', x, y, z, w, h, d, 0, 0, color, Facade.Plain, 0.72, 0.18, 0);
+  /** 屋上の受水槽。ステンレス・FRP・塗装鋼板で光り方が違う。 */
+  tank(
+    x: number,
+    y: number,
+    z: number,
+    w: number,
+    h: number,
+    d: number,
+    color: number | Color,
+    rough = 0.72,
+    metal = 0.18,
+  ): void {
+    this.put('tank', x, y, z, w, h, d, 0, 0, color, Facade.Plain, rough, metal, 0);
   }
 
   /** 鳥居。 */

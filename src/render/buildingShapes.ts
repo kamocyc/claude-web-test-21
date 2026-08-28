@@ -1,6 +1,6 @@
 import { Color } from 'three';
 import { jitterColor } from './materials';
-import { Facade, type BuildingParts } from './buildingParts';
+import { Facade, FrontKind, type BuildingParts } from './buildingParts';
 import { RoofKind, type MeshStyle } from './theme';
 
 /**
@@ -92,6 +92,79 @@ const tmpA = new Color();
 const tmpB = new Color();
 const tmpC = new Color();
 
+/**
+ * 「1 階に店構えのキットが載っている面」を、階高の符号と小数第 1 位に埋め込む。
+ *
+ * こうしておくと、壁のシェーダはその面の 1 階だけ窓帯を描くのをやめて
+ * 腰壁にする。埋め込まずにキットを重ねると、庇と柱の隙間から
+ * 上階と同じ窓帯が覗いて、せっかく作り分けた 1 階が台無しになる。
+ */
+function frontFlag(floorH: number, front: Facing): number {
+  return -(floorH * 10 + front + 1);
+}
+
+/** 用途ごとの 1 階の出（張り出し）(m)。 */
+const FRONT_DEPTH: Record<number, number> = {
+  [FrontKind.Shop]: 1.5,
+  [FrontKind.Office]: 2.4,
+  [FrontKind.Porch]: 1.15,
+  [FrontKind.Shutter]: 0.9,
+  [FrontKind.Tenant]: 1.15,
+};
+
+/**
+ * 1 階の店構えを正面に 1 つ置く。
+ *
+ * レビューで「07 の左右の建物は 1 階が全部ただの壁か上階と同じ窓帯」と
+ * 指摘された箇所の本体。ここが目線の高さのカットをいちばん動かす。
+ * 置くのは焼き固めたキット 1 インスタンスだけで、
+ * ガラス／自動ドア／玄関扉／シャッター／テナント板の描き分けは
+ * シェーダが `kind` から行う。
+ *
+ * @param gh    1 階の階高 (m)。壁のシェーダの割付と必ず揃えること。
+ * @param scale 間口に対する店構えの幅の比。1 未満なら残りは素の壁になる。
+ */
+function frontage(
+  ctx: BuildCtx,
+  kind: number,
+  gh: number,
+  scale = 0.96,
+  opts: { w?: number; d?: number; cx?: number; cz?: number; bay?: number; f?: Facing; off?: number } = {},
+): void {
+  const { e, hash, gy } = ctx;
+  const f = opts.f ?? ctx.front;
+  const w = opts.w ?? ctx.w;
+  const d = opts.d ?? ctx.d;
+  const cx = opts.cx ?? ctx.cx;
+  const cz = opts.cz ?? ctx.cz;
+  const len = Math.max(1.6, faceLen(f, w, d) * scale);
+  const dist = faceDist(f, w, d);
+  // テナントの割付。1 区画 5.5m を目安に、間口に収まる整数で割る。
+  // 割り切れない刻みにすると、端の区画だけ極端に狭くなって嘘に見える。
+  const bay = opts.bay ?? len / Math.max(1, Math.round(len / 5.5));
+  // 面に沿ったずらし（正面を全部使わない用途：玄関ポーチ・昇降口）
+  const off = opts.off ?? 0;
+  tmpA.copy(ctx.wall);
+  e.frontage(
+    cx + FX[f]! * dist + (f % 2 === 0 ? off : 0),
+    gy,
+    cz + FZ[f]! * dist + (f % 2 === 0 ? 0 : off),
+    len,
+    gh,
+    FRONT_DEPTH[kind] ?? 1.4,
+    kind,
+    Math.max(2.2, bay),
+    (hash % 991) / 991,
+    tmpA,
+    faceRot(f),
+  );
+}
+
+/** 1 階の階高 (m)。窓の割付・店構えの高さの両方がこの値で決まる。 */
+function groundH(style: MeshStyle, facade: number): number {
+  return style.floorH * groundMul(facade);
+}
+
 /** 1 階の割増し（シェーダの groundMul と揃えること）。 */
 function groundMul(facade: number): number {
   if (facade === Facade.Shop) return 1.45;
@@ -132,7 +205,9 @@ function rooftop(
   opts: { parapet?: number; clutter?: number } = {},
 ): void {
   const { e, hash } = ctx;
-  const ph = opts.parapet ?? 0.85;
+  // パラペットの高さを棟ごとに散らす。ここが全棟同じだと、
+  // 屋上の縁の線が街区で揃い、輪郭が「同じ高さの箱の集合」に見える。
+  const ph = (opts.parapet ?? 0.85) * (0.7 + rnd(hash, salt + 90) * 1.0);
   const t = Math.min(0.3, Math.min(w, d) * 0.06);
   tmpA.copy(ctx.wall).multiplyScalar(0.94);
   // パラペット。屋上の縁に線が 1 本出るだけで、平らな箱が建物になる。
@@ -158,6 +233,13 @@ function rooftop(
    * 実際の屋上は 1 台 40cm のパッケージから 3m の高置水槽まで大きさが揃っていない。
    */
   const vary = (r: number): number => 0.6 + r * 1.2;
+
+  // 笠木（パラペットの天端に載る一回り広い見切り）。
+  // 3 棟に 1 棟ほど付けると、屋上の縁に太い線と細い線が混ざる。
+  if (rnd(hash, salt + 91) > 0.55) {
+    tmpB.copy(ctx.wall).multiplyScalar(1.05);
+    e.box(x, topY + ph, z, w + 0.3, 0.14, d + 0.3, tmpB, 0.85, 0.05);
+  }
 
   // 落下防止柵。パラペットの天端に回す。
   // 屋上の縁に「透けた線」が 1 本入るだけで、平らな灰色の面に厚みが出る。
@@ -187,10 +269,16 @@ function rooftop(
     // 出入口の鉄扉。面のどこかに 1 枚暗い矩形があると、大きさの見当が付く。
     e.box(sx, topY + 0.05, sz + sd / 2, 0.95, 2.0, 0.1, 0x6e7276, 0.55, 0.45);
   }
-  // 架台付きの高置水槽
+  // 架台付きの高置水槽。ステンレス・FRP・塗装鋼板で光り方をはっきり分ける。
+  // 「全部が同じ淡いグレー」に見えていた原因は形ではなく、材質が 1 種類だったこと。
   if (r1 < 0.6) {
     const tw = Math.min(w * 0.26, 3.4) * vary(r4);
-    e.tank(px(r2), topY, pz(1 - r0), tw, Math.max(1.8, tw * 1.05), tw * 0.78, 0xa8aca6);
+    const mat = rnd(hash, salt + 92);
+    const col = mat < 0.4 ? 0xc2c8ca : mat < 0.78 ? 0xd8d3c2 : 0xa8aca6;
+    // ステンレス（磨いた面）/ FRP（つや消しの白）/ 塗装鋼板
+    const rough = mat < 0.4 ? 0.26 : mat < 0.78 ? 0.86 : 0.6;
+    const metal = mat < 0.4 ? 0.88 : mat < 0.78 ? 0.02 : 0.3;
+    e.tank(px(r2), topY, pz(1 - r0), tw, Math.max(1.8, tw * 1.05), tw * 0.78, col, rough, metal);
   }
   // 空調室外機の列。列そのものの長さと高さを散らす。
   const rows = 1 + Math.floor(r2 * 2.4);
@@ -200,18 +288,46 @@ function rooftop(
     const s = vary(rnd(hash, salt + 30 + i));
     // 経年で色が振れる。全部が同じ白だと、大きさを散らしても列が揃って見える。
     const age = 0.82 + rnd(hash, salt + 70 + i) * 0.3;
-    tmpC.setRGB(age, age * 0.99, age * 0.95);
-    e.acRow(px(rx), topY, pz(rz), 2.6 * s, 0.95 * s, 0.85 * s, rx > 0.5 ? Math.PI / 2 : 0, tmpC);
+    const mat = rnd(hash, salt + 93 + i);
+    // 塗装鋼板（新しい）／ステンレス／屋外で焼けた古い機。
+    if (mat < 0.5) tmpC.setRGB(age, age * 0.99, age * 0.95);
+    else if (mat < 0.78) tmpC.setRGB(age * 0.92, age * 0.95, age * 0.98);
+    else tmpC.setRGB(age * 0.86, age * 0.82, age * 0.74);
+    e.acRow(
+      px(rx),
+      topY,
+      pz(rz),
+      2.6 * s,
+      0.95 * s,
+      0.85 * s,
+      rx > 0.5 ? Math.PI / 2 : 0,
+      tmpC,
+      mat < 0.5 ? 0.62 : mat < 0.78 ? 0.3 : 0.9,
+      mat < 0.5 ? 0.28 : mat < 0.78 ? 0.82 : 0.12,
+    );
   }
   // 円筒の排気筒。屋上で唯一の丸い形なので、1 本あるだけで面が単調でなくなる。
   const stacks = r0 > 0.45 ? 1 + Math.floor(r1 * 2) : 0;
   for (let i = 0; i < stacks; i++) {
     const s = vary(rnd(hash, salt + 40 + i));
     const age = 0.8 + rnd(hash, salt + 80 + i) * 0.35;
-    tmpC.setRGB(age, age * 0.97, age * 0.92);
-    e.stack(px(rnd(hash, salt + 50 + i)), topY, pz(rnd(hash, salt + 60 + i)), 0.3 * s, 1.7 * s, tmpC);
+    // 亜鉛メッキか、赤錆の浮いた鉄。錆が 1 本混ざるだけで屋上が「使われている」。
+    const rusty = rnd(hash, salt + 96 + i) > 0.72;
+    if (rusty) tmpC.setRGB(age * 0.78, age * 0.5, age * 0.34);
+    else tmpC.setRGB(age, age * 0.97, age * 0.92);
+    e.stack(
+      px(rnd(hash, salt + 50 + i)),
+      topY,
+      pz(rnd(hash, salt + 60 + i)),
+      0.3 * s,
+      1.7 * s,
+      tmpC,
+      rusty ? 0.94 : 0.4,
+      rusty ? 0.08 : 0.7,
+    );
   }
   // 屋上を這う配管・ダクト。水平の線が 1 本走ると、屋上が「面」ではなく「場」になる。
+  // ラッキング（ステンレスの保温外装）なので、他の設備よりはっきり光る。
   if (r4 > 0.4 && bigRoof) {
     const alongX = r0 > 0.5;
     e.box(
@@ -221,9 +337,48 @@ function rooftop(
       alongX ? w * 0.5 : 0.45,
       0.45,
       alongX ? 0.45 : d * 0.5,
-      0xa4a8a4,
-      0.6,
-      0.4,
+      0xc0c6c8,
+      0.3,
+      0.8,
+    );
+    // ダクトを受ける架台。宙に浮いた配管は「貼り付けた」に見える最たるもの。
+    for (const sg of [-1, 1]) {
+      e.box(
+        px(r1) + (alongX ? sg * w * 0.18 : 0),
+        topY,
+        pz(r2) + (alongX ? 0 : sg * d * 0.18),
+        0.12,
+        0.35,
+        0.12,
+        0x8a8e90,
+        0.75,
+        0.2,
+      );
+    }
+  }
+
+  // 屋上看板のフレーム。
+  // 高さだけ違う箱が並ぶスカイラインを割るのに、いちばん効く要素。
+  // 脚 2 本＋看板 1 枚の 3 インスタンスなので、5 棟に 1 棟に載せても軽い。
+  if (r2 > 0.78 && bigRoof && w > 8) {
+    const sw = Math.min(w * 0.82, 12);
+    const sh = 2.4 + r1 * 2.2;
+    const legY = topY + ph;
+    const bx = x + (r0 - 0.5) * (w - sw) * 0.5;
+    const bz = z + (r1 - 0.5) * d * 0.3;
+    for (const sg of [-1, 1]) {
+      e.box(bx + sg * sw * 0.4, legY, bz, 0.2, 1.6 + sh, 0.2, 0x8f9498, 0.7, 0.25);
+    }
+    e.signFace(
+      bx,
+      legY + 1.6 + sh,
+      bz,
+      sw,
+      sh,
+      pick(SIGN_ACCENTS, hash, salt + 97),
+      rnd(hash, salt + 98),
+      0.14,
+      1.6,
     );
   }
   // アンテナ・避雷針。細くて高いものが 1 本あると輪郭が締まる。
@@ -307,23 +462,6 @@ function pitched(
     ctx.roofRough,
     ctx.roofMetal,
   );
-}
-
-/** 正面の庇（店舗・玄関）。奥行きのある水平の板は、影が落ちて立体感を作る。 */
-function awning(
-  ctx: BuildCtx,
-  y: number,
-  depth: number,
-  color: number | Color,
-  widthScale = 1,
-  f: Facing = ctx.front,
-): void {
-  const { e, cx, cz, w, d } = ctx;
-  const len = faceLen(f, w, d) * widthScale;
-  const dist = faceDist(f, w, d);
-  const px = cx + FX[f]! * (dist + depth / 2 - 0.1);
-  const pz = cz + FZ[f]! * (dist + depth / 2 - 0.1);
-  e.box(px, y, pz, f % 2 === 0 ? len : depth, 0.22, f % 2 === 0 ? depth : len, color, 0.6, 0.25);
 }
 
 /** 低い塀（ブロック塀・玉垣）。路上に降りたときの「敷地感」がこれで出る。 */
@@ -438,12 +576,45 @@ function massing(ctx: BuildCtx, variant: number): Block[] {
     const wingH = snapHeight(Math.max(f * 2, H * (0.55 + rnd(hash, 8) * 0.2)), f, fac);
     const ww = alongX ? w * 0.42 : w - mainW;
     const wd = alongX ? d - mainD : d * 0.42;
+    const near = rnd(hash, 9) > 0.5;
     out.push({
-      x: alongX ? -(w - ww) / 2 + (rnd(hash, 9) > 0.5 ? w - ww : 0) : (w - ww) / 2,
-      z: alongX ? (d - wd) / 2 : -(d - wd) / 2 + (rnd(hash, 9) > 0.5 ? d - wd : 0),
+      x: alongX ? -(w - ww) / 2 + (near ? w - ww : 0) : (w - ww) / 2,
+      z: alongX ? (d - wd) / 2 : -(d - wd) / 2 + (near ? d - wd : 0),
       w: ww + (alongX ? 0 : bite),
       d: wd + (alongX ? bite : 0),
       h: wingH,
+    });
+    // コの字。反対の端にもう 1 本翼を出す。
+    // L 字だけだと、輪郭の切れ方が「箱の角が欠けた」に見える棟が多くなる。
+    // 両端に翼が出ると中庭が生まれ、遠景でも影の落ち方で平面形が読める。
+    if (rnd(hash, 14) > 0.45) {
+      const wing2H = snapHeight(Math.max(f * 2, H * (0.5 + rnd(hash, 15) * 0.25)), f, fac);
+      out.push({
+        x: alongX ? -(w - ww) / 2 + (near ? 0 : w - ww) : (w - ww) / 2,
+        z: alongX ? (d - wd) / 2 : -(d - wd) / 2 + (near ? 0 : d - wd),
+        w: ww + (alongX ? 0 : bite),
+        d: wd + (alongX ? bite : 0),
+        h: wing2H,
+      });
+    }
+    return out;
+  }
+  if (variant === 4 && floors >= 3) {
+    // 独立した階段室ボックス。
+    // 本体より 1.5 層高い細い塔を片側に寄せて立てる。
+    // 平らなパラペットが横一直線に並ぶのがスカイラインの鋸歯の正体なので、
+    // 縦に突き出るものを混ぜて輪郭を割る。
+    const alongX = w >= d;
+    const core = Math.min(alongX ? w * 0.24 : w * 0.9, 6.2);
+    const coreD = Math.min(alongX ? d * 0.9 : d * 0.24, 6.2);
+    const side = rnd(hash, 12) > 0.5 ? 1 : -1;
+    out.push({ x: 0, z: 0, w, d, h: H });
+    out.push({
+      x: alongX ? side * (w - core) * 0.5 * 0.86 : 0,
+      z: alongX ? 0 : side * (d - coreD) * 0.5 * 0.86,
+      w: core,
+      d: coreD,
+      h: snapHeight(H + f * (1 + Math.floor(rnd(hash, 13) * 2)), f, fac),
     });
     return out;
   }
@@ -469,9 +640,16 @@ function massing(ctx: BuildCtx, variant: number): Block[] {
   return out;
 }
 
-/** 量塊を実際に置き、陸屋根なら屋上を仕上げる。 */
-function placeBlocks(ctx: BuildCtx, blocks: Block[], facade: number): void {
+/**
+ * 量塊を実際に置き、陸屋根なら屋上を仕上げる。
+ *
+ * @param frontKind 1 階に載せる店構えの種別（負なら置かない）。
+ *   置く場合は**基壇（blocks[0]）の正面**に載せ、その面の 1 階には
+ *   壁のシェーダが窓帯を描かないよう符号で印を付ける。
+ */
+function placeBlocks(ctx: BuildCtx, blocks: Block[], facade: number, frontKind = -1): void {
   const { e, cx, cz, gy, style, hash } = ctx;
+  const gh = groundH(style, facade);
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i]!;
     e.mass(
@@ -483,7 +661,7 @@ function placeBlocks(ctx: BuildCtx, blocks: Block[], facade: number): void {
       b.d,
       ctx.wall,
       facade,
-      style.floorH,
+      i === 0 && frontKind >= 0 ? frontFlag(style.floorH, ctx.front) : style.floorH,
       style.bay,
       (hash % 997) / 997 + i * 0.31,
     );
@@ -497,6 +675,10 @@ function placeBlocks(ctx: BuildCtx, blocks: Block[], facade: number): void {
     } else if (style.roofKind !== RoofKind.None) {
       pitched(ctx, style.roofKind, cx + b.x, cz + b.z, gy + b.h, b.w, b.d);
     }
+  }
+  if (frontKind >= 0) {
+    const b = blocks[0]!;
+    frontage(ctx, frontKind, gh, 0.94, { w: b.w, d: b.d, cx: cx + b.x, cz: cz + b.z });
   }
 }
 
@@ -529,30 +711,47 @@ function house(ctx: BuildCtx): void {
     e.mass(cx + sx, gy, cz + sz, sw + 0.2, sh, sd + 0.2, ctx.wall, Facade.Residential, style.floorH, style.bay, seed + 0.4);
     pitched(ctx, RoofKind.Gable, cx + sx, cz + sz, gy + sh, sw, sd, 0.8);
   } else {
-    // 総 2 階＋玄関ポーチ
+    // 総 2 階
     e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Residential, style.floorH, style.bay, seed);
     pitched(ctx, RoofKind.Gable, cx, cz, gy + H, w, d);
-    tmpA.copy(ctx.wall).multiplyScalar(0.96);
-    awning(ctx, gy + style.floorH * 0.78, Math.min(1.4, d * 0.2), tmpA, 0.42);
   }
+
+  // 玄関ポーチ。庇・両脇の柱・玄関扉・玄関灯が 1 インスタンスで載る。
+  // 住宅の 1 階が「無地の壁」なのが、目線の高さでいちばん貧しく見えていた。
+  // 駐車スペースと取り合うので、玄関は正面の左寄せ・カーポートは右寄せにする。
+  const porchLen = Math.min(3.0, faceLen(ctx.front, w, d) * 0.45);
+  frontage(ctx, FrontKind.Porch, style.floorH * 0.98, porchLen / Math.max(faceLen(ctx.front, w, d), 1), {
+    off: -(faceLen(ctx.front, w, d) - porchLen) * 0.5 + 0.2,
+  });
 
   // カーポート（薄い屋根＋柱 2 本）。日本の宅地はほぼ必ず駐車スペースがある。
   if (v !== 1 && rnd(hash, 2) > 0.35) {
     const f = ctx.front;
-    const len = Math.min(4.6, faceLen(f, w, d) * 0.62);
+    const len = Math.min(4.0, faceLen(f, w, d) * 0.5);
     const dist = faceDist(f, w, d) + 1.9;
-    const px = cx + FX[f]! * dist;
-    const pz = cz + FZ[f]! * dist;
+    // 玄関ポーチの反対側へ寄せる。中央に重ねると柱と庇が刺さる。
+    const side = (faceLen(f, w, d) - len) * 0.4;
+    const px = cx + FX[f]! * dist + (f % 2 === 0 ? side : 0);
+    const pz = cz + FZ[f]! * dist + (f % 2 === 0 ? 0 : side);
     const cw = f % 2 === 0 ? len : 3.6;
     const cd = f % 2 === 0 ? 3.6 : len;
     e.box(px, gy + 2.3, pz, cw, 0.12, cd, 0xb8c4c8, 0.35, 0.25);
     e.box(px - cw / 2 + 0.2, gy, pz - cd / 2 + 0.2, 0.16, 2.3, 0.16, 0xa8adb0, 0.72, 0.18);
     e.box(px + cw / 2 - 0.2, gy, pz + cd / 2 - 0.2, 0.16, 2.3, 0.16, 0xa8adb0, 0.72, 0.18);
   }
-  // ブロック塀
+  // ブロック塀と門柱。門柱が 2 本立つだけで、塀の切れ目が「門」に見える。
   if (rnd(hash, 3) > 0.45) {
     const site = { ...ctx, w: w * 1.34, d: d * 1.34 };
     fence(site as BuildCtx, w * 1.34, d * 1.34, 1.15, 0xc8c6bc);
+    const f = ctx.front;
+    const gap = Math.min(3.0, w * 1.34 * 0.3);
+    const gdist = faceDist(f, w * 1.34, d * 1.34);
+    for (const sgn of [-1, 1]) {
+      const ox = f % 2 === 0 ? sgn * gap * 0.5 : 0;
+      const oz = f % 2 === 0 ? 0 : sgn * gap * 0.5;
+      e.box(cx + FX[f]! * gdist + ox, gy, cz + FZ[f]! * gdist + oz, 0.34, 1.5, 0.34, 0xd0cec4, 0.9, 0.02);
+      e.box(cx + FX[f]! * gdist + ox, gy + 1.5, cz + FZ[f]! * gdist + oz, 0.44, 0.1, 0.44, 0xb4b2a8, 0.85, 0.04);
+    }
   }
 }
 
@@ -609,15 +808,17 @@ function apartment(ctx: BuildCtx): void {
   } else {
     pitched(ctx, RoofKind.Gable, cx, cz, gy + H, w, d, 0.7);
   }
+  // 1 階の玄関。外廊下側に階段があるので、道路側は小さなポーチだけ。
+  frontage(ctx, FrontKind.Porch, style.floorH * 0.98, Math.min(0.34, 3.0 / Math.max(faceLen(ctx.front, w, d), 1)));
 }
 
 /** マンション。基壇＋セットバック＋塔屋＋受水槽。 */
 function mansion(ctx: BuildCtx): void {
   const v = Math.floor(rnd(ctx.hash, 1) * ctx.style.variants);
-  placeBlocks(ctx, massing(ctx, v === 0 ? 0 : v === 1 ? 1 : 3), Facade.Residential);
-  // 1 階のエントランス庇
-  tmpA.copy(ctx.wall).multiplyScalar(0.88);
-  awning(ctx, ctx.gy + ctx.style.floorH * 0.85, 1.8, tmpA, 0.34);
+  placeBlocks(ctx, massing(ctx, v === 0 ? 0 : v === 1 ? 1 : v === 2 ? 3 : 4), Facade.Residential);
+  // 1 階のエントランスホール。キャノピーと自動ドアが 1 インスタンスで載る。
+  // 幅は間口の 4 割。残りは住戸なので、バルコニーの窓帯のままでよい。
+  frontage(ctx, FrontKind.Office, ctx.style.floorH * 1.05, 0.4);
 }
 
 /** タワーマンション。基壇・低層部・タワー・冠部の 4 段構成にする。 */
@@ -627,7 +828,8 @@ function tower(ctx: BuildCtx): void {
   const seed = (hash % 997) / 997;
   const podiumH = style.floorH * 2.3;
   // 低層部（共用部）。周りより一回り広く、街路に対する足元を作る。
-  e.mass(cx, gy, cz, w * 1.1, podiumH, d * 1.1, ctx.wall, Facade.Shop, style.floorH, style.bay, seed);
+  e.mass(cx, gy, cz, w * 1.1, podiumH, d * 1.1, ctx.wall, Facade.Shop, frontFlag(style.floorH, ctx.front), style.bay, seed);
+  frontage(ctx, FrontKind.Shop, groundH(style, Facade.Shop), 0.94, { w: w * 1.1, d: d * 1.1 });
   rooftop(ctx, cx, cz, gy + podiumH, w * 1.1, d * 1.1, 50, { parapet: 0.9, clutter: 0 });
   // 塔体
   const shaftH = H - podiumH - style.floorH * 2;
@@ -661,7 +863,9 @@ function konbini(ctx: BuildCtx): void {
   const { e, cx, cz, gy, w, d, hash, style } = ctx;
   const H = snapHeight(ctx.height, style.floorH, Facade.Shop);
   const seed = (hash % 997) / 997;
-  e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Shop, style.floorH, style.bay, seed);
+  e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Shop, frontFlag(style.floorH, ctx.front), style.bay, seed);
+  // 全面ガラスの売り場。コンビニは 1 階しか無いので、ここがそのまま外観になる。
+  frontage(ctx, FrontKind.Shop, groundH(style, Facade.Shop), 0.94, { bay: faceLen(ctx.front, w, d) * 0.5 });
   const f = ctx.front;
   const len = faceLen(f, w, d);
   const dist = faceDist(f, w, d);
@@ -680,7 +884,6 @@ function konbini(ctx: BuildCtx): void {
   );
   // パラペットと庇
   rooftop(ctx, cx, cz, gy + H, w, d, 60, { parapet: 0.75, clutter: 1 });
-  awning(ctx, gy + H - 2.4, 1.5, 0xe8e8e4, 0.98);
   // 駐車場の車止めと照明ポール
   const px = cx + FX[f]! * (dist + 5.0);
   const pz = cz + FZ[f]! * (dist + 5.0);
@@ -722,7 +925,15 @@ function shotengai(ctx: BuildCtx): void {
     const h = snapHeight(ctx.height * (0.85 + rnd(hash, 20 + i) * 0.3), style.floorH, Facade.Shop);
     tmpB.copy(ctx.wall);
     jitterColor(tmpB, hash + i * 7919, 0.16, tmpC);
-    e.mass(px, gy, pz, alongX ? sw : depth, h, alongX ? depth : sw, tmpC, Facade.Shop, style.floorH, style.bay, seed + i * 0.17);
+    e.mass(px, gy, pz, alongX ? sw : depth, h, alongX ? depth : sw, tmpC, Facade.Shop, frontFlag(style.floorH, f), style.bay, seed + i * 0.17);
+    // 店ごとのショップフロント。間口が狭いので 1 店 = 1 区画で割る。
+    frontage(ctx, FrontKind.Shop, groundH(style, Facade.Shop), 0.98, {
+      w: alongX ? sw : depth,
+      d: alongX ? depth : sw,
+      cx: px,
+      cz: pz,
+      bay: sw,
+    });
     // 切妻を通りに直交させる（妻面が通りを向く）
     if (style.roofKind === RoofKind.Gable) {
       const rh = Math.min(2.2, sw * 0.34);
@@ -749,11 +960,29 @@ function shotengai(ctx: BuildCtx): void {
     );
   }
 
-  // 軒を通して連ねる庇（アーケード）
+  // 軒を通して連ねる庇（アーケード）。
+  // 店ごとの庇の上に、通りを覆う 1 枚がさらに架かる二重構造にする。
+  // 高さを分けないと、店の庇とアーケードが同じ面で重なって縞が出る。
   const dist = faceDist(f, w, d);
-  const ax = cx + FX[f]! * (dist + 0.9);
-  const az = cz + FZ[f]! * (dist + 0.9);
-  e.box(ax, gy + style.floorH * 1.2, az, alongX ? span : 2.0, 0.2, alongX ? 2.0 : span, 0x8a6350, 0.75, 0.06);
+  const ax = cx + FX[f]! * (dist + 1.5);
+  const az = cz + FZ[f]! * (dist + 1.5);
+  const arcadeY = gy + groundH(style, Facade.Shop) + 0.55;
+  e.box(ax, arcadeY, az, alongX ? span : 3.0, 0.2, alongX ? 3.0 : span, 0x8a6350, 0.75, 0.06);
+  // アーケードを受ける柱。通りに柱が立つと、歩道の奥行きが読める。
+  for (let i = 0; i <= shops; i++) {
+    const off = -span / 2 + (span / shops) * i;
+    e.box(
+      cx + FX[f]! * (dist + 2.8) + (alongX ? off : 0),
+      gy,
+      cz + FZ[f]! * (dist + 2.8) + (alongX ? 0 : off),
+      0.16,
+      arcadeY - gy,
+      0.16,
+      0x9a8a7a,
+      0.8,
+      0.08,
+    );
+  }
   // 幟（のぼり）。細く色の強い縦の板が数本並ぶだけで、通りの賑わいが出る。
   for (let i = 0; i < shops; i++) {
     const off = -span / 2 + sw * (i + 0.72);
@@ -769,12 +998,13 @@ function supermarket(ctx: BuildCtx): void {
   const { e, cx, cz, gy, w, d, hash, style } = ctx;
   const H = snapHeight(ctx.height, style.floorH, Facade.Shop);
   const seed = (hash % 997) / 997;
-  e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Shop, style.floorH, style.bay, seed);
+  e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Shop, frontFlag(style.floorH, ctx.front), style.bay, seed);
   rooftop(ctx, cx, cz, gy + H, w, d, 80, { parapet: 1.0 });
   const f = ctx.front;
   const len = faceLen(f, w, d);
   const dist = faceDist(f, w, d);
-  awning(ctx, gy + style.floorH * 1.3, 2.6, 0xdedad0, 0.7);
+  // 売り場は 1 区画が広い。5.5m 刻みで割ると柱だらけになるので、間口の 1/3 で割る。
+  frontage(ctx, FrontKind.Shop, groundH(style, Facade.Shop), 0.92, { bay: len / 3 });
   e.signFace(
     cx + FX[f]! * (dist + 0.36),
     gy + H - 2.0,
@@ -793,8 +1023,9 @@ function supermarket(ctx: BuildCtx): void {
 function zakkyo(ctx: BuildCtx): void {
   const { e, cx, cz, gy, w, d, hash, style } = ctx;
   const v = Math.floor(rnd(hash, 1) * ctx.style.variants);
-  const blocks = massing(ctx, v === 2 ? 3 : v);
-  placeBlocks(ctx, blocks, Facade.Shop);
+  const blocks = massing(ctx, v === 2 ? 3 : v === 3 ? 4 : v);
+  // 1 階はテナント看板の並ぶ入口。奥まった階段と自販機で「入れる建物」に見せる。
+  placeBlocks(ctx, blocks, Facade.Shop, FrontKind.Tenant);
   // 裏の非常階段。正面に看板が並ぶぶん、裏は階段で読ませる。
   if (blocks[0]!.h > style.floorH * 3.5 && rnd(hash, 4) > 0.45) {
     fireStair(ctx, cx, cz, w, d, gy, blocks[0]!.h, style.floorH);
@@ -830,9 +1061,8 @@ function zakkyo(ctx: BuildCtx): void {
 function office(ctx: BuildCtx): void {
   const v = Math.floor(rnd(ctx.hash, 1) * ctx.style.variants);
   const blocks = massing(ctx, v === 0 ? 1 : v);
-  placeBlocks(ctx, blocks, Facade.Curtain);
-  tmpA.copy(ctx.wall).multiplyScalar(0.85);
-  awning(ctx, ctx.gy + ctx.style.floorH * 1.15, 2.2, tmpA, 0.5);
+  // 1 階はエントランスホール＋キャノピー。
+  placeBlocks(ctx, blocks, Facade.Curtain, FrontKind.Office);
   if (rnd(ctx.hash, 4) > 0.55) {
     fireStair(ctx, ctx.cx, ctx.cz, ctx.w, ctx.d, ctx.gy, blocks[0]!.h, ctx.style.floorH);
   }
@@ -844,7 +1074,9 @@ function industrial(ctx: BuildCtx, kind: 'small' | 'big' | 'saw' | 'store'): voi
   const H = snapHeight(ctx.height, style.floorH, Facade.Industrial);
   const seed = (hash % 997) / 997;
   const alongX = w >= d;
-  e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Industrial, style.floorH, style.bay, seed);
+  e.mass(cx, gy, cz, w, H, d, ctx.wall, Facade.Industrial, frontFlag(style.floorH, ctx.front), style.bay, seed);
+  // 搬入口。シャッターと通用口とガイドレールを 1 インスタンスで。
+  frontage(ctx, FrontKind.Shutter, Math.min(H * 0.9, style.floorH * 1.05), 0.62);
 
   if (style.roofKind === RoofKind.Gable) {
     // 折板の切妻。勾配を寝かせると工場らしくなる。
@@ -916,8 +1148,10 @@ function station(ctx: BuildCtx): void {
   // 駅舎
   const bw = alongX ? w * 0.55 : w;
   const bd = alongX ? d : d * 0.55;
-  e.mass(cx, gy, cz, bw, H, bd, ctx.wall, Facade.Institution, style.floorH, style.bay, seed);
+  e.mass(cx, gy, cz, bw, H, bd, ctx.wall, Facade.Institution, frontFlag(style.floorH, ctx.front), style.bay, seed);
   pitched(ctx, RoofKind.Hip, cx, cz, gy + H, bw, bd, 0.85);
+  // 改札口。奥が明るいガラスの間口があると、駅が「入れる建物」になる。
+  frontage(ctx, FrontKind.Office, style.floorH * 1.1, 0.72, { w: bw, d: bd });
 
   // ホーム上屋。長く薄い庇を線路方向に伸ばす。
   const pl = alongX ? w * 1.5 : d * 1.5;
@@ -976,6 +1210,8 @@ function school(ctx: BuildCtx): void {
   const oz = alongX ? -d * 0.29 : 0;
   e.mass(cx + ox, gy, cz + oz, bw, H, bd, ctx.wall, Facade.Institution, style.floorH, style.bay, seed);
   rooftop(ctx, cx + ox, cz + oz, gy + H, bw, bd, 100, { parapet: 1.0 });
+  // 昇降口。校舎の中ほどに 1 か所だけ。
+  frontage(ctx, FrontKind.Office, style.floorH, 0.26, { w: bw, d: bd, cx: cx + ox, cz: cz + oz });
   // 階段室
   e.mass(
     cx + ox + (alongX ? bw * 0.38 : 0),
@@ -1086,9 +1322,9 @@ function institution(ctx: BuildCtx, kind: 'hospital' | 'cityhall' | 'police' | '
   const { e, cx, cz, gy, w, d, hash, style } = ctx;
   const v = kind === 'cityhall' ? 0 : Math.floor(rnd(hash, 1) * 3);
   const blocks = massing(ctx, v === 0 ? 0 : v === 1 ? 2 : 1);
-  placeBlocks(ctx, blocks, Facade.Institution);
+  // 玄関はキャノピー付きのエントランスホール。
+  placeBlocks(ctx, blocks, Facade.Institution, FrontKind.Office);
   tmpA.copy(ctx.wall).multiplyScalar(0.9);
-  awning(ctx, gy + style.floorH * 1.1, 2.4, tmpA, 0.45);
 
   const f = ctx.front;
   const dist = faceDist(f, w, d);
@@ -1263,6 +1499,15 @@ function park(ctx: BuildCtx): void {
   }
 }
 
+/** 立面の様式から 1 階の店構えを選ぶ（個別のレシピを持たない用途向け）。 */
+function defaultFrontKind(facade: number): number {
+  if (facade === Facade.Shop) return FrontKind.Shop;
+  if (facade === Facade.Curtain || facade === Facade.Institution) return FrontKind.Office;
+  if (facade === Facade.Industrial) return FrontKind.Shutter;
+  if (facade === Facade.Residential) return FrontKind.Porch;
+  return -1;
+}
+
 /**
  * 形状キーごとの造形を選ぶ。
  * ここに無いキーは「量塊＋屋根＋屋上」の一般形にまわす。
@@ -1329,7 +1574,7 @@ export function composeBuilding(key: string, ctx: BuildCtx): void {
       return park(ctx);
     default: {
       const v = Math.floor(rnd(ctx.hash, 1) * ctx.style.variants);
-      return placeBlocks(ctx, massing(ctx, v), ctx.style.facade);
+      return placeBlocks(ctx, massing(ctx, v), ctx.style.facade, defaultFrontKind(ctx.style.facade));
     }
   }
 }

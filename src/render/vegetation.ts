@@ -10,7 +10,7 @@ import {
   Quaternion,
   Vector3,
 } from 'three';
-import { applyVerticalAO, mergeParts, type Part } from './materials';
+import { applyVerticalAO, chamferedUnitBox, mergeParts, type Part } from './materials';
 import {
   BAMBOO_SEASON,
   BROADLEAF_SEASON,
@@ -112,7 +112,7 @@ function blob(seed: number, radius = 1): BufferGeometry {
  * 押し戻しているから。同じ理屈で、枝の塊にもわずかに緑を残して
  * 明度を落としてある。冬の雑木林を遠くから見た色は実際にもこの辺り。
  */
-const TWIG_MASS = 0x4a5040;
+const TWIG_MASS = 0x59594a;
 
 /** 冬の枝の塊の [x, y, z, 半径]。夏の樹冠よりひと回り小さく、まばらに散らす。 */
 const WINTER_MASS: [number, number, number, number][] = [
@@ -424,6 +424,21 @@ export function bundGeometry(season: number): BufferGeometry {
     { geom: boxGeom(0.86, 0.3, 0.86), color: canopyColor(grass, 0.4), matrix: at(0, 0.7, 0) },
   ];
   return applyVerticalAO(mergeParts(parts), 0.72, 1.04, 1.4);
+}
+
+/**
+ * 敷地の小物（塀・生垣・物置・駐車パッド）の共通ジオメトリ。
+ *
+ * 形の違いは **拡大率だけ** で作る。塀は薄く長く、生垣は少し厚く、
+ * 物置は箱、駐車パッドは板。1 種類のジオメトリで済ませれば
+ * InstancedMesh が 1 つで足り、ドローコールが 4 つではなく 1 つになる。
+ *
+ * 角を落としてあるのは、街区の空き地に何十個も並ぶものだからで、
+ * 鋭い辺のままだと「立方体を置いた」感じが強く出てしまう。
+ * 足元を暗くしておくと、地面に置いたときにそこだけ影が溜まって接地する。
+ */
+export function lotPropGeometry(): BufferGeometry {
+  return applyVerticalAO(chamferedUnitBox(0.05), 0.66, 1.06, 1.5);
 }
 
 /** 底面 y=0 の直方体。 */

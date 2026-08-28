@@ -257,7 +257,10 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     perLevel: 6,
     roofKind: RoofKind.Flat,
     inset: 0.82,
-    variants: 3,
+    // 最上階セットバック・段違い・独立した階段室ボックスを引けるようにする。
+    // 同じ押し出し箱が並ぶのがスカイラインの鋸歯の正体なので、
+    // 中高層ほど量塊の候補を増やす。
+    variants: 4,
   }),
   tower: style({
     walls: [0xc8ccd2, 0xbfc6ce, 0xd2d6da, 0xb4bcc6, 0xdcdee0, 0xc0c8c4, 0xcac4ba],
@@ -324,7 +327,7 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     perLevel: 6.6,
     roofKind: RoofKind.Flat,
     inset: 0.86,
-    variants: 3,
+    variants: 4,
   }),
   office: style({
     walls: [
@@ -338,7 +341,7 @@ export const MESH_STYLES: Record<string, MeshStyle> = {
     perLevel: 10.8,
     roofKind: RoofKind.Flat,
     inset: 0.84,
-    variants: 3,
+    variants: 5,
   }),
   // ---- 工業 ----
   smallfactory: style({

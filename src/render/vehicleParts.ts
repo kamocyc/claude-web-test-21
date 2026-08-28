@@ -62,7 +62,13 @@ const BEAM = 0xffe9b4;
 
 /**
  * 自家用車の車種。日本の街なので軽自動車を主役に置く。
- * 保有比率はおおむね 軽 4 : 乗用 4 : 箱型 2。
+ *
+ * 3 車種では足りなかった。路上に並ぶ台数は 1 タイル 2 台 × 数十タイルなので、
+ * 3 種類だと消失点まで見通したときに同じシルエットが 10 台以上並び、
+ * 「インスタンスを並べただけ」だと一目で分かってしまう。
+ * **5 車種**あると、隣り合う 3 台が同じ形になる確率が 4% まで落ちる。
+ * 増えるのは 1 車種あたり 2 ドローコール（本体・夜の灯り）だけで、
+ * 台数がいくら増えても call は増えない。
  */
 export const CarKind = {
   /** 軽自動車。背が高く四角い。 */
@@ -71,16 +77,77 @@ export const CarKind = {
   Sedan: 1,
   /** ワンボックス。鼻が短くて背が高い。 */
   Van: 2,
+  /** ステーションワゴン／SUV。腰高でルーフが後端まで伸びる。 */
+  Wagon: 3,
+  /** 軽トラック。日本の郊外・農村でいちばん目に入る車。 */
+  KeiTruck: 4,
 } as const;
 export type CarKind = (typeof CarKind)[keyof typeof CarKind];
-export const CAR_KIND_COUNT = 3;
+export const CAR_KIND_COUNT = 5;
 
-/** ハッシュから車種を選ぶ。同じ車は毎フレーム同じ形になる。 */
+/**
+ * ハッシュから車種を選ぶ。同じ車は毎フレーム同じ形になる。
+ * 比率は日本の保有台数に寄せた 軽 30 : 乗用 26 : 箱型 14 : ワゴン 20 : 軽トラ 10。
+ */
 export function carKind(hash: number): CarKind {
   const h = (hash >>> 7) % 100;
-  if (h < 40) return CarKind.Kei;
-  if (h < 80) return CarKind.Sedan;
-  return CarKind.Van;
+  if (h < 30) return CarKind.Kei;
+  if (h < 56) return CarKind.Sedan;
+  if (h < 70) return CarKind.Van;
+  if (h < 90) return CarKind.Wagon;
+  return CarKind.KeiTruck;
+}
+
+/**
+ * 車体色。
+ *
+ * `theme.ts` の 5 色では、路上に降りたときに「白と紺の 2 色」にしか見えなかった。
+ * 白・銀・黒で 8 割という実際の分布は守りつつ、**同じ「白」の中に階調を作る**
+ * ことで単調さを消す。パール白・アイボリー・シャンパンは離れて見れば同じ白系だが、
+ * 隣り合うと確かに違う車に見える。
+ */
+const CAR_PAINTS: { upTo: number; color: number }[] = [
+  { upTo: 18, color: 0xe9e9e6 }, // ソリッド白
+  { upTo: 30, color: 0xdfdcd3 }, // パール白（わずかに温かい）
+  { upTo: 38, color: 0xcfd2cf }, // アイボリー寄りの白
+  { upTo: 52, color: 0xa9aeb3 }, // シルバー
+  { upTo: 60, color: 0x7c8288 }, // ガンメタ
+  { upTo: 74, color: 0x2b2e33 }, // 黒
+  { upTo: 81, color: 0x36506f }, // 紺
+  { upTo: 86, color: 0x6d8faa }, // 水色
+  { upTo: 91, color: 0x8c3a35 }, // 赤
+  { upTo: 95, color: 0x3d5a44 }, // 深緑
+  { upTo: 100, color: 0xb3a184 }, // ベージュ／シャンパン
+];
+
+/** ハッシュから車体色を引く。 */
+export function carPaint(hash: number): number {
+  const h = hash % 100;
+  for (const c of CAR_PAINTS) {
+    if (h < c.upTo) return c.color;
+  }
+  return CAR_PAINTS[CAR_PAINTS.length - 1]!.color;
+}
+
+/**
+ * 事業者ごとのトラックの塗色。
+ *
+ * 帰りの空車をすべて同じ灰色にしていたので、走っているトラックの過半数が
+ * 「同じ形・同じ色」で並び、そこがいちばん機械的に見えていた。
+ * 日本の運送会社の車体でよく見る色から、隣り合っても見分けの付く順に並べてある。
+ */
+const TRUCK_LIVERIES: number[] = [
+  0xe9e9e6, // 白（いちばん多い）
+  0xdedfe2, // 銀白
+  0x2f6f4f, // 緑
+  0x2d5590, // 青
+  0xa8402f, // 赤
+  0xd8b24a, // 黄
+  0x4a4f57, // 濃灰
+];
+
+export function truckLivery(hash: number): number {
+  return TRUCK_LIVERIES[(hash >>> 0) % TRUCK_LIVERIES.length]!;
 }
 
 /** 車種ごとの寸法（全長・全幅・全高、m）。灯りの位置もここから引く。 */
@@ -97,6 +164,9 @@ interface CarSpec {
   tailY: number;
   /** 前照灯の左右間隔（中心からの距離）。 */
   headX: number;
+  /** 室内灯を灯す位置と長さ。軽トラは荷台があるのでキャブの上に寄せる。 */
+  cabinZ?: number;
+  cabinD?: number;
 }
 
 const CAR_SPECS: Record<CarKind, CarSpec> = {
@@ -112,7 +182,26 @@ const CAR_SPECS: Record<CarKind, CarSpec> = {
     length: 4.4, width: 1.7, height: 1.95,
     frontZ: 1.5, rearZ: -1.36, wheelR: 0.3, headY: 0.86, tailY: 1.24, headX: 0.6,
   },
+  [CarKind.Wagon]: {
+    length: 4.62, width: 1.78, height: 1.66,
+    frontZ: 1.5, rearZ: -1.44, wheelR: 0.33, headY: 0.84, tailY: 1.16, headX: 0.62,
+  },
+  [CarKind.KeiTruck]: {
+    length: 3.4, width: 1.47, height: 1.78,
+    frontZ: 1.06, rearZ: -1.02, wheelR: 0.26, headY: 0.7, tailY: 0.72, headX: 0.48,
+    cabinZ: 0.86, cabinD: 1.1,
+  },
 };
+
+/**
+ * 車輪の角数。
+ *
+ * 目線の高さのカットでは車輪が画面上 20〜40px あり、8 角柱だと下端が
+ * 「短い柱を斜めに切った面」に見えて接地点が読めなかった。12 角にすると
+ * 底に必ず平らな面が来て、そこが路面に接する。1 台あたり 4 輪 × 12 三角形
+ * 増えるだけ（96 → 144）なので、近景の説得力に対して十分安い。
+ */
+const WHEEL_SEG = 12;
 
 /** 4 輪をまとめて。 */
 function fourWheels(s: CarSpec, width: number): Part[] {
@@ -120,7 +209,9 @@ function fourWheels(s: CarSpec, width: number): Part[] {
   const out: Part[] = [];
   for (const z of [s.frontZ, s.rearZ]) {
     for (const side of [1, -1] as const) {
-      out.push(...wheel({ x: side * x, y: s.wheelR, z, r: s.wheelR, width, side, tyre: TYRE, hub: HUB }));
+      out.push(
+        ...wheel({ x: side * x, y: s.wheelR, z, r: s.wheelR, width, side, seg: WHEEL_SEG, tyre: TYRE, hub: HUB }),
+      );
     }
   }
   return out;
@@ -176,10 +267,44 @@ function bake(parts: Part[]): BufferGeometry {
     const mark = new Float32Array(nSolid + nGlass);
     mark.fill(1, nSolid);
     g.setAttribute(GLASS_ATTRIBUTE, new BufferAttribute(mark, 1));
+    curveGlass(g, mark);
   }
   // 下ほど暗くする。車の下は実際に影になるので、これだけで「浮き」が消える。
   applyVerticalAO(g, 0.62, 1.06, 1.5);
   return g;
+}
+
+/**
+ * ガラスの法線を左右に反らせる。
+ *
+ * 窓は平らな板で焼いてあるので、面の法線が一定になる。すると反射ベクトルも
+ * 面の中で一定になり、どんなに良い環境マップを当てても**1 枚のガラスが
+ * 一様な明るい灰色**にしかならない（＝「白く塗った板」に見える正体）。
+ *
+ * 実車のガラスは必ず左右に湾曲していて、だからこそ 1 枚の中で空・地平・
+ * 路面が横に流れる。ここでは面を割らずに **法線だけ**を円筒状に反らせる。
+ * 頂点も三角形も 1 つも増えないのに、反射の階調が出る。
+ */
+function curveGlass(g: BufferGeometry, mark: Float32Array): void {
+  const pos = g.getAttribute('position');
+  const nor = g.getAttribute('normal');
+  if (!pos || !nor) return;
+  // 車体半幅 0.85m ぶんで法線が 0.6 ぶん傾く＝半径 1.4m 前後の湾曲。
+  const CURVE = 0.6;
+  const HALF = 0.85;
+  for (let i = 0; i < pos.count; i++) {
+    if (mark[i] !== 1) continue;
+    const t = Math.max(-1, Math.min(1, pos.getX(i) / HALF));
+    let nx = nor.getX(i) + CURVE * t;
+    let ny = nor.getY(i);
+    let nz = nor.getZ(i);
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len;
+    ny /= len;
+    nz /= len;
+    nor.setXYZ(i, nx, ny, nz);
+  }
+  nor.needsUpdate = true;
 }
 
 // ---- 自家用車 --------------------------------------------------------------
@@ -271,11 +396,89 @@ function vanParts(): Part[] {
   return [...boxes(specs), ...fourWheels(s, 0.18)];
 }
 
+/**
+ * ステーションワゴン／SUV。
+ * セダンより腰が高く、ルーフが後端まで水平に伸びて後ろで断ち切られる。
+ * ルーフレールを 1 本入れると、真横から見たときにセダンと確実に区別が付く。
+ */
+function wagonParts(): Part[] {
+  const s = CAR_SPECS[CarKind.Wagon];
+  const specs: BoxSpec[] = [
+    // 腰。セダンより高く、絞りは浅い。
+    { w: s.width, h: 0.78, d: s.length, y: 0.62, c: 0.07, wf: 0.9, wb: 0.93 },
+    // ボンネット。
+    { w: s.width - 0.1, h: 0.16, d: 1.3, y: 1.03, z: 1.42, c: 0.05, wf: 0.86, hf: 0.72 },
+    // ガラスハウス。後端まで伸ばす。
+    { w: s.width - 0.1, h: 0.5, d: 2.9, y: 1.29, z: -0.55, wt: 0.93, wf: 0.95, tint: GLASS },
+    // ルーフ。
+    { w: s.width - 0.13, h: 0.11, d: 2.7, y: 1.58, z: -0.6, c: 0.05, wt: 0.95 },
+    // ルーフレール（板 1 枚で左右に 2 本出る）。
+    { w: s.width - 0.04, h: 0.07, d: 2.1, y: 1.66, z: -0.7, tint: 0x4c5054 },
+    // 傾いたフロントガラスと、立ったリアゲートのガラス。
+    { w: s.width - 0.16, h: 0.76, d: 0.06, y: 1.28, z: 0.94, rx: -0.5, tint: GLASS },
+    { w: s.width - 0.2, h: 0.66, d: 0.06, y: 1.34, z: -2.0, rx: 0.16, tint: GLASS },
+    // バンパー。SUV らしく黒い樹脂の下回りを覗かせる。
+    { w: s.width - 0.04, h: 0.32, d: 0.3, y: 0.44, z: s.length / 2 - 0.08, c: 0.06, tint: TRIM },
+    { w: s.width - 0.04, h: 0.32, d: 0.3, y: 0.46, z: -s.length / 2 + 0.08, c: 0.06, tint: TRIM },
+    // 前後の車輪の間だけ。車輪まで覆うと、タイヤの外側に樹脂が突き出す。
+    { w: s.width - 0.04, h: 0.2, d: 2.5, y: 0.34, tint: 0x3c4045 },
+    // 灯火。テールは縦長でリアゲートの脇に付く。
+    { w: 0.36, h: 0.19, d: 0.14, x: s.headX, y: s.headY, z: s.length / 2 - 0.12, tint: LENS },
+    { w: 0.36, h: 0.19, d: 0.14, x: -s.headX, y: s.headY, z: s.length / 2 - 0.12, tint: LENS },
+    { w: 0.16, h: 0.46, d: 0.1, x: 0.68, y: s.tailY, z: -s.length / 2 + 0.06, tint: TAIL_LENS },
+    { w: 0.16, h: 0.46, d: 0.1, x: -0.68, y: s.tailY, z: -s.length / 2 + 0.06, tint: TAIL_LENS },
+    { w: 0.9, h: 0.16, d: 0.08, y: 0.74, z: s.length / 2 - 0.06, tint: 0x30343a },
+    ...mirrors(0.95, 1.18, 0.78),
+    ...doorSeams(s.width, 0.72, 0.78, [0.42, -0.92]),
+  ];
+  return [...boxes(specs), ...fourWheels(s, 0.2)];
+}
+
+/**
+ * 軽トラック。
+ * 運転台が前端まで来て、その後ろが低い荷台。日本の郊外・農村の路上で
+ * いちばん目に入る形なので、これが混ざるだけで「日本の街」らしさが増す。
+ */
+function keiTruckParts(): Part[] {
+  const s = CAR_SPECS[CarKind.KeiTruck];
+  const specs: BoxSpec[] = [
+    // シャシー。
+    { w: s.width - 0.18, h: 0.22, d: s.length - 0.3, y: 0.52, tint: UNDER },
+    // キャブ。前端から 1.5m ほど。
+    { w: s.width, h: 1.06, d: 1.5, y: 1.14, z: 0.86, c: 0.05, wt: 0.96 },
+    // フロントガラス（立っている）と側面窓。
+    { w: s.width - 0.12, h: 0.6, d: 0.07, y: 1.42, z: 1.58, rx: -0.1, tint: GLASS },
+    { w: s.width + 0.03, h: 0.5, d: 1.2, y: 1.44, z: 0.82, tint: GLASS },
+    // 荷台の床とあおり 3 枚。
+    { w: s.width, h: 0.12, d: 1.72, y: 0.72, z: -0.78, tint: 0x9c9184 },
+    { w: 0.08, h: 0.42, d: 1.72, x: s.width / 2 - 0.04, y: 0.98, z: -0.78 },
+    { w: 0.08, h: 0.42, d: 1.72, x: -(s.width / 2 - 0.04), y: 0.98, z: -0.78 },
+    { w: s.width, h: 0.42, d: 0.08, y: 0.98, z: -1.6 },
+    // 鳥居（キャブ後ろの立ち板）。
+    { w: s.width - 0.06, h: 0.5, d: 0.08, y: 1.42, z: 0.1, tint: 0xdfe0e0 },
+    // バンパー・灯火。
+    { w: s.width - 0.04, h: 0.26, d: 0.24, y: 0.42, z: s.length / 2 - 0.04, c: 0.05, tint: TRIM },
+    { w: 0.26, h: 0.18, d: 0.1, x: s.headX, y: s.headY, z: s.length / 2 - 0.03, tint: LENS },
+    { w: 0.26, h: 0.18, d: 0.1, x: -s.headX, y: s.headY, z: s.length / 2 - 0.03, tint: LENS },
+    { w: 0.16, h: 0.22, d: 0.08, x: 0.56, y: s.tailY, z: -s.length / 2 + 0.02, tint: TAIL_LENS },
+    { w: 0.16, h: 0.22, d: 0.08, x: -0.56, y: s.tailY, z: -s.length / 2 + 0.02, tint: TAIL_LENS },
+    ...mirrors(0.86, 1.46, 1.44),
+  ];
+  return [...boxes(specs), ...fourWheels(s, 0.15)];
+}
+
 const CAR_BUILDERS: Record<CarKind, () => Part[]> = {
   [CarKind.Kei]: keiParts,
   [CarKind.Sedan]: sedanParts,
   [CarKind.Van]: vanParts,
+  [CarKind.Wagon]: wagonParts,
+  [CarKind.KeiTruck]: keiTruckParts,
 };
+
+/** 車種ごとの全長 (m)。前後の車間を取るのに使う（`agentLayer`）。 */
+export function carLength(kind: CarKind): number {
+  return CAR_SPECS[kind].length;
+}
 
 export function carGeometry(kind: CarKind): BufferGeometry {
   return bake(CAR_BUILDERS[kind]());
@@ -307,9 +510,85 @@ export function carLampGeometry(kind: CarKind): BufferGeometry {
       { w: 0.13, h: 0.3, d: 0.08, x: 0.62, y: s.tailY, z: tail, tint: TAIL_LAMP },
       { w: 0.13, h: 0.3, d: 0.08, x: -0.62, y: s.tailY, z: tail, tint: TAIL_LAMP },
       // 車内のかすかな灯り。窓越しに見えるだけでよいので弱く小さく。
-      { w: s.width - 0.34, h: 0.06, d: 1.2, y: s.height - 0.28, z: -0.2, tint: 0x6a5230 },
+      {
+        w: s.width - 0.34,
+        h: 0.06,
+        d: s.cabinD ?? 1.2,
+        y: s.height - 0.28,
+        z: s.cabinZ ?? -0.2,
+        tint: 0x6a5230,
+      },
     ]),
   );
+}
+
+/**
+ * 前照灯の光の**円錐**（空中に伸びる光）。
+ *
+ * 路面に落ちる楕円だけでは、真横や斜め前から見た夜の車が「点が 2 つ光る箱」に
+ * しかならない。夜の街の写真で車が車に見えるのは、埃と湿気に散乱した光が
+ * 前方に立体として伸びているからで、それが**光っている物と照らされている物の
+ * 関係**を作っている。加算合成の円錐 1 つ（180 三角形）でそこまで届く。
+ *
+ * 単位ジオメトリ: 頂点が原点、+Z へ長さ 1。半径は 1 の位置で 0.5。
+ * 使う側で (幅, 高さ, 長さ) にスケールする。表裏どちらも描くので、
+ * 中心軸の近くは前面と背面が二重に足されて自然に明るくなる。
+ */
+export function beamConeGeometry(): BufferGeometry {
+  const SEG = 12;
+  const NZ = 4;
+  const c = new Color(BEAM);
+  const pos: number[] = [];
+  const col: number[] = [];
+  // 根元は絞られていて、遠くへ行くほど広がりながら暗くなる。
+  const radius = (t: number): number => (0.06 + t * 0.44) * 1.0;
+  const bright = (t: number): number => Math.pow(1 - t, 2.0) * 0.9;
+  const push = (t: number, k: number): void => {
+    const a = (k / SEG) * Math.PI * 2;
+    const r = radius(t);
+    pos.push(Math.cos(a) * r, Math.sin(a) * r, t);
+    const b = bright(t);
+    col.push(c.r * b, c.g * b, c.b * b);
+  };
+  for (let i = 0; i < NZ; i++) {
+    const t0 = i / NZ;
+    const t1 = (i + 1) / NZ;
+    for (let k = 0; k < SEG; k++) {
+      push(t0, k); push(t0, k + 1); push(t1, k + 1);
+      push(t0, k); push(t1, k + 1); push(t1, k);
+    }
+  }
+  const g = new BufferGeometry();
+  g.setAttribute('position', new BufferAttribute(new Float32Array(pos), 3));
+  g.setAttribute('color', new BufferAttribute(new Float32Array(col), 3));
+  g.computeVertexNormals();
+  return mergeParts([{ geom: g }]);
+}
+
+/** 円錐の置き方（前端の z・幅・高さ・届く距離）。 */
+export interface ConeSpec {
+  z: number;
+  y: number;
+  width: number;
+  height: number;
+  length: number;
+}
+
+export function carConeSpec(kind: CarKind): ConeSpec {
+  const s = CAR_SPECS[kind];
+  return { z: s.length / 2, y: s.headY, width: s.width * 2.4, height: 1.5, length: 11 };
+}
+
+export function truckConeSpec(): ConeSpec {
+  return { z: TRUCK_LEN / 2, y: 0.92, width: TRUCK_W * 2.2, height: 1.8, length: 13 };
+}
+
+export function busConeSpec(): ConeSpec {
+  return { z: BUS_LEN / 2, y: 0.98, width: BUS_W * 2.2, height: 1.8, length: 13 };
+}
+
+export function trainConeSpec(): ConeSpec {
+  return { z: L / 2, y: 1.62, width: 5.5, height: 3.0, length: 26 };
 }
 
 /**
@@ -371,6 +650,9 @@ export function carBeamSpec(kind: CarKind): { z: number; width: number; length: 
 
 const BUS_LEN = 8.2;
 const BUS_W = 2.44;
+/** バスの全長・全幅 (m)。車間と接地影の大きさを決めるのに使う。 */
+export const BUS_BODY_M = BUS_LEN;
+export const BUS_WIDTH_M = BUS_W;
 
 export function busGeometry(): BufferGeometry {
   const half = BUS_LEN / 2;
@@ -446,6 +728,9 @@ export function busBeamSpec(): { z: number; width: number; length: number; y: nu
 
 const TRUCK_LEN = 6.6;
 const TRUCK_W = 2.16;
+/** トラックの全長・全幅 (m)。 */
+export const TRUCK_BODY_M = TRUCK_LEN;
+export const TRUCK_WIDTH_M = TRUCK_W;
 
 /**
  * トラック。運転台と荷台を分ける。

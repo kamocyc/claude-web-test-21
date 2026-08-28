@@ -16,7 +16,9 @@ import {
   PADDY_WATER_SEASON,
   groundColor,
   terrainNoise,
+  terrainNoise2,
 } from './groundPalette';
+import { applySurfaceNoise } from './surfaceNoise';
 import {
   RIVER_SINK,
   SEA_LEVEL,
@@ -107,6 +109,17 @@ export class TerrainMesh {
 
   constructor() {
     this.group.name = 'terrain';
+    // 近距離のディテール。頂点は 1 タイル 10m 刻みなので、頂点カラーで作れる
+    // むらは最小でも 10m ある。目線の高さで足元を見ると、その 10m のむらは
+    // 画面いっぱいに引き伸ばされて「巨大なグラデーションの板」になる。
+    // 世界座標のノイズを材質に差し込んで、1〜2m の粒を近くだけ重ねる。
+    applySurfaceNoise(this.material, {
+      scale: 2.8,
+      color: 0.09,
+      roughness: 0.06,
+      bump: 0.035,
+      fade: 220,
+    });
     for (let c = 0; c < CHUNK_COUNT; c++) {
       const geom = new BufferGeometry();
       const tiles = CHUNK * CHUNK;
@@ -325,7 +338,7 @@ export class TerrainMesh {
             // 明度だけでなく緑と赤の比も少し動かす。明度だけだと
             // 「同じ色の濃淡」にしかならず、草地の情報量が増えない。
             const nz = terrainNoise(ox + cxl, oy + cyl);
-            const m = 1 + nz * 0.21;
+            const m = 1 + nz * 0.26;
             r *= m * (1 - nz * 0.05);
             g *= m;
             bl *= m * (1 + nz * 0.06);
@@ -341,6 +354,15 @@ export class TerrainMesh {
     nrm.needsUpdate = true;
     col.needsUpdate = true;
     geom.computeBoundingSphere();
+  }
+
+  /** 隣接 4 タイルに建物があるか（敷地際の地面を草のままにしないため）。 */
+  private nextToBuilt(world: { buildingRef: Uint32Array }, t: number): boolean {
+    for (let d = 0; d < 4; d++) {
+      const nb = neighbor(t, d);
+      if (nb >= 0 && world.buildingRef[nb] !== 0) return true;
+    }
+    return false;
   }
 
   /** 隣接 4 タイルに淡水があるか（川岸の護岸を出すのに使う）。 */
@@ -429,8 +451,22 @@ export class TerrainMesh {
     // 素材を混ぜて地面の色を作る。分類・標高・傾斜・季節・水辺までの距離。
     // ノイズを渡しているのは、傾斜だけで岩を出すと平らな山頂が
     // 一面の同じ灰色になって巨大な板に見えるため。
-    const n = terrainNoise((t % 320) * 0.55, ((t / 320) | 0) * 0.55);
-    const c = groundColor(terrain, world.heightDm[t]!, world.slope[t]!, season, shore, n, this.scratch);
+    const tx = t % 320;
+    const ty = (t / 320) | 0;
+    const n = terrainNoise(tx * 0.55, ty * 0.55);
+    // 2 本目のノイズは「乾湿」を決める。素材の比率が場所で変わることで、
+    // 引きの画でも平野が単色にならない。
+    const n2 = terrainNoise2(tx, ty);
+    const c = groundColor(
+      terrain,
+      world.heightDm[t]!,
+      world.slope[t]!,
+      season,
+      shore,
+      n,
+      this.scratch,
+      n2,
+    );
 
     // 川岸は砂浜ではなく玉石と護岸。日本の川はほぼ全部護岸されているので、
     // 海岸と同じ砂色にすると、内陸に唐突にビーチが現れる。
@@ -438,10 +474,38 @@ export class TerrainMesh {
       c.lerp(TMP.setHex(GROUND.gravel), 0.55).lerp(TMP.setHex(GROUND.revetment), 0.25);
     }
 
-    // ゾーン指定済みで未建築の土地は、用途の色をうっすら混ぜる
-    if (world.zone[t] !== Zone.None && world.buildingRef[t] === 0) {
-      const z = zoneColor(world.zone[t]!, TMP);
-      c.setRGB(c.r * 0.76 + z.r * 0.24, c.g * 0.76 + z.g * 0.24, c.b * 0.76 + z.b * 0.24);
+    /**
+     * 宅地の地面。
+     *
+     * ここは作り直した。以前は「用途地域を指定して未建築のタイル」に
+     * 用途の色（鮮やかな黄緑など）を 24% 混ぜていた。その結果、街区の中の
+     * 空き地が彩度の高い四角として露出し、絵ではなく**区画データの可視化**に
+     * 見えていた。さらに建物の載ったタイルには何もしていなかったので、
+     * 建物と歩道の間に**草地の帯**が残り、目線のカットで
+     * 「建物際に不自然な黄緑の帯が走っている」と読まれていた。
+     *
+     * 用途の色を使うのはやめ、周りの地面と同系の「草を刈って踏み固めた土」に
+     * 寄せる。寄せ具合は 3 段階。
+     *   建物が載っている  … 建物際は土間コンか砂利。いちばん強く。
+     *   用途地域だけある  … 更地。半分ほど。
+     *   建物の隣          … 庭・通路・裏の空き地。弱く。
+     * 混ぜ具合と明度をタイルのハッシュで散らすので、隣り合う敷地が
+     * 別々の土地に見える。
+     */
+    const zone = world.zone[t]!;
+    const built = world.buildingRef[t] !== 0;
+    const urban = built || (zone >= Zone.ResidentialLow && zone <= Zone.IndustrialHeavy);
+    if (urban) {
+      const hh = (t * 2654435761) >>> 0;
+      // 商業・工業の敷地はほぼ全面が舗装。低層住居は庭が残る。
+      const paved = zone >= Zone.CommercialLocal && zone <= Zone.IndustrialHeavy;
+      const base = built ? (paved ? 0.78 : 0.62) : paved ? 0.5 : 0.32;
+      c.lerp(TMP.setHex(GROUND.lotBare), base + ((hh >>> 11) % 26) / 100);
+      // 建物際は建物自身に遮られて暗いので、一段落としておく。
+      c.multiplyScalar((built ? 0.82 : 0.92) + ((hh >>> 19) % 22) / 100);
+    } else if (zone === Zone.None && this.nextToBuilt(world, t)) {
+      const hh = (t * 2654435761) >>> 0;
+      c.lerp(TMP.setHex(GROUND.lotBare), 0.24 + ((hh >>> 13) % 18) / 100);
     }
     return c;
   }
@@ -491,3 +555,4 @@ export class TerrainMesh {
 }
 
 const TMP = new Color();
+

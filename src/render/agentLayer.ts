@@ -21,7 +21,6 @@ import {
   MAX_VISIBLE_BUSES,
   MAX_VISIBLE_TRUCKS,
   MAX_VISIBLE_VEHICLES,
-  PARKED_CARS_PER_TILE,
   PARKED_CAR_LOD_DISTANCE_M,
   PEDESTRIAN_LOD_DISTANCE_M,
   TERRAIN_HEIGHT_SCALE,
@@ -48,27 +47,49 @@ import {
   type RailPose,
   type TrainHead,
 } from '@sim/network/railLines';
-import { CARGO_COLORS, TRAIN_BODY_COLOR, carColor, lineColor } from './theme';
-import { agentSurface } from './agentMaterial';
-import { LIMB_PIVOT_Y, bodyGeometry, limbGeometry, simpleGeometry } from './pedestrianParts';
+import { CARGO_COLORS, TRAIN_BODY_COLOR, lineColor } from './theme';
+import { jitterColor } from './materials';
+import { agentSurface, type AgentSurface } from './agentMaterial';
+import { GroundShadows } from './groundShadow';
+import {
+  LIMB_PIVOT_Y,
+  PED_SHOULDER_M,
+  bodyGeometry,
+  limbGeometry,
+  pedColor,
+  simpleGeometry,
+} from './pedestrianParts';
 import {
   CAR_KIND_COUNT,
   CarKind,
+  beamConeGeometry,
   beamGeometry,
   busBeamSpec,
+  busConeSpec,
+  BUS_BODY_M,
+  BUS_WIDTH_M,
+  TRUCK_BODY_M,
+  TRUCK_WIDTH_M,
   busGeometry,
   busLampGeometry,
   carBeamSpec,
+  carConeSpec,
   carGeometry,
   carHalfWidth,
   carKind,
   carLampGeometry,
+  carLength,
+  carPaint,
+  truckLivery,
   trainBeamSpec,
+  trainConeSpec,
   trainGeometry,
   trainLampGeometry,
   truckBeamSpec,
+  truckConeSpec,
   truckGeometry,
   truckLampGeometry,
+  type ConeSpec,
 } from './vehicleParts';
 import { atmosphereAt } from './sky';
 
@@ -154,15 +175,83 @@ const WALK_OUTER_M = TILE_M / 2;
 const STREET_LIFE_DISTANCE_M = 400;
 const STREET_LIFE_RADIUS_M = 320;
 /**
- * 路肩に飾りの車を足す確率 (%)。縦列の枠 1 つが 5.2m なので、
- * 5 割強で「20m にだいたい 1 台」になる。大通りは駐車禁止のつもりで減らす。
+ * 路肩に飾りの車を足す確率 (%)。**片側 1 タイルにつき**の値。
+ *
+ * 以前は 1 タイルに縦列 4 枠（5.2m 間隔）を切っていたが、タイルが 10m
+ * なのでタイル境界をまたぐ枠の間隔が 4.8m しかなく、全長 4.4m のワンボックスが
+ * 並ぶと車間 40cm ―― 実質「隙間なく数珠つなぎ」になっていた。
+ * ミラーとバンパーを勘定すれば互いに貫入もする。
+ *
+ * いまは **1 タイル 1 側につき最大 1 台**に改め、位置をタイル内で
+ * ±1.6m 揺らす。こうすると同じ側の前後の間隔は最低でも 6.8m 取れるので、
+ * いちばん長いワゴン（4.62m）でも車間が 2.2m 残る（`MIN_HEADWAY_RATIO` の
+ * 要求 1.16m を上回る）。台数は減るが、左右 2 側を独立に抽選するので
+ * 通り全体の密度は以前とほとんど変わらない。
  */
 const PARK_CHANCE_PCT: Record<number, number> = {
   [RoadClass.None]: 0,
-  [RoadClass.Street]: 58,
-  [RoadClass.Avenue]: 50,
-  [RoadClass.Boulevard]: 32,
+  [RoadClass.Street]: 34,
+  [RoadClass.Avenue]: 27,
+  [RoadClass.Boulevard]: 16,
 };
+
+/**
+ * 前後の最小車間を、車長の何倍取るか。
+ *
+ * 渋滞列でも、車は前の車のバンパーに触れる手前で止まる。交通流は
+ * 「リンクをどこまで進めたか」しか持っていないので、同じリンクに詰まった
+ * 車どうしがめり込むことがある。描画側で最後に間隔を強制する。
+ */
+const MIN_HEADWAY_RATIO = 0.25;
+
+/**
+ * 路肩の車の向きの揺らぎ (rad)。±1.5°。
+ * 完璧に平行な車列は現実には存在しない。ここが揃っているだけで
+ * 「配列に並べた」と読まれる。走行中の車はもっと小さく振る。
+ */
+const PARK_YAW_JITTER = 0.052;
+const DRIVE_YAW_JITTER = 0.02;
+
+/**
+ * 接地影を描く距離 (m) と枚数の上限。
+ *
+ * 接地影は「足元の数十 cm」を埋めるためのものなので、遠景では 1px 未満に
+ * なって効かない。近いところだけに絞って枚数を抑える。
+ * 打ち切りの線で影だけが消えると目立つので、手前 6 割から徐々に薄くする。
+ */
+const SHADOW_DISTANCE_M = 260;
+const SHADOW_FADE_FROM = 0.6;
+const MAX_SHADOWS = 2600;
+
+/**
+ * 接地影と光の円錐を描くカメラ距離 (m)。
+ *
+ * どちらも「足元の陰」「空中の光」という近景専用の演出で、街区を見下ろす
+ * 距離では 1px 未満にしかならない。それでもメッシュは描画リストに載って
+ * ドローコールを 2 つ（GTAO の再描画を含めると 4 つ）食うので、
+ * 引いたら丸ごと降ろす。
+ */
+const CONTACT_DETAIL_M = 300;
+
+/**
+ * これより引いたら、自家用車を 1 車種に畳む (m)。
+ *
+ * 俯瞰では車は 2〜3px にしかならず、軽とワゴンの区別は物理的に付かない。
+ * それでも 5 車種ぶんのメッシュが描画リストに載ると、本体 5 + 灯り 5 で
+ * 10 ドローコールを使う。1 車種に畳めば 2 で済む。
+ * 車種を分ける意味があるのは、路上に降りた画だけ。
+ */
+const CAR_KIND_LOD_M = 520;
+
+/**
+ * 夜、路肩の飾りの車のうち灯りを点けている割合 (%)。
+ *
+ * 「夜に無灯火の車列」は物理的にありえない。とはいえ全部を点けると
+ * 駐車場が滑走路になるので、3 割ほどを「停車中でエンジンをかけている車」
+ * として点灯させる。これだけで列の中に光の点が散り、
+ * 残りの消灯した車も「暗いだけの車」として読めるようになる。
+ */
+const PARKED_LIT_PCT = 30;
 
 /** タイプごとのインスタンス群（本体と、夜の灯り）。 */
 interface Fleet {
@@ -170,11 +259,12 @@ interface Fleet {
   lamps: InstancedMesh | null;
   count: number;
   /**
-   * うち灯りの行列を書き込んだ数。
+   * 灯りメッシュに書き込んだ数。**本体のインスタンス番号とは独立**に数える。
    *
-   * 走行中の車だけが灯りを持つ（駐車車両は消灯している）。ここを見ずに
-   * `count` で灯りを点けると、駐車車両のぶんだけ「前フレームの位置に
-   * 取り残された前照灯」が夜空に浮かぶ。
+   * 灯すのは「走行中の車」と「夜に停まっている車の一部」で、両者は本体の
+   * インスタンス列の中で飛び飛びに現れる。本体と同じ番号に書いていた頃は
+   * 「先頭から連続した n 台」しか灯せず、消灯した車の位置に前フレームの
+   * 前照灯が取り残された。別の連番にすれば、どの車を灯すかを自由に選べる。
    */
   lit: number;
 }
@@ -194,8 +284,8 @@ interface Fleet {
  *
  * メッシュの割り方には 3 つの理由がある。
  *
- * 1. **車種でメッシュを分ける。** 軽・セダン・ワンボックスは形が違うので
- *    ジオメトリを共有できない。分けるとドローコールが 3 つになるが、
+ * 1. **車種でメッシュを分ける。** 軽・セダン・ワンボックス・ワゴン・軽トラは
+ *    形が違うのでジオメトリを共有できない。分けるとドローコールが 5 つになるが、
  *    路上に降りたときに「同じ箱が色違いで並んでいる」のが解消される。
  *    1 台 1 インスタンスなのは変わらないので、台数が増えても call は増えない。
  * 2. **人の手足を別メッシュにする。** InstancedMesh は 1 インスタンス 1 行列
@@ -218,7 +308,7 @@ export class AgentLayer {
   private readonly pedBody: InstancedMesh;
   private readonly pedLimbs: [InstancedMesh, InstancedMesh];
 
-  /** 自家用車。軽・セダン・ワンボックスで形が違うのでメッシュを分ける。 */
+  /** 自家用車。車種で形が違うのでメッシュを分ける（`CarKind`）。 */
   private readonly cars: Fleet[] = [];
   private readonly trucks: Fleet;
   private readonly buses: Fleet;
@@ -229,17 +319,47 @@ export class AgentLayer {
   private readonly beams: InstancedMesh;
   private readonly beamMaterial: MeshBasicMaterial;
   private beamCount = 0;
-  /** 車種ごとの光の板の置き方（車体の座標系での相対行列）。 */
+  /**
+   * 前照灯が空中に作る光の円錐。路面の楕円と対で置く。
+   * こちらも全車種で 1 メッシュ（置き方だけ車種ごとの相対行列で変える）。
+   */
+  private readonly cones: InstancedMesh;
+  private readonly coneMaterial: MeshBasicMaterial;
+  private coneCount = 0;
+  /** 今フレーム、光の円錐を置くか（引いた画では置かない）。 */
+  private conesOn = true;
+  /** 今フレーム、車種を 1 つに畳むか（俯瞰の LOD）。 */
+  private carLod = false;
+  /** 車種ごとの光の板・円錐・尾灯の照り返しの置き方（車体の座標系での相対行列）。 */
   private readonly carBeamLocal: Matrix4[] = [];
+  private readonly carConeLocal: Matrix4[] = [];
+  private readonly carPoolLocal: Matrix4[] = [];
   private readonly truckBeamLocal: Matrix4;
   private readonly busBeamLocal: Matrix4;
   private readonly trainBeamLocal: Matrix4;
+  private readonly truckConeLocal: Matrix4;
+  private readonly busConeLocal: Matrix4;
+  private readonly trainConeLocal: Matrix4;
+  private readonly truckPoolLocal: Matrix4;
+  private readonly busPoolLocal: Matrix4;
+  private readonly trainPoolLocal: Matrix4;
+  /**
+   * 光の板の色。前は白（＝焼いてある色そのまま）、後ろは尾灯の赤。
+   * 板のジオメトリは 1 つを使い回し、色だけ `instanceColor` で変える。
+   */
+  private readonly beamWhite = new Color(1, 1, 1);
+  private readonly beamRed = new Color(0.8, 0.11, 0.07);
+
+  /** 接地影。車も人もここに 1 枚ずつ置く（1 ドローコール）。 */
+  private readonly shadows = new GroundShadows(MAX_SHADOWS);
 
   /** 灯りの明るさ 0..1。`atmosphereAt().nightAmount` をそのまま使う。 */
   private nightAmount = 0;
   private readonly lampMaterials: MeshBasicMaterial[] = [];
   /** 夜に車体・人を持ち上げる量（`agentMaterial` の uniform と共有している）。 */
   private readonly nightUniforms: { value: number }[] = [];
+  /** ガラスが映す空の色など（`agentMaterial` の uniform と共有している）。 */
+  private readonly surfaces: AgentSurface[] = [];
 
   private readonly mat = new Matrix4();
   private readonly mat2 = new Matrix4();
@@ -251,6 +371,13 @@ export class AgentLayer {
   private readonly axisX = new Vector3(1, 0, 0);
   private readonly color = new Color();
   private readonly tmp: PathPose = { x: 0, z: 0, heading: 0, edge: -1 };
+  /** ガラスの映り込みに配る色（毎フレーム書き換える）。 */
+  private readonly glassSky = new Color();
+  private readonly glassHorizon = new Color();
+  private readonly glassGround = new Color();
+  /** 接地影を描く距離のしきい値（2 乗）。 */
+  private shadowNear2 = 0;
+  private shadowFar2 = 0;
 
   /** 線路の折れ線。グラフが作り直されたときだけ再計算する。 */
   private railLines: RailLine[] = [];
@@ -258,7 +385,13 @@ export class AgentLayer {
   /** 編成の先頭位置の受け皿（毎フレーム使い回す）。 */
   private readonly heads: TrainHead[] = Array.from({ length: 64 }, () => ({ distM: 0, forward: true }));
   private readonly railPose: RailPose = { x: 0, z: 0, heading: 0 };
-  /** 接道タイル → そのタイルに既に置いた駐車台数。毎フレーム clear して使い回す。 */
+  /**
+   * タイル → その路肩の使用状況（bit0 = 左側、bit1 = 右側）。
+   * 毎フレーム clear して使い回す。
+   *
+   * シミュレーション由来の駐車車両と飾りの駐車車両が **同じ表**を使うのが肝。
+   * 別々に置き場所を決めると、同じ路肩に 2 台が重なって 1 台が 2 台に割れる。
+   */
   private readonly parkSlots = new Map<number, number>();
   /**
    * 今フレーム、走行中の車両が乗っている「タイル×車線の側」の集合。
@@ -270,6 +403,27 @@ export class AgentLayer {
    * （消えた駐車車両の場所はちょうど走行車両が覆うので、抜けは目に見えない。）
    */
   private readonly busy = new Set<number>();
+
+  /**
+   * 走行中の車両を一旦ためる場所。
+   *
+   * 交通流はリンク上の進捗しか持っていないので、そのまま置くと同じ車線で
+   * 車体どうしが貫入する。**リンクごとに前から順に並べ直し、前後の車間を
+   * 強制してから**置く。そのために 1 フレームぶんを溜める。
+   */
+  private vehCount = 0;
+  private vehSlot = new Int32Array(0);
+  /** 車線 ID（軸 × 直交方向のタイル列 × 進行の向き）。 */
+  private vehLane = new Int32Array(0);
+  private vehAlongZ = new Int32Array(0);
+  private vehSign = new Int32Array(0);
+  /** 車線に沿った座標 (m)。ここを押し下げて車間を作る。 */
+  private vehAlong = new Float32Array(0);
+  private vehLength = new Float32Array(0);
+  private vehX = new Float32Array(0);
+  private vehZ = new Float32Array(0);
+  private vehHeading = new Float32Array(0);
+  private readonly vehOrder: number[] = [];
 
   /** 今フレームで書き込んだ人の数（putPerson が進める）。 */
   private animCount = 0;
@@ -295,11 +449,12 @@ export class AgentLayer {
     this.group.name = 'agents';
 
     // 人。布と肌なので粗く、映り込みは弱い。
-    this.pedSimple = this.makeMesh(simpleGeometry(), MAX_VISIBLE_AGENTS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT);
-    this.pedBody = this.makeMesh(bodyGeometry(), MAX_ANIMATED_PEDS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT);
+    // `skin: true` は「肌・髪・靴は服の色の変調を受けない」印を有効にする指定。
+    this.pedSimple = this.makeMesh(simpleGeometry(), MAX_VISIBLE_AGENTS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT, true);
+    this.pedBody = this.makeMesh(bodyGeometry(), MAX_ANIMATED_PEDS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT, true);
     this.pedLimbs = [
-      this.makeMesh(limbGeometry(1), MAX_ANIMATED_PEDS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT),
-      this.makeMesh(limbGeometry(-1), MAX_ANIMATED_PEDS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT),
+      this.makeMesh(limbGeometry(1), MAX_ANIMATED_PEDS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT, true),
+      this.makeMesh(limbGeometry(-1), MAX_ANIMATED_PEDS, 0.86, 0.02, 1, false, PED_NIGHT_LIFT, true),
     ];
 
     // 車両は部品（車体・窓・ガラス・車輪）を焼き込んだジオメトリ 1 つ。
@@ -317,8 +472,9 @@ export class AgentLayer {
         count: 0,
         lit: 0,
       });
-      const b = carBeamSpec(kind);
-      this.carBeamLocal.push(beamLocal(b));
+      this.carBeamLocal.push(beamLocal(carBeamSpec(kind)));
+      this.carConeLocal.push(coneLocal(carConeSpec(kind)));
+      this.carPoolLocal.push(poolLocal(carConeSpec(kind)));
     }
     this.trucks = {
       body: this.makeMesh(truckGeometry(), MAX_VISIBLE_TRUCKS, 0.42, 0.24, 1.25, true),
@@ -345,6 +501,12 @@ export class AgentLayer {
     this.truckBeamLocal = beamLocal(truckBeamSpec());
     this.busBeamLocal = beamLocal(busBeamSpec());
     this.trainBeamLocal = beamLocal(trainBeamSpec());
+    this.truckConeLocal = coneLocal(truckConeSpec());
+    this.busConeLocal = coneLocal(busConeSpec());
+    this.trainConeLocal = coneLocal(trainConeSpec());
+    this.truckPoolLocal = poolLocal(truckConeSpec());
+    this.busPoolLocal = poolLocal(busConeSpec());
+    this.trainPoolLocal = poolLocal(trainConeSpec());
 
     // 路面に落ちる光。加算合成なので、暗い路面ほど明るく浮かび上がる。
     this.beamMaterial = new MeshBasicMaterial({
@@ -365,6 +527,32 @@ export class AgentLayer {
     this.group.add(this.beams);
     this.meshes.push(this.beams);
     this.noShadow.push(this.beams);
+
+    // 空中に伸びる光の円錐。路面の楕円だけだと、真横から見た夜の車が
+    // 「点が 2 つ光る箱」にしかならない。表裏どちらも描いて、
+    // 中心軸の近くが二重に足されるようにする。
+    this.coneMaterial = new MeshBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      blending: AdditiveBlending,
+      side: DoubleSide,
+      depthWrite: false,
+      toneMapped: false,
+      opacity: 0,
+    });
+    this.materials.push(this.coneMaterial);
+    this.cones = new InstancedMesh(beamConeGeometry(), this.coneMaterial, MAX_VISIBLE_VEHICLES);
+    this.cones.count = 0;
+    this.cones.frustumCulled = false;
+    this.cones.renderOrder = 3;
+    this.group.add(this.cones);
+    this.meshes.push(this.cones);
+    this.noShadow.push(this.cones);
+
+    // 接地影。灯りと同じく影は落とさない（路面すれすれの板なので、
+    // 影を落とすと夜の道路に真っ黒な楕円が貼り付く）。
+    this.group.add(this.shadows.mesh);
+    this.noShadow.push(this.shadows.mesh);
   }
 
   /**
@@ -373,6 +561,8 @@ export class AgentLayer {
    * @param glass ジオメトリが `aGlass` 属性（ガラスの印）を持つか。
    *   車両だけ true。人は窓を持たないので不要。
    * @param nightLift 夜に車体を持ち上げる強さ。人は車より弱くする。
+   * @param skin ジオメトリが `aSkin` 属性（服の色に染まらない部位の印）を持つか。
+   *   人だけ true。
    */
   private makeMesh(
     geom: BufferGeometry,
@@ -382,10 +572,12 @@ export class AgentLayer {
     envMapIntensity = 1,
     glass = false,
     nightLift = 1,
+    skin = false,
   ): InstancedMesh {
-    const s = agentSurface({ roughness, metalness, envMapIntensity, glass, nightLift });
+    const s = agentSurface({ roughness, metalness, envMapIntensity, glass, nightLift, skin });
     const material = s.material;
     this.nightUniforms.push(s.night);
+    this.surfaces.push(s);
     this.materials.push(material);
     const mesh = new InstancedMesh(geom, material, capacity);
     mesh.count = 0;
@@ -418,15 +610,33 @@ export class AgentLayer {
 
   /** 時刻を受け取り、夜なら灯りを点ける。境目で明滅しないよう連続値で扱う。 */
   setTimeOfDay(dayFraction: number): void {
-    this.nightAmount = atmosphereAt(dayFraction).nightAmount;
+    const atmo = atmosphereAt(dayFraction);
+    this.nightAmount = atmo.nightAmount;
     // 灯りの明るさそのものを大気に合わせて上げ下げする。
     // 真偽値で切り替えると、日没の 1 分間に街じゅうの灯りが一斉に点いて不自然になる。
     const on = Math.max(0, Math.min(1, (this.nightAmount - LAMP_ON) / (1 - LAMP_ON)));
     for (const m of this.lampMaterials) m.color.setScalar(0.25 + on * 0.75);
-    this.beamMaterial.opacity = on * 0.24;
+    this.beamMaterial.opacity = on * 0.3;
+    this.coneMaterial.opacity = on * 0.1;
     // 夜の車体・人が真っ黒なシルエットに潰れるのを、街灯を拾っている想定の
     // 弱い自発光で戻す。灯りの点灯と同じカーブに乗せて、夕方に段が出ないようにする。
     for (const u of this.nightUniforms) u.value = on;
+
+    // ガラスが映す 3 段の色。時刻とともに変わるので毎フレーム配る。
+    // 路面の照り返しは地面からの回り込みをさらに落としたもの
+    // （アスファルトは空の 1/3 も返さない）。
+    this.glassSky.copy(atmo.zenith).multiplyScalar(1.15);
+    this.glassHorizon.copy(atmo.horizon);
+    this.glassGround.copy(atmo.groundLight).multiplyScalar(0.35);
+    for (const s of this.surfaces) {
+      s.glassSky.value.copy(this.glassSky);
+      s.glassHorizon.value.copy(this.glassHorizon);
+      s.glassGround.value.copy(this.glassGround);
+    }
+
+    // 接地影は日向でいちばん濃い。夜は街灯の拡散光しかないので薄くする
+    // （ただし 0 にはしない。夜でも足元は必ず暗い）。
+    this.shadows.setOpacity(0.5 - on * 0.26);
   }
 
   /**
@@ -454,6 +664,17 @@ export class AgentLayer {
     this.animCount = 0;
     this.simpleCount = 0;
     this.beamCount = 0;
+    this.coneCount = 0;
+    this.shadows.reset();
+    // 接地影の距離しきい値。カメラの引き具合に連動させる。
+    // 引いた画では丸ごと切る（1px 未満の影にドローコールは払えない）。
+    const closeUp = camDistance < CONTACT_DETAIL_M;
+    const shadowRadius = closeUp ? Math.min(SHADOW_DISTANCE_M, Math.max(90, camDistance * 1.9)) : 0;
+    this.shadowFar2 = shadowRadius * shadowRadius;
+    this.shadowNear2 = (shadowRadius * SHADOW_FADE_FROM) ** 2;
+    this.conesOn = closeUp;
+    // 俯瞰では車種を 1 つに畳む（`CAR_KIND_LOD_M` の注記を参照）。
+    this.carLod = camDistance >= CAR_KIND_LOD_M;
     for (const f of this.cars) f.count = f.lit = 0;
     this.trucks.count = this.trucks.lit = 0;
     this.buses.count = this.buses.lit = 0;
@@ -522,7 +743,7 @@ export class AgentLayer {
       if (mode === Mode.Bike) {
         this.color.setHex(0xe08a3a);
       } else {
-        this.color.setHSL(((h >>> 8) % 360) / 360, 0.24, 0.56 + ((h >>> 20) % 24) / 120);
+        pedColor(h, this.color);
       }
 
       // 歩き。個体ごとに位相をずらさないと、街じゅうが同じ足で行進する。
@@ -530,7 +751,7 @@ export class AgentLayer {
       const swing = Math.sin(phase) * WALK_SWING;
       // 上下の揺れ。踏み込むたびに腰が沈むので、歩調の 2 倍で振る。
       const bob = Math.abs(Math.cos(phase)) * 0.022;
-      this.putPerson(d2 <= animDist2, wx, groundY, wz, this.tmp.heading, swing, bob);
+      this.putPerson(d2 <= animDist2, wx, groundY, wz, this.tmp.heading, swing, bob, h, d2);
     }
 
     // --- 立ち寄り中の市民 ---
@@ -577,7 +798,7 @@ export class AgentLayer {
         const ox = alongZ ? curb : along;
         const oz = alongZ ? along : curb;
 
-        this.color.setHSL(((h >>> 8) % 360) / 360, 0.22, 0.54 + ((h >>> 20) % 24) / 120);
+        pedColor(h, this.color);
         // 立っているので手足は振らないが、片足を少し前に出した姿勢を
         // 個体ごとに変える。全員が気を付けの姿勢だと人形の展示に見える。
         const stance = ((((h >>> 6) % 64) / 64) - 0.5) * 0.24;
@@ -589,6 +810,8 @@ export class AgentLayer {
           ((h >>> 24) % 360) * (Math.PI / 180),
           stance,
           0,
+          h,
+          dx * dx + dz * dz,
         );
       }
     }
@@ -611,6 +834,8 @@ export class AgentLayer {
       vehicles += f.count;
     }
     setCount(this.beams, lampsOn ? this.beamCount : 0);
+    setCount(this.cones, lampsOn ? this.coneCount : 0);
+    this.shadows.finish();
 
     for (const m of this.meshes) {
       m.instanceMatrix.needsUpdate = true;
@@ -645,7 +870,27 @@ export class AgentLayer {
     heading: number,
     swing: number,
     bob: number,
+    hash: number,
+    d2: number,
   ): boolean {
+    // 体格を個体ごとに散らす。「全員が同じ大きさ」は、姿勢や服の色より先に
+    // 「同じ人形を並べた」と読まれる。身長 1.55〜1.87m、横幅 ±10% ほど。
+    const sy = 0.91 + ((hash >>> 13) % 32) / 160;
+    const sxz = 0.9 + ((hash >>> 23) % 26) / 110;
+    this.scl.set(sxz, sy, sxz);
+
+    // 足元の接地影。人が浮いて見えるのは、影マップの解像度と normalBias で
+    // 必ず抜ける「足元の数十 cm」が空いているせい。
+    this.shadows.add(
+      x,
+      y + 0.02,
+      z,
+      heading,
+      PED_SHOULDER_M * 1.3 * sxz,
+      PED_SHOULDER_M * 1.7 * sxz,
+      this.shadowStrength(d2) * 0.85,
+    );
+
     if (near && this.animCount < MAX_ANIMATED_PEDS) {
       const n = this.animCount;
       this.quat.setFromAxisAngle(this.axisY, heading);
@@ -654,7 +899,8 @@ export class AgentLayer {
       this.pedBody.setMatrixAt(n, this.mat);
       this.pedBody.setColorAt(n, this.color);
       // 手足は腰と肩の中間を軸に前後へ振る。左右で符号を逆にすると対角で揃う。
-      this.pos.y = y + bob + LIMB_PIVOT_Y;
+      // 軸の高さも身長に合わせて伸ばさないと、背の高い人だけ腰から下が伸びる。
+      this.pos.y = y + bob + LIMB_PIVOT_Y * sy;
       for (let k = 0; k < 2; k++) {
         this.quat.setFromAxisAngle(this.axisY, heading);
         this.quat2.setFromAxisAngle(this.axisX, k === 0 ? swing : -swing);
@@ -664,24 +910,96 @@ export class AgentLayer {
         this.pedLimbs[k]!.setColorAt(n, this.color);
       }
       this.animCount++;
+      this.scl.set(1, 1, 1);
       return true;
     }
-    if (this.simpleCount >= MAX_VISIBLE_AGENTS) return false;
+    if (this.simpleCount >= MAX_VISIBLE_AGENTS) {
+      this.scl.set(1, 1, 1);
+      return false;
+    }
     this.quat.setFromAxisAngle(this.axisY, heading);
     this.pos.set(x, y, z);
     this.mat.compose(this.pos, this.quat, this.scl);
     this.pedSimple.setMatrixAt(this.simpleCount, this.mat);
     this.pedSimple.setColorAt(this.simpleCount, this.color);
     this.simpleCount++;
+    this.scl.set(1, 1, 1);
     return false;
   }
 
-  /** 車の前に光の板を 1 枚置く。 */
-  private addBeam(local: Matrix4): void {
-    if (this.nightAmount <= LAMP_ON || this.beamCount >= MAX_VISIBLE_VEHICLES) return;
-    this.mat2.multiplyMatrices(this.mat, local);
-    this.beams.setMatrixAt(this.beamCount, this.mat2);
-    this.beamCount++;
+  /**
+   * 接地影の濃さ。手前は 1、遠くへ向かって 0 に落とす。
+   * 打ち切りの線で影だけが一斉に消えると、そこに境界線が見えてしまう。
+   */
+  private shadowStrength(d2: number): number {
+    if (d2 >= this.shadowFar2) return 0;
+    if (d2 <= this.shadowNear2) return 1;
+    return (this.shadowFar2 - d2) / (this.shadowFar2 - this.shadowNear2);
+  }
+
+  /**
+   * 走っている車の夜の灯りを路面と空中に置く。3 つ 1 組。
+   *
+   * - **前照灯の楕円プール**（路面）。これが無いと道路が真っ暗なまま
+   *   「光る点が流れる」画になる。
+   * - **光の円錐**（空中）。真横から見たときに車が光源として立体になる。
+   * - **尾灯の照り返し**（路面・赤）。去っていく車の後ろに赤い滲みが残る。
+   *   夜の街路の写真でいちばん目に付く赤はこれで、無いと車列が
+   *   「白い点の列」にしかならない。
+   *
+   * 板は前後で同じジオメトリを使い、色だけ `instanceColor` で分ける。
+   * `this.mat` に車体の行列が入っている状態で呼ぶこと。
+   */
+  private addBeam(beam: Matrix4, cone: Matrix4, pool: Matrix4): void {
+    if (this.nightAmount <= LAMP_ON) return;
+    if (this.beamCount < MAX_VISIBLE_VEHICLES) {
+      this.mat2.multiplyMatrices(this.mat, beam);
+      this.beams.setMatrixAt(this.beamCount, this.mat2);
+      this.beams.setColorAt(this.beamCount, this.beamWhite);
+      this.beamCount++;
+    }
+    if (this.beamCount < MAX_VISIBLE_VEHICLES) {
+      this.mat2.multiplyMatrices(this.mat, pool);
+      this.beams.setMatrixAt(this.beamCount, this.mat2);
+      this.beams.setColorAt(this.beamCount, this.beamRed);
+      this.beamCount++;
+    }
+    if (this.conesOn && this.coneCount < MAX_VISIBLE_VEHICLES) {
+      this.mat2.multiplyMatrices(this.mat, cone);
+      this.cones.setMatrixAt(this.coneCount, this.mat2);
+      this.coneCount++;
+    }
+  }
+
+  /**
+   * 車体 1 台ぶんの接地影。`this.pos` に車体の位置が入っている状態で呼ぶ。
+   * 幅は車体幅の 1.1 倍、長さは全長の 1.05 倍。
+   */
+  private addVehicleShadow(heading: number, width: number, length: number, d2: number): void {
+    this.shadows.add(
+      this.pos.x,
+      this.pos.y + 0.02,
+      this.pos.z,
+      heading,
+      width * 1.1,
+      length * 1.05,
+      this.shadowStrength(d2),
+    );
+  }
+
+  /**
+   * ハッシュから車種を選ぶ。引いた画では 1 車種に畳む（`CAR_KIND_LOD_M`）。
+   * 畳む先はセダン。いちばん平均的な形なので、遠景の点として無難。
+   */
+  private pickCarKind(hash: number): CarKind {
+    return this.carLod ? CarKind.Sedan : carKind(hash);
+  }
+
+  /** 灯りメッシュに 1 台ぶん書き込む。本体とは別の連番で数える。 */
+  private addLamps(fleet: Fleet, capacity: number): void {
+    if (!fleet.lamps || fleet.lit >= capacity) return;
+    fleet.lamps.setMatrixAt(fleet.lit, this.mat);
+    fleet.lit++;
   }
 
   /**
@@ -729,46 +1047,98 @@ export class AgentLayer {
       const access = b.accessTile[slot]!;
       if (access < 0) continue;
 
-      // 同じ接道タイルに何台も重ねない
       const wx = (tileX(access) + 0.5) * TILE_M;
       const wz = (tileY(access) + 0.5) * TILE_M;
       const dx = wx - camX;
       const dz = wz - camZ;
+      const d2 = dx * dx + dz * dz;
       // 距離の判定を駐車枠の確保より先に置く。逆にすると、視野の外にいて
       // 描かない車が枠を潰し、境界のタイルに本来より少ない台数しか並ばない。
-      if (dx * dx + dz * dz > maxDist2) continue;
-
-      const used = this.parkSlots.get(access) ?? 0;
-      if (used >= PARKED_CARS_PER_TILE) continue;
-      // 2 台ずつ、道路の左右の路肩に分ける。
-      const side = used & 1 ? 1 : -1;
-      // 走行車両が来ている車線には置かない（重なって 1 台が 2 台に割れて見える）。
-      if (this.busy.has(access * 2 + (side > 0 ? 1 : 0))) continue;
+      if (d2 > maxDist2) continue;
 
       const hash = (id * 2654435761) >>> 0;
-      const kind = carKind(hash);
+      // 停める側は車ごとのハッシュで選び、埋まっていれば反対側へ回る。
+      // 走行車両が来ている車線には置かない（重なって 1 台が 2 台に割れて見える）。
+      const want = hash & 0x10000 ? 1 : -1;
+      let side = 0;
+      for (const cand of [want, -want] as const) {
+        if (this.busy.has(access * 2 + (cand > 0 ? 1 : 0))) continue;
+        if (this.tryShoulder(access, cand)) {
+          side = cand;
+          break;
+        }
+      }
+      if (side === 0) continue;
+
+      const kind = this.pickCarKind(hash);
       const fleet = this.cars[kind]!;
       if (fleet.count >= MAX_VISIBLE_VEHICLES) continue;
-      this.parkSlots.set(access, used + 1);
 
-      // 道路の走っている向きに沿って縦列駐車させる。
-      // 向きを見ずに置くと、車が道路を跨いで横向きに刺さる。
       const conn = sim.world.roadConn(access);
       const alongZ = (conn & 0b0101) !== 0 || conn === 0;
-      const along = ((used >> 1) - 0.5) * 5.2;
-      const curb = side * shoulderOffset(sim.world.road[access]!, kind);
-      const ox = alongZ ? curb : along;
-      const oz = alongZ ? along : curb;
+      this.placeParked(sim, access, wx, wz, alongZ, side, sim.world.road[access]!, kind, hash, d2);
+    }
+  }
 
-      // 左側通行なので、路肩の車はその車線の進行方向を向いている。
-      // 前後をハッシュで裏返していた頃は、対向車線に頭から突っ込んだ車が並んでいた。
-      this.quat.setFromAxisAngle(this.axisY, parkHeading(alongZ, side));
-      this.pos.set(wx + ox, this.groundAt(sim, wx + ox, wz + oz) + ROAD_SURFACE_M, wz + oz);
-      this.mat.compose(this.pos, this.quat, this.scl);
-      fleet.body.setMatrixAt(fleet.count, this.mat);
-      this.color.setHex(carColor(hash));
-      fleet.body.setColorAt(fleet.count, this.color);
-      fleet.count++;
+  /**
+   * 路肩の枠を 1 つ取る。取れたら true。
+   *
+   * **1 タイル 1 側につき 1 台まで**にするのが要点。タイルは 10m しかないので、
+   * 2 台入れると必ず車間が 1m を切り、タイル境界をまたぐ組はさらに詰まる。
+   * 「消失点まで隙間なく一列、しかも互いに貫入」の正体はここだった。
+   */
+  private tryShoulder(tile: number, side: number): boolean {
+    const used = this.parkSlots.get(tile) ?? 0;
+    const bit = side > 0 ? 2 : 1;
+    if (used & bit) return false;
+    this.parkSlots.set(tile, used | bit);
+    return true;
+  }
+
+  /**
+   * 路肩に車を 1 台置く。シミュレーション由来の駐車車両と飾りの車で共通。
+   *
+   * 「インスタンスを並べただけ」に見せないために、ここで 3 つを散らす。
+   *
+   * - **前後の位置** を ±1.6m。等間隔の列が崩れる。
+   * - **向き** を ±1.5°。完璧に平行な列は現実には存在しない。
+   * - **色** を 11 色 + 微小なばらつき。同じ「白」でも隣とは違う白になる。
+   */
+  private placeParked(
+    sim: Simulation,
+    tile: number,
+    wx: number,
+    wz: number,
+    alongZ: boolean,
+    side: number,
+    cls: number,
+    kind: CarKind,
+    hash: number,
+    d2: number,
+  ): void {
+    const fleet = this.cars[kind]!;
+    const h = tileHash(tile, side > 0 ? 21 : 22);
+    // タイル内での前後の揺らぎ。同じタイル・同じ側なら毎フレーム同じ値になる。
+    const along = (((h >>> 6) % 64) / 64 - 0.5) * 3.2;
+    const curb = side * (shoulderOffset(cls, kind) + (((h >>> 12) % 16) / 16 - 0.5) * 0.24);
+    const ox = alongZ ? curb : along;
+    const oz = alongZ ? along : curb;
+    // 左側通行なので、路肩の車はその車線の進行方向を向いている。
+    // 前後をハッシュで裏返していた頃は、対向車線に頭から突っ込んだ車が並んでいた。
+    const yaw = parkHeading(alongZ, side) + (((h >>> 18) % 64) / 64 - 0.5) * PARK_YAW_JITTER;
+    this.quat.setFromAxisAngle(this.axisY, yaw);
+    this.pos.set(wx + ox, this.groundAt(sim, wx + ox, wz + oz) + ROAD_SURFACE_M, wz + oz);
+    this.mat.compose(this.pos, this.quat, this.scl);
+    fleet.body.setMatrixAt(fleet.count, this.mat);
+    jitterColor(carPaint(hash), hash >>> 11, 0.045, this.color);
+    fleet.body.setColorAt(fleet.count, this.color);
+    fleet.count++;
+    this.addVehicleShadow(yaw, carHalfWidth(kind) * 2, carLength(kind), d2);
+    // 夜は一部だけ灯りを点ける（`PARKED_LIT_PCT` の理由はそちらの注記に）。
+    // 路面への光は付けない。停まっている車の光溜まりが重なると、
+    // 路肩が一本の光の帯になってしまう。
+    if (this.nightAmount > LAMP_ON && (hash >>> 3) % 100 < PARKED_LIT_PCT) {
+      this.addLamps(fleet, MAX_VISIBLE_VEHICLES);
     }
   }
 
@@ -825,13 +1195,18 @@ export class AgentLayer {
         if (ns === ew) continue;
         const half = CARRIAGE_HALF_M[cls] ?? CARRIAGE_HALF_M[RoadClass.Street]!;
 
-        if (!world.isLevelCrossing(tile)) this.parkOnShoulder(sim, tile, wx, wz, ns, cls);
+        if (!world.isLevelCrossing(tile)) this.parkOnShoulder(sim, tile, wx, wz, ns, cls, d2);
         if (drawPeds) this.standOnWalkway(sim, tile, wx, wz, ns, half, camX, camZ, maxDist2, animDist2);
       }
     }
   }
 
-  /** 路肩に飾りの車を 1 台。既存の車種メッシュに相乗りするのでドローコールは増えない。 */
+  /**
+   * 路肩に飾りの車を 1 台。既存の車種メッシュに相乗りするのでドローコールは増えない。
+   *
+   * 抽選は**左右それぞれ独立**に行う。1 タイル 1 側 1 台の上限があるので、
+   * 台数を稼ぐには側を増やすしかない（縦列を詰めるのは車間を潰す）。
+   */
   private parkOnShoulder(
     sim: Simulation,
     tile: number,
@@ -839,35 +1214,21 @@ export class AgentLayer {
     wz: number,
     alongZ: boolean,
     cls: number,
+    d2: number,
   ): void {
-    const h = tileHash(tile, 1);
-    // タイルの半分ほどに 1 台足す（縦列の枠 1 つ ＝ 5.2m なので、おおむね 20m 間隔）。
-    if (h % 100 >= (PARK_CHANCE_PCT[cls] ?? 0)) return;
-    // **駐車枠はシミュレーション由来の駐車車両と共有する。**
-    // 別々に置き場所を決めると、同じ路肩に 2 台が重なって 1 台が 2 台に割れる。
-    // 先に走った drawParkedCars が使った枠の続きに 1 台足す形にすれば、
-    // 縦列の間隔（5.2m）も左右の割り振りも自動的に噛み合う。
-    const used = this.parkSlots.get(tile) ?? 0;
-    if (used >= PARKED_CARS_PER_TILE) return;
-    const side = used & 1 ? 1 : -1;
-    if (this.busy.has(tile * 2 + (side > 0 ? 1 : 0))) return;
-
-    const kind = carKind(h);
-    const fleet = this.cars[kind]!;
-    if (fleet.count >= MAX_VISIBLE_VEHICLES) return;
-    this.parkSlots.set(tile, used + 1);
-
-    const curb = side * shoulderOffset(cls, kind);
-    const along = ((used >> 1) - 0.5) * 5.2;
-    const ox = alongZ ? curb : along;
-    const oz = alongZ ? along : curb;
-    this.quat.setFromAxisAngle(this.axisY, parkHeading(alongZ, side));
-    this.pos.set(wx + ox, this.groundAt(sim, wx + ox, wz + oz) + ROAD_SURFACE_M, wz + oz);
-    this.mat.compose(this.pos, this.quat, this.scl);
-    fleet.body.setMatrixAt(fleet.count, this.mat);
-    this.color.setHex(carColor(h >>> 3));
-    fleet.body.setColorAt(fleet.count, this.color);
-    fleet.count++;
+    const chance = PARK_CHANCE_PCT[cls] ?? 0;
+    for (const side of [-1, 1] as const) {
+      const h = tileHash(tile, side > 0 ? 1 : 2);
+      if (h % 100 >= chance) continue;
+      // **駐車枠はシミュレーション由来の駐車車両と共有する。**
+      // 別々に置き場所を決めると、同じ路肩に 2 台が重なって 1 台が 2 台に割れる。
+      if (!this.tryShoulder(tile, side)) continue;
+      if (this.busy.has(tile * 2 + (side > 0 ? 1 : 0))) continue;
+      const hash = (h >>> 3) ^ Math.imul(tile, 0x27d4eb2d);
+      const kind = this.pickCarKind(hash);
+      if (this.cars[kind]!.count >= MAX_VISIBLE_VEHICLES) continue;
+      this.placeParked(sim, tile, wx, wz, alongZ, side, cls, kind, hash >>> 0, d2);
+    }
   }
 
   /**
@@ -916,14 +1277,15 @@ export class AgentLayer {
       const d2 = dx * dx + dz * dz;
       if (d2 > maxDist2) continue;
 
-      this.color.setHSL(((g >>> 8) % 360) / 360, 0.22, 0.52 + ((g >>> 20) % 24) / 120);
+      pedColor(g, this.color);
       // 通りに沿った 2 方向を主に、少しだけ振る。全員が真正面を向くと人形の展示になる。
       const facing = alongZ
         ? ((g >>> 2) & 1 ? 0 : Math.PI)
         : ((g >>> 2) & 1 ? Math.PI / 2 : -Math.PI / 2);
       const heading = facing + (((g >>> 11) % 32) / 32 - 0.5) * 0.9;
       const stance = (((g >>> 17) % 64) / 64 - 0.5) * 0.26;
-      if (!this.putPerson(d2 <= animDist2, px, this.groundAt(sim, px, pz) + WALK_SURFACE_M, pz, heading, stance, 0)) {
+      const py = this.groundAt(sim, px, pz) + WALK_SURFACE_M;
+      if (!this.putPerson(d2 <= animDist2, px, py, pz, heading, stance, 0, g, d2)) {
         // 簡易形の枠も尽きていたら、以降のタイルでも入らないので打ち切る。
         if (this.simpleCount >= MAX_VISIBLE_AGENTS) return;
       }
@@ -976,10 +1338,9 @@ export class AgentLayer {
           fleet.body.setMatrixAt(fleet.count, this.mat);
           this.color.setHex(TRAIN_BODY_COLOR);
           fleet.body.setColorAt(fleet.count, this.color);
-          if (fleet.lamps) fleet.lamps.setMatrixAt(fleet.count, this.mat);
-          if (slot === 0) this.addBeam(this.trainBeamLocal);
+          this.addLamps(fleet, MAX_VISIBLE_TRAIN_CARS);
+          if (slot === 0) this.addBeam(this.trainBeamLocal, this.trainConeLocal, this.trainPoolLocal);
           fleet.count++;
-          fleet.lit = fleet.count;
           total++;
         }
       }
@@ -1026,42 +1387,128 @@ export class AgentLayer {
 
   private drawVehicles(sim: Simulation, camX: number, camZ: number, maxDist2: number, tick: number): void {
     const tr = sim.traffic;
+    const graph = sim.graph;
     const nowSec = tick * 60;
     const t = sim.freight.trucks;
+
+    // --- 1 巡目: 位置を集める ---
+    //
+    // 交通流が持っているのは「リンクをどこまで進めたか」だけで、車体の長さを
+    // 知らない。そのまま置くと詰まった車列で前後がめり込む。
+    //
+    // 並べ直す単位は**リンクではなく車線**にする。リンクはタイル 1 つぶん
+    // （10m）しかないので、リンクごとに整えても「隣のリンクの車と重なる」が
+    // まったく直らない。道路は必ず軸に平行なので、
+    // 「軸 × 直交方向のタイル列 × 進行の向き」で 1 本の車線として束ねられる。
+    this.vehCount = 0;
     tr.forEachVehicle((v) => {
       const kind = tr.kind[v]!;
-      const isTruck = kind === VehicleKind.Truck;
-      const isBus = kind === VehicleKind.Bus;
-      if (isTruck && this.trucks.count >= MAX_VISIBLE_TRUCKS) return;
-      if (isBus && this.buses.count >= MAX_VISIBLE_BUSES) return;
-      if (!tr.pose(sim.graph, v, nowSec, this.tmp)) return;
+      if (!tr.pose(graph, v, nowSec, this.tmp)) return;
       const dx = this.tmp.x - camX;
       const dz = this.tmp.z - camZ;
       if (dx * dx + dz * dz > maxDist2) return;
+      const edge = this.tmp.edge;
+      if (edge < 0) return;
+      const a = graph.edgeFrom[edge]!;
+      const b = graph.edgeTo[edge]!;
+      const ex = graph.nodeX[b]! - graph.nodeX[a]!;
+      const ez = graph.nodeZ[b]! - graph.nodeZ[a]!;
+      const alongZ = Math.abs(ez) >= Math.abs(ex);
+      const sign = (alongZ ? ez : ex) >= 0 ? 1 : -1;
+      // 車線 ID。直交方向のタイル列で束ねる（同じ通りの同じ向きが 1 本になる）。
+      const perp = Math.round((alongZ ? this.tmp.x : this.tmp.z) / TILE_M);
+      const lane = perp * 4 + (alongZ ? 2 : 0) + (sign > 0 ? 1 : 0);
+      const along = (alongZ ? this.tmp.z : this.tmp.x) * sign;
+      this.pushVehicle(
+        v,
+        lane,
+        along,
+        kind === VehicleKind.Truck
+          ? TRUCK_BODY_M
+          : kind === VehicleKind.Bus
+            ? BUS_BODY_M
+            : carLength(this.pickCarKind((tr.owner[v]! * 2654435761) >>> 0)),
+        this.tmp.x,
+        this.tmp.z,
+        Math.atan2(ex, ez),
+        alongZ,
+        sign,
+      );
+    });
 
-      const heading = this.smoothHeading(v, tr.departTick[v]!, this.tmp.heading);
+    // --- 2 巡目: 同じ車線の前後で最小車間を強制する ---
+    //
+    // 車線ごとに前（進行方向側）から並べ、後ろの車を必要なだけ下げる。
+    // 先頭（停止線に着いている車）は動かさない。動かすと信号待ちの列が
+    // 交差点に食い込む。
+    const order = this.vehOrder;
+    order.length = 0;
+    for (let i = 0; i < this.vehCount; i++) order.push(i);
+    order.sort((p, q) => this.vehLane[p]! - this.vehLane[q]! || this.vehAlong[q]! - this.vehAlong[p]!);
+    let curLane = Number.NaN;
+    let prevAlong = 0;
+    let prevLen = 0;
+    for (const i of order) {
+      const lane = this.vehLane[i]!;
+      const len = this.vehLength[i]!;
+      if (lane !== curLane) {
+        curLane = lane;
+      } else {
+        const gap = MIN_HEADWAY_RATIO * Math.max(len, prevLen);
+        const limit = prevAlong - prevLen / 2 - gap - len / 2;
+        if (this.vehAlong[i]! > limit) this.vehAlong[i] = limit;
+      }
+      prevAlong = this.vehAlong[i]!;
+      prevLen = len;
+    }
+
+    // --- 3 巡目: 実際に置く ---
+    for (let i = 0; i < this.vehCount; i++) {
+      const v = this.vehSlot[i]!;
+      const kind = tr.kind[v]!;
+      const isTruck = kind === VehicleKind.Truck;
+      const isBus = kind === VehicleKind.Bus;
+      if (isTruck && this.trucks.count >= MAX_VISIBLE_TRUCKS) continue;
+      if (isBus && this.buses.count >= MAX_VISIBLE_BUSES) continue;
+
+      // 車線の向きの成分だけを、車間を空けた値に差し替える。
+      const alongZ = this.vehAlongZ[i] === 1;
+      const sign = this.vehSign[i]!;
+      const moved = this.vehAlong[i]! * sign;
+      const px = alongZ ? this.vehX[i]! : moved;
+      const pz = alongZ ? moved : this.vehZ[i]!;
+
+      const heading = this.smoothHeading(v, tr.departTick[v]!, this.vehHeading[i]!)
+        // 走行中もほんの少しだけ向きを散らす。全車が完璧に車線と平行だと、
+        // 消失点まで伸びる列が 1 本の定規に見える。
+        + (((v * 2654435761) >>> 20) % 32) / 32 * DRIVE_YAW_JITTER - DRIVE_YAW_JITTER / 2;
       this.quat.setFromAxisAngle(this.axisY, heading);
       // 左側通行。対向車が別の車線を流れる
       const ox = this.laneOffsetX(heading, LANE_OFFSET_M);
       const oz = this.laneOffsetZ(heading, LANE_OFFSET_M);
-      this.pos.set(
-        this.tmp.x + ox,
-        this.groundAt(sim, this.tmp.x + ox, this.tmp.z + oz) + ROAD_SURFACE_M,
-        this.tmp.z + oz,
-      );
+      this.pos.set(px + ox, this.groundAt(sim, px + ox, pz + oz) + ROAD_SURFACE_M, pz + oz);
       this.mat.compose(this.pos, this.quat, this.scl);
-      this.markLane(this.tmp.x + ox, this.tmp.z + oz, heading, ox, oz, isTruck || isBus);
+      this.markLane(px + ox, pz + oz, heading, ox, oz, isTruck || isBus);
+      const dx = px - camX;
+      const dz = pz - camZ;
+      const d2 = dx * dx + dz * dz;
 
       const owner = tr.owner[v]!;
       if (isTruck) {
         const f = this.trucks;
         f.body.setMatrixAt(f.count, this.mat);
-        // 帰路は空車なので無地。往路は積荷の色。
+        // 積荷があれば積荷の色、空車（帰路）なら事業者の塗色。
+        // 帰りの車をすべて同じ灰色にしていたので、走っているトラックの
+        // 過半数が「同じ形・同じ色」で並び、そこがいちばん機械的に見えていた。
         const returning = t.alive[owner] === 1 && t.state[owner] === TruckState.Returning;
-        this.color.setHex(CARGO_COLORS[returning ? 0 : t.good[owner]!] ?? CARGO_COLORS[0]!);
+        const base = returning
+          ? truckLivery((owner * 2654435761) >>> 0)
+          : (CARGO_COLORS[t.good[owner]!] ?? CARGO_COLORS[0]!);
+        jitterColor(base, (owner * 40503) >>> 0, 0.05, this.color);
         f.body.setColorAt(f.count, this.color);
-        if (f.lamps) f.lamps.setMatrixAt(f.count, this.mat);
-        this.addBeam(this.truckBeamLocal);
+        this.addLamps(f, MAX_VISIBLE_TRUCKS);
+        this.addBeam(this.truckBeamLocal, this.truckConeLocal, this.truckPoolLocal);
+        this.addVehicleShadow(heading, TRUCK_WIDTH_M, TRUCK_BODY_M, d2);
         f.count++;
       } else if (isBus) {
         // 車体は路線の色。路線一覧の色と揃えてあるので、
@@ -1070,27 +1517,70 @@ export class AgentLayer {
         f.body.setMatrixAt(f.count, this.mat);
         this.color.setHex(lineColor(sim.transit.lineOfBus(owner)));
         f.body.setColorAt(f.count, this.color);
-        if (f.lamps) f.lamps.setMatrixAt(f.count, this.mat);
-        this.addBeam(this.busBeamLocal);
+        this.addLamps(f, MAX_VISIBLE_BUSES);
+        this.addBeam(this.busBeamLocal, this.busConeLocal, this.busPoolLocal);
+        this.addVehicleShadow(heading, BUS_WIDTH_M, BUS_BODY_M, d2);
         f.count++;
       } else {
         const hash = (owner * 2654435761) >>> 0;
-        const kindIdx = carKind(hash);
+        const kindIdx = this.pickCarKind(hash);
         const f = this.cars[kindIdx]!;
-        if (f.count >= MAX_VISIBLE_VEHICLES) return;
+        if (f.count >= MAX_VISIBLE_VEHICLES) continue;
         f.body.setMatrixAt(f.count, this.mat);
-        this.color.setHex(carColor(hash));
+        jitterColor(carPaint(hash), hash >>> 11, 0.045, this.color);
         f.body.setColorAt(f.count, this.color);
-        if (f.lamps) f.lamps.setMatrixAt(f.count, this.mat);
-        this.addBeam(this.carBeamLocal[kindIdx]!);
+        this.addLamps(f, MAX_VISIBLE_VEHICLES);
+        this.addBeam(this.carBeamLocal[kindIdx]!, this.carConeLocal[kindIdx]!, this.carPoolLocal[kindIdx]!);
+        this.addVehicleShadow(heading, carHalfWidth(kindIdx) * 2, carLength(kindIdx), d2);
         f.count++;
       }
-    });
-    // ここまでが走行中の車両。以降に積む駐車車両は消灯しているので、
-    // 灯りのインスタンス数はこの時点の台数で打ち止めにする。
-    for (const f of this.cars) f.lit = f.count;
-    this.trucks.lit = this.trucks.count;
-    this.buses.lit = this.buses.count;
+    }
+  }
+
+  /** 走行中の車両を 1 台ぶん溜める。配列は使い回して伸ばすだけ。 */
+  private pushVehicle(
+    slot: number,
+    lane: number,
+    along: number,
+    length: number,
+    x: number,
+    z: number,
+    heading: number,
+    alongZ: boolean,
+    sign: number,
+  ): void {
+    if (this.vehCount >= this.vehSlot.length) {
+      const n = Math.max(512, this.vehSlot.length * 2);
+      const grow32 = (src: Int32Array): Int32Array<ArrayBuffer> => {
+        const out = new Int32Array(n);
+        out.set(src);
+        return out;
+      };
+      const growF = (src: Float32Array): Float32Array<ArrayBuffer> => {
+        const out = new Float32Array(n);
+        out.set(src);
+        return out;
+      };
+      this.vehSlot = grow32(this.vehSlot);
+      this.vehLane = grow32(this.vehLane);
+      this.vehAlongZ = grow32(this.vehAlongZ);
+      this.vehSign = grow32(this.vehSign);
+      this.vehAlong = growF(this.vehAlong);
+      this.vehLength = growF(this.vehLength);
+      this.vehX = growF(this.vehX);
+      this.vehZ = growF(this.vehZ);
+      this.vehHeading = growF(this.vehHeading);
+    }
+    const i = this.vehCount++;
+    this.vehSlot[i] = slot;
+    this.vehLane[i] = lane;
+    this.vehAlong[i] = along;
+    this.vehLength[i] = length;
+    this.vehX[i] = x;
+    this.vehZ[i] = z;
+    this.vehHeading[i] = heading;
+    this.vehAlongZ[i] = alongZ ? 1 : 0;
+    this.vehSign[i] = sign;
   }
 
   /**
@@ -1118,6 +1608,7 @@ export class AgentLayer {
   }
 
   dispose(): void {
+    this.shadows.dispose();
     // InstancedMesh.dispose() はジオメトリを解放しない。明示的に捨てる。
     for (const m of this.meshes) {
       m.geometry.dispose();
@@ -1168,5 +1659,25 @@ function beamLocal(spec: { z: number; width: number; length: number; y: number }
   const m = new Matrix4();
   m.makeScale(spec.width, 1, spec.length);
   m.setPosition(0, spec.y, spec.z);
+  return m;
+}
+
+/** 光の円錐の相対行列（単位ジオメトリは 頂点が原点・+Z 長さ 1・半径 0.5）。 */
+function coneLocal(spec: ConeSpec): Matrix4 {
+  const m = new Matrix4();
+  m.makeScale(spec.width, spec.height, spec.length);
+  m.setPosition(0, spec.y, spec.z);
+  return m;
+}
+
+/**
+ * 尾灯が路面に落とす照り返しの相対行列。
+ * 光の板は +Z へ伸びるので、Y まわりに 180 度回して後ろへ向ける。
+ * 前照灯より弱く短い（尾灯は路面を照らすための灯りではない）。
+ */
+function poolLocal(spec: ConeSpec): Matrix4 {
+  const m = new Matrix4().makeRotationY(Math.PI);
+  m.scale(new Vector3(spec.width * 0.5, 1, 3.4));
+  m.setPosition(0, 0.03, -spec.z - 0.4);
   return m;
 }

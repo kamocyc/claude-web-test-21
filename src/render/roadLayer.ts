@@ -1,6 +1,7 @@
 import {
   AdditiveBlending,
   BufferGeometry,
+  CircleGeometry,
   Color,
   CylinderGeometry,
   Matrix4,
@@ -16,6 +17,7 @@ import { OneWay, RoadClass, Terrain, TransitKind, Zone } from '@shared/enums';
 import type { Simulation } from '@sim/simulation';
 import { neighbor, tileX, tileY } from '@sim/world/tiles';
 import { surface } from './materials';
+import { applySurfaceNoise } from './surfaceNoise';
 import { InstancePool } from './instancePool';
 import { atmosphereAt } from './sky';
 import {
@@ -23,7 +25,10 @@ import {
   LAMP_WARM,
   LINE_WHITE,
   LINE_YELLOW,
+  MANHOLE_COLOR,
   PAVEMENT,
+  PATCH_COLOR,
+  RUT_COLOR,
 } from './groundPalette';
 import {
   ARM_HALF,
@@ -59,13 +64,32 @@ import {
  * 舗装の幅そのものが変わる。生活道路と大通りが遠景でも見分けられる。
  *
  * **2. 歩道を「板」ではなく「断面」にする。**
- * 縁石・側溝・平板を 1 つのジオメトリに焼いてある（`walkwaySectionGeometry`）。
- * 段差が 20cm あるだけで、道と歩道の境界に影の線が出て、路面が沈んで見える。
+ * L 型側溝の平部・目地・縁石・平板を 1 つのジオメトリに焼いてある
+ * （`walkwaySectionGeometry`）。車道側から 2 段で立ち上がるので、
+ * 道と歩道の境界に影の線が 2 本出て、路面がはっきり沈んで見える。
  *
  * **3. 街路の小物を置く。**
  * 街灯・電柱・電線・ガードレール・カーブミラー・標識・自販機・バス停。
  * 日本の街路の見た目を決めているのは、実のところ道路そのものではなく
  * この雑多な立ち物の密度だと思う。
+ *
+ * さらに 2 つを作り直した。
+ *
+ * **4. 夜の路面を「街灯の下だけ」明るくする。**
+ * 以前は道路タイル 1 枚ごとに加算の板を敷いて路面全体を底上げし、
+ * そのうえ街灯 1 本の光溜まりを 24m 角・ほぼ全強度で置いていた。
+ * 光溜まりが隣同士で完全に重なった結果、夜の街路が
+ * **道路の形をした一様な発光カーペット**になり、路面がファサードの
+ * 12 倍明るいという上下関係の逆転を起こしていた。
+ * 一律の底上げは廃止し（それは半球ライトの仕事）、光溜まりは
+ * 街灯の間隔より小さく・以前の 1/6 の強さにした。
+ *
+ * **5. 路面に情報を入れる。**
+ * 目線の高さでは画面の 3〜4 割が路面なので、そこが継ぎ目も轍も無い
+ * 一色のグレーだと、そのカット全体が未完成に見える。
+ * 骨材の粗さは世界座標のノイズで材質に焼き（`surfaceNoise.ts`）、
+ * 轍・補修跡・マンホールはインスタンスで散らす。どれも近景専用で、
+ * 引いたら LOD で丸ごと落とすのでドローコールは返ってくる。
  *
  * 更新は「道路のエポックか季節か路線が変わったとき」だけ。
  * 毎フレームやるのは夜の演出（街灯の点灯）だけで、これは材質の
@@ -96,6 +120,8 @@ const CURB_H = 0.22;
  * （斜面では地形の三角形が路面より上に来ることがあり、高さだけでは足りない）。
  */
 const Y_ASPHALT = 0.16;
+/** 轍・補修跡・マンホール。標示より下（標示は補修跡の上に引き直される）。 */
+const Y_WEAR = 0.172;
 const Y_MARKING = 0.2;
 const Y_POOL = 0.23;
 
@@ -145,7 +171,23 @@ const WIRE_LOD_DISTANCE = 620;
  * 交差点の流入 1 本につき 1 枚だけ置く。情報（そこに横断歩道がある）は残り、
  * ちらつきの原因になる高周波だけが消える。
  */
-const MARKING_LOD_DISTANCE = 500;
+const MARKING_LOD_DISTANCE = 280;
+/**
+ * 遠景の代替（連続線と横断歩道の平均色）も落とす距離 (m)。
+ *
+ * ここまで引くと車線 1 本の幅は 1 画素の何分の一かになる。面積比で薄めた
+ * 矩形でさえ、隣り合う画素の間で出たり消えたりしてちらつく。俯瞰で
+ * 道路の形を伝えているのは舗装そのものなので、標示はいっそ全部落とす。
+ */
+const MARKING_FAR_CUTOFF = 760;
+
+/**
+ * 路面の傷み（轍・補修跡・マンホール）を描くカメラ距離 (m)。
+ *
+ * これは近景専用のディテール。街区より引くと 1 画素未満になって
+ * ちらつくだけなので、まるごと落としてドローコールも返す。
+ */
+const WEAR_LOD_DISTANCE = 260;
 
 /**
  * 横断歩道の塗料。車線の白線よりさらに一段暗い。
@@ -159,24 +201,39 @@ const CROSSWALK_COLOR = 0xa5a399;
 const CROSSWALK_FAR_COLOR = 0x62635c;
 
 /**
- * 夜、市街地の路面を底上げする「面光源」の色と大きさ。
+ * 夜、街灯が路面に落とす光の大きさ (m) と強さ。
  *
- * 夜景の説得力は「光っているもの」ではなく「光が当たっているもの」で決まる。
- * 自発光する灯具だけを置いても路面は真っ黒のままで、街区の形が読めない。
- * かといって PointLight を数百個置くとフォワード描画では破綻する。
- * そこで市街地の道路タイル 1 枚ごとに、ごく弱い加算の板を敷いて
- * 「窓明かりと空のスカイグローに照らされた路面」を作る。
- * 街灯の光溜まりと同じ材質・同じプールに入れるので、描画は増えない
- * （色を instanceColor で分けるだけ）。
+ * ここは作り直した。以前は「道路タイル 1 枚ごとに弱い加算の板を敷いて
+ * 路面全体を底上げする」ことをしていて、そのうえ街灯 1 本の光溜まりを
+ * 24m 角・ほぼ全強度で置いていた。結果として光溜まりが隣同士で完全に
+ * 重なり、**道路の形をした一様な発光カーペット**になっていた。
+ * 目線の夜景では路面がファサードの 12 倍明るく、明暗の上下関係が
+ * 逆転して立体そのものが壊れていた。
+ *
+ * 直し方は 2 つ。
+ *
+ * **1. タイルごとの一律加算をやめる。** 光源と明るさの因果が切れていたのは
+ * これが原因で、街灯の無い区間まで同じ明るさで光っていた。
+ * 路面全体の底上げは加算板ではなく半球ライト（renderer 側）の仕事にする。
+ *
+ * **2. 光溜まりを小さく弱くする。** 灯具は 6m の高さにあるので、
+ * 路面で意味のある明るさになるのはせいぜい半径 7〜8m。
+ * 街灯の間隔（3 タイル＝30m）より小さくしておくと、
+ * **灯の下だけが明るく、間は落ちる**という夜道本来のリズムが出る。
  */
-const AMBIENT_POOL_SIZE = TILE_M * 2.2;
-const AMBIENT_POOL_LEVEL = 0.1;
-/** 交差点はもう一回り広く。街区の格子はここで読める。 */
-const JUNCTION_POOL_SIZE = TILE_M * 3.0;
-const JUNCTION_POOL_LEVEL = 0.062;
+const LAMP_POOL_SIZE = 15;
+const LAMP_POOL_LEVEL = 0.16;
+
+/**
+ * 遠景の連続線の幅 (m)。
+ * 実寸 15cm の線をこの幅まで太らせ、そのぶん舗装色へ薄める（面積比の保存）。
+ */
+const LINE_FAR_WIDTH = 0.5;
 
 /** 光の板を白に寄せるための混色先。 */
 const WHITE = new Color(1, 1, 1);
+/** 混色の作業用（this.color を潰さずに 2 色目を作るため）。 */
+const tmpColor = new Color();
 
 export class RoadLayer {
   readonly group = new Object3D();
@@ -185,8 +242,12 @@ export class RoadLayer {
   private readonly walkway: InstancePool;
   private readonly corner: InstancePool;
   private readonly marking: InstancePool;
-  /** 俯瞰用。横断歩道 1 か所につき淡い矩形 1 枚だけを持つ。 */
+  /** 俯瞰用。連続線と、横断歩道 1 か所につき淡い矩形 1 枚だけを持つ。 */
   private readonly markingFar: InstancePool;
+  /** 轍と補修跡。近景でだけ出す平板。 */
+  private readonly wear: InstancePool;
+  /** マンホールと集水桝の蓋。近景でだけ出す円板。 */
+  private readonly manhole: InstancePool;
   private readonly lamp: InstancePool;
   private readonly lampHead: InstancePool;
   private readonly lightPool: InstancePool;
@@ -212,6 +273,8 @@ export class RoadLayer {
   private night = -1;
   /** 直近に適用した LOD（毎フレーム visible を触らずに済ませるため）。 */
   private detailFar = false;
+  private markingsShown = true;
+  private wearShown = true;
   private wiresShown = true;
 
   private readonly mat = new Matrix4();
@@ -234,19 +297,56 @@ export class RoadLayer {
     // --- 路面 ---
     // 濡れていない乾いたアスファルトは粗いが、完全な拡散面ではない。
     // わずかに反射を残すと、朝夕の低い日射で路面がぬらりと光る。
-    const asphaltMat = surface({ roughness: 0.78, metalness: 0.06, envMapIntensity: 0.3 });
+    // envMapIntensity を大きく下げてある。目線の高さ（仰角 6 度）で路面を
+    // 見ると視線はほぼ水平で、そこではフレネル反射が 1 に近づく。
+    // 0.3 のままだと **空がそのまま路面に映って、車道が歩道と同じ明るさの
+    // 白っぽい板になる**（実際にそうなった）。乾いたアスファルトは
+    // ほとんど鏡面反射を持たないので、下げるのが物理的にも正しい。
+    const asphaltMat = surface({ roughness: 0.74, metalness: 0.05, envMapIntensity: 0.14 });
     // 板が地形と同じ高さに来たときの縞を止める。高さのオフセットと二段構えにする。
     asphaltMat.polygonOffset = true;
     asphaltMat.polygonOffsetFactor = -3;
     asphaltMat.polygonOffsetUnits = -3;
+    // 骨材の粗さを世界座標のノイズで焼く。目線の高さでは画面の 3〜4 割が路面で、
+    // そこが継ぎ目も色ムラも無い一色だとカット全体が未完成に見える。
+    // 板ごとに倍率の違う UV は使えないので、シェーダに差し込む（surfaceNoise.ts）。
+    applySurfaceNoise(asphaltMat, { scale: 3.4, color: 0.075, roughness: 0.15, bump: 0.03, fade: 240 });
     this.materials.push(asphaltMat);
 
     const plane = new PlaneGeometry(1, 1);
     plane.rotateX(-Math.PI / 2);
     this.asphalt = this.pool(plane, asphaltMat, true, 8192);
 
+    // --- 路面の傷み（轍・補修跡・マンホール）---
+    // 轍は車輪が通ったところだけ骨材が磨かれて、わずかに暗く・滑らかになる。
+    // 舗装と同じ材質にすると「色だけ違う板」になって轍に見えないので、
+    // 粗さを一段落とした専用の材質にする（近景でしか出さないので安い）。
+    // 「滑らか」といっても路面の話なので、鏡になってはいけない。
+    // 舗装より 0.12 だけ粗さを落とし、環境反射は舗装と同じに揃える。
+    // ここを 0.5 / 0.42 にしていたときは、轍が車道の大半を覆うぶん
+    // 空の映り込みで路面全体が白く飛んだ。
+    const wearMat = surface({ roughness: 0.62, metalness: 0.05, envMapIntensity: 0.16 });
+    wearMat.polygonOffset = true;
+    wearMat.polygonOffsetFactor = -5;
+    wearMat.polygonOffsetUnits = -5;
+    applySurfaceNoise(wearMat, { scale: 2.2, color: 0.07, roughness: 0.16, bump: 0.02, fade: 200 });
+    this.materials.push(wearMat);
+    this.wear = this.pool(plane.clone(), wearMat, true, 4096);
+    // 蓋は鋳鉄。粗さを下げて金属度を上げると、朝夕の低い日射で 1 個だけ光る。
+    const manholeMat = surface({ roughness: 0.5, metalness: 0.45, envMapIntensity: 0.28 });
+    manholeMat.polygonOffset = true;
+    manholeMat.polygonOffsetFactor = -7;
+    manholeMat.polygonOffsetUnits = -7;
+    this.materials.push(manholeMat);
+    const disc = new CircleGeometry(0.5, 12);
+    disc.rotateX(-Math.PI / 2);
+    this.manhole = this.pool(disc, manholeMat, true, 2048);
+
     // --- 歩道（縁石・側溝を含む断面）---
-    const walkMat = surface({ roughness: 0.9, metalness: 0.02, vertexColors: true, envMapIntensity: 0.28 });
+    const walkMat = surface({ roughness: 0.88, metalness: 0.02, vertexColors: true, envMapIntensity: 0.28 });
+    // 歩道も一色の板だった。平板の目地までは作らないが、
+    // 汚れと退色の大きなむらがあるだけで「敷かれた面」に見える。
+    applySurfaceNoise(walkMat, { scale: 2.6, color: 0.07, roughness: 0.1, bump: 0.02, fade: 200 });
     this.materials.push(walkMat);
     this.walkway = this.pool(walkwaySectionGeometry(), walkMat, false, 8192);
     this.corner = this.pool(walkwayCornerGeometry(), walkMat, false, 4096);
@@ -259,6 +359,10 @@ export class RoadLayer {
     markMat.polygonOffset = true;
     markMat.polygonOffsetFactor = -6;
     markMat.polygonOffsetUnits = -6;
+    // 塗料の擦れ。真っ白で均一な標示は、施工直後の数週間しか存在しない。
+    // 細かいノイズで濃淡を付けると、横断歩道が「印刷した縞」から
+    // 「踏まれて減った塗料」になる。振れ幅は舗装より大きく取る。
+    applySurfaceNoise(markMat, { scale: 1.1, color: 0.19, roughness: 0.06, bump: 0.0, fade: 210 });
     this.materials.push(markMat);
     this.marking = this.pool(plane.clone(), markMat, true, 16384);
     // 俯瞰用の代替（横断歩道 1 か所 = 1 枚）。同じ材質を共有するので描画は 1 増えるだけ。
@@ -297,6 +401,12 @@ export class RoadLayer {
       depthWrite: false,
       toneMapped: false,
     });
+    // 路面に貼り付ける板なので、深度を数テクセルぶん手前に押す。
+    // 高さのオフセット（Y_POOL）だけだと、斜面では舗装の三角形が
+    // 板より手前に来て光溜まりが虫食いになる。
+    this.poolMat.polygonOffset = true;
+    this.poolMat.polygonOffsetFactor = -8;
+    this.poolMat.polygonOffsetUnits = -8;
     this.materials.push(this.poolMat);
     const poolGeom = new PlaneGeometry(1, 1);
     poolGeom.rotateX(-Math.PI / 2);
@@ -356,13 +466,18 @@ export class RoadLayer {
    */
   private setDetail(camDistance: number): void {
     this.detailFar = camDistance > MARKING_LOD_DISTANCE;
+    // いちばん引いたところでは、面積比で薄めた矩形すらちらつくので全部落とす。
+    this.markingsShown = camDistance < MARKING_FAR_CUTOFF;
+    this.wearShown = camDistance < WEAR_LOD_DISTANCE;
     this.wiresShown = camDistance < WIRE_LOD_DISTANCE;
     this.applyDetail();
   }
 
   private applyDetail(): void {
     this.marking.setVisible(!this.detailFar);
-    this.markingFar.setVisible(this.detailFar);
+    this.markingFar.setVisible(this.detailFar && this.markingsShown);
+    this.wear.setVisible(this.wearShown);
+    this.manhole.setVisible(this.wearShown);
     this.wire.setVisible(this.wiresShown);
   }
 
@@ -382,13 +497,11 @@ export class RoadLayer {
     this.vendingGlow.mesh.visible = lit;
     if (!lit) return;
     this.lampHeadMat.opacity = Math.min(1, night * 1.4);
-    // 光の板の強さ。ここが夜の絵のほぼすべてを決める。
-    // 弱すぎると路面が黒いままで道路網が消え、強すぎると白飛びして
-    // やはり道の形が消える。舗装が反射率 10% 前後で相当暗いので、
-    // 加算で 0.9 くらい乗せてようやく「照らされた路面」に見える。
-    // 板ごとの強さの差（街灯の直下か、街区全体のスカイグローか）は
-    // instanceColor 側で付けてあるので、ここは全体の掛け率だけ。
-    this.poolMat.opacity = night * 0.92;
+    // 光の板の強さ。以前はここを 0.92 まで上げていて、24m 角の光溜まりが
+    // 隣同士で重なった結果、路面が「発光するベージュの絨毯」になっていた。
+    // 加算板が担うのは**街灯の真下のプール光だけ**で、路面全体の明るさは
+    // 半球ライト（renderer 側）が持つ。以前の 1/6 まで落とす。
+    this.poolMat.opacity = night * LAMP_POOL_LEVEL;
     this.vendingGlowMat.opacity = Math.min(1, night * 1.2);
   }
 
@@ -413,7 +526,7 @@ export class RoadLayer {
       this.putPavement(cls, conn, cx, cz, gy, half, h);
       this.putWalkways(world, i, conn, cx, cz, gy, half, h, cls);
       this.putMarkings(world, i, cls, conn, degree, cx, cz, gy, half);
-      this.putGlow(world, i, degree, cx, cz, gy);
+      this.putWear(conn, degree, cx, cz, gy, half, h);
     }
 
     this.putBusStops(sim);
@@ -424,38 +537,84 @@ export class RoadLayer {
   }
 
   /**
-   * 夜の路面の底上げ。
+   * 路面の傷み。轍・補修跡・マンホール。
    *
-   * 街灯の光溜まり（`putEdgeProps`）だけだと、灯具のある辺の 20m 四方しか
-   * 明るくならず、街区の大半は純黒のままだった。実際の市街地の夜は、
-   * 窓明かり・看板・空のスカイグローで**道路面全体がうっすら見えている**。
-   * ここでは「まわりに建物がある道路タイル」にごく弱い板を 1 枚敷いて、
-   * その底上げを作る。何も無い郊外の道は暗いままにしたいので、
-   * 隣接タイルに用途地域があるかどうかで出し分ける。
+   * 目線のカットで路面が「無地の板」に見えていた最大の理由は、
+   * 舗装の色ムラが無いことより **人工物の痕跡が 1 つも無いこと** だった。
+   * 実際のアスファルトには、必ず轍・掘り返した跡・鉄蓋が乗っている。
+   * どれも数が少ないので、近景でしか描かない（LOD で丸ごと落とす）。
    */
-  private putGlow(world: Simulation['world'], i: number, degree: number, cx: number, cz: number, gy: number): void {
-    let built = false;
-    for (let d = 0; d < 4; d++) {
-      const nb = neighbor(i, d);
-      const zone = nb >= 0 ? world.zone[nb]! : Zone.None;
-      // 「まわりに人の営みがある」＝市街地の 3 用途だけ。農地・林業地・公園を
-      // 含めると、田園の農道まで格子状に光り、俯瞰でまた「配線パターン」に戻る
-      // （実際、夜の田んぼの中の道は街灯も窓明かりも無く真っ暗）。
-      if (zone >= Zone.ResidentialLow && zone <= Zone.IndustrialHeavy) {
-        built = true;
-        break;
+  private putWear(
+    conn: number,
+    degree: number,
+    cx: number,
+    cz: number,
+    gy: number,
+    half: number,
+    h: number,
+  ): void {
+    const straightNS = conn === 0b0101;
+    const straightEW = conn === 0b1010;
+    const y = gy + Y_WEAR;
+
+    // --- 轍 ---
+    // 車は中心から ±LANE_OFFSET_M(2.2) を走るので、その帯だけが磨り減る。
+    // 交差点では車の軌跡が散るので敷かない（実物も交差点内に轍は出ない）。
+    if (straightNS || straightEW) {
+      const alongX = straightEW;
+      // 帯の幅は「中心から 2.2m の車輪跡が車道からはみ出さない」上限で決める。
+      // 生活道路（半幅 3.1m）では 1.8m しか取れない。
+      const width = Math.min(2.3, Math.max(0.8, (half - 2.2) * 2));
+      this.color.setHex(RUT_COLOR);
+      for (let k = -1; k <= 1; k += 2) {
+        const off = k * 2.2;
+        this.place(
+          this.wear,
+          alongX ? cx : cx + off,
+          y,
+          alongX ? cz + off : cz,
+          alongX ? TILE_M : width,
+          alongX ? width : TILE_M,
+          0,
+          this.color,
+        );
       }
     }
-    if (!built) return;
-    const y = gy + Y_POOL;
-    // 板は暖色に寄せる。日本の夜の街路は水銀灯とナトリウム灯と
-    // 窓明かりが混ざって、写真で見るとわずかに黄色い。
-    this.color.setRGB(AMBIENT_POOL_LEVEL, AMBIENT_POOL_LEVEL * 0.95, AMBIENT_POOL_LEVEL * 0.82);
-    this.place(this.lightPool, cx, y, cz, AMBIENT_POOL_SIZE, AMBIENT_POOL_SIZE, 0, this.color);
-    // 交差点はもう一枚重ねる。格子の交点が明るいと、上空から街区の形が読める。
-    if (degree >= JUNCTION_DEGREE) {
-      this.color.setRGB(JUNCTION_POOL_LEVEL, JUNCTION_POOL_LEVEL * 0.96, JUNCTION_POOL_LEVEL * 0.86);
-      this.place(this.lightPool, cx, y, cz, JUNCTION_POOL_SIZE, JUNCTION_POOL_SIZE, 0, this.color);
+
+    // --- 補修跡 ---
+    // 掘り返して埋め戻したところ。新しいアスファルトなので周りより黒い。
+    // タイルの 1/4 くらいの矩形を、8 タイルに 1 枚。
+    if ((h >>> 6) % 8 === 3 && half > 0) {
+      const px = cx + ((((h >>> 11) % 100) / 100 - 0.5) * half * 1.2);
+      const pz = cz + ((((h >>> 17) % 100) / 100 - 0.5) * TILE_M * 0.55);
+      const sx = 1.4 + ((h >>> 21) % 22) / 10;
+      const sz = 1.1 + ((h >>> 25) % 26) / 10;
+      this.color.setHex(PATCH_COLOR);
+      this.place(this.wear, px, y, pz, sx, sz, 0, this.color);
+    }
+
+    // --- マンホール・集水桝 ---
+    // 交差点の隅と、路肩寄りの管路の上。等間隔に並べると点線になるので、
+    // タイルのハッシュで位相を散らす。
+    if ((h >>> 3) % 3 === 1) {
+      const side = (h >>> 9) % 2 === 0 ? 1 : -1;
+      const lat = Math.min(half - 0.7, 1.5 + ((h >>> 13) % 14) / 10);
+      const alongOff = ((((h >>> 15) % 100) / 100 - 0.5) * TILE_M * 0.7);
+      const vertical = straightNS || (!straightEW && degree >= JUNCTION_DEGREE);
+      const size = 0.62 + ((h >>> 19) % 10) / 40;
+      // 蓋は個体差が大きい（新しい鋳鉄・錆びたもの・アスファルトが被ったもの）。
+      const v = 0.8 + ((h >>> 23) % 45) / 100;
+      this.color.setHex(MANHOLE_COLOR).multiplyScalar(v);
+      this.place(
+        this.manhole,
+        vertical ? cx + lat * side : cx + alongOff,
+        y,
+        vertical ? cz + alongOff : cz + lat * side,
+        size,
+        size,
+        0,
+        this.color,
+      );
     }
   }
 
@@ -614,12 +773,11 @@ export class RoadLayer {
       // 路面に落ちる光。灯具の色をそのまま使うと路面がオレンジ一色になるので、
       // 白に寄せて薄める（実際の路面も光源色ほどは色が付かない）。
       this.color.lerp(WHITE, 0.26);
-      // 灯具が 6m の高さにあるので、光は半径 12m 前後に広がる。
-      // 隣の街灯の光と重なる大きさにしておくと、点の列ではなく
-      // 「照らされた帯」になって、上空から道路の形が読める。
-      // 広げすぎると、郊外では路肩を越えて田畑の上まで丸く光り、
-      // 路面ではなく「霧の塊」に見えるので 24m 角に収める。
-      this.place(this.lightPool, gx, gy + Y_POOL, gz, 24, 24, 0, this.color);
+      // 光溜まりは街灯の間隔より小さく。以前は 24m 角にしていたが、
+      // 街灯は 3 タイル（30m）ごと・道の両側にあるので、それだと
+      // 隣の光と完全に重なって「切れ目のない発光する帯」になっていた。
+      // 15m 角なら灯の下だけが明るく、間はきちんと落ちる。
+      this.place(this.lightPool, gx, gy + Y_POOL, gz, LAMP_POOL_SIZE, LAMP_POOL_SIZE, 0, this.color);
     }
 
     // --- 電柱 ---
@@ -845,6 +1003,10 @@ export class RoadLayer {
     const y = gy + Y_MARKING;
     const straightNS = conn === 0b0101;
     const straightEW = conn === 0b1010;
+    // 標示の褪せ具合をタイルごとに散らす。同じ白が街じゅうに続いていると、
+    // 塗料ではなく「上から重ねた図形」に見える。
+    const th = (i * 1103515245 + 12345) >>> 0;
+    const fade = 0.86 + ((th >>> 7) % 24) / 100;
 
     if (straightNS || straightEW) {
       const alongX = straightEW;
@@ -854,7 +1016,7 @@ export class RoadLayer {
        * 縦横の場合分けをここに閉じ込めると、車線の定義そのものが素直に書ける。
        */
       const line = (offset: number, width: number, length: number, hex: number, shift = 0): void => {
-        this.color.setHex(hex);
+        this.color.setHex(hex).multiplyScalar(fade);
         this.place(
           this.marking,
           alongX ? cx + shift : cx + offset,
@@ -870,22 +1032,52 @@ export class RoadLayer {
       const dashed = (offset: number, width: number, hex: number): void => {
         for (let k = 0; k < 2; k++) line(offset, width, TILE_M * 0.3, hex, (k - 0.5) * (TILE_M / 2));
       };
+      /**
+       * 遠景用の連続線。
+       *
+       * 街区の距離だと車線 1 本は 1 画素を割る。同じ幅・同じ色で描くと、
+       * 画素の網にかかったところだけが白く出て、道路が点滅する鎖に見える
+       * （前回の指摘の「白いビーズの鎖」がこれ）。そこで**面積比を保ったまま
+       * 幅を広げて色を薄める**。線 1 本が受け持つ明るさの総量は変わらないので、
+       * 遠くから見た印象は同じまま、高周波だけが消える。
+       */
+      const farLine = (offset: number, width: number, hex: number): void => {
+        this.color
+          .setHex(PAVEMENT.avenue)
+          .lerp(tmpColor.setHex(hex), Math.min(1, (width / LINE_FAR_WIDTH) * fade));
+        this.place(
+          this.markingFar,
+          alongX ? cx : cx + offset,
+          y,
+          alongX ? cz + offset : cz,
+          alongX ? TILE_M : LINE_FAR_WIDTH,
+          alongX ? LINE_FAR_WIDTH : TILE_M,
+          0,
+          this.color,
+        );
+      };
 
       // 外側線。路肩の位置を示す線で、これがあると路面が「道」に見える。
       line(half - 0.3, 0.15, TILE_M, LINE_WHITE);
       line(-(half - 0.3), 0.15, TILE_M, LINE_WHITE);
+      farLine(half - 0.3, 0.15, LINE_WHITE);
+      farLine(-(half - 0.3), 0.15, LINE_WHITE);
 
       // 生活道路（RoadClass.Street）はここで何も足さない。外側線だけ。
       if (cls === RoadClass.Avenue) {
         line(0, 0.16, TILE_M, LINE_YELLOW);
         dashed(half * 0.5, 0.12, LINE_WHITE);
         dashed(-half * 0.5, 0.12, LINE_WHITE);
+        // 遠景では破線を出さない。切れ目のある線は最悪のちらつき源で、
+        // しかも中央線さえあれば「二車線の道」は十分読める。
+        farLine(0, 0.16, LINE_YELLOW);
       } else if (cls === RoadClass.Boulevard) {
         // 黄の二重線（追い越し禁止）。大通りだとひと目で分かる記号になる。
         line(0.17, 0.14, TILE_M, LINE_YELLOW);
         line(-0.17, 0.14, TILE_M, LINE_YELLOW);
         dashed(half * 0.55, 0.12, LINE_WHITE);
         dashed(-half * 0.55, 0.12, LINE_WHITE);
+        farLine(0, 0.28, LINE_YELLOW);
       }
     }
 
@@ -896,7 +1088,7 @@ export class RoadLayer {
     if (ow !== OneWay.None) {
       const ax = ow === OneWay.East ? 1 : ow === OneWay.West ? -1 : 0;
       const az = ow === OneWay.South ? 1 : ow === OneWay.North ? -1 : 0;
-      this.color.setHex(LINE_WHITE);
+      this.color.setHex(LINE_WHITE).multiplyScalar(fade);
       this.place(this.marking, cx, y, cz, ax !== 0 ? 4.4 : 0.45, az !== 0 ? 4.4 : 0.45, 0, this.color);
       for (let k = 0; k < 2; k++) {
         const back = 0.7 + k * 0.7;
@@ -928,7 +1120,7 @@ export class RoadLayer {
       // 横断歩道。縞は歩行者の進む向きに対して直角＝道路の向きに沿って伸びる。
       const e = TILE_M / 2 - 1.6;
       const stripes = Math.max(3, Math.round((half * 2 - 0.6) / 1.25));
-      this.color.setHex(CROSSWALK_COLOR);
+      this.color.setHex(CROSSWALK_COLOR).multiplyScalar(fade);
       for (let k = 0; k < stripes; k++) {
         const t = (k - (stripes - 1) / 2) * 1.25;
         this.place(
@@ -944,7 +1136,7 @@ export class RoadLayer {
       }
       // 俯瞰用の 1 枚。縞の並ぶ範囲をそのまま覆う矩形を、平均色で敷く。
       const band = stripes * 1.25;
-      this.color.setHex(CROSSWALK_FAR_COLOR);
+      this.color.setHex(CROSSWALK_FAR_COLOR).multiplyScalar(fade);
       this.place(
         this.markingFar,
         cx + ox * e,
@@ -960,7 +1152,7 @@ export class RoadLayer {
       // 交差点の手前に太い白帯が 1 本あるだけで「止まる場所」が読める。
       const se = TILE_M / 2 - 3.4;
       const lat = half * 0.5;
-      this.color.setHex(LINE_WHITE);
+      this.color.setHex(LINE_WHITE).multiplyScalar(fade);
       this.place(
         this.marking,
         cx + ox * se - ax * lat,

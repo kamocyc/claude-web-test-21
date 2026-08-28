@@ -1,4 +1,5 @@
 import {
+  Color,
   InstancedMesh,
   Material,
   Matrix4,
@@ -72,10 +73,26 @@ const RAIL_WEB = 0x6b5a4c;
 const DECK_COLOR = 0x6e6a64;
 const POLE_COLOR = 0x9aa0a6;
 /**
- * 架線の色。純黒に近い線は空を背景にするとジャギーが目立つので、
- * 空との明度差を詰めた暗い灰褐色にしておく。
+ * 架線の色。
+ *
+ * 1 本の色・1 本の太さで全部を張っていたので、遠目には「真っ黒な線が
+ * 何本か平行に走っている」だけになっていた。実際の架線は
+ *
+ *  - **吊架線**（上）: 亜鉛めっき鋼より線。太くて明るい灰。
+ *  - **トロリ線**（下）: パンタグラフが擦り続けるので銅が磨かれて光る。細い。
+ *  - **ハンガー**: その 2 本を繋ぐ短い吊り具。いちばん細い。
+ *
+ * と太さも色も違う。同じジオメトリのままインスタンス行列の断面スケールと
+ * `instanceColor` で描き分ければ、ドローコールを 1 つも増やさずに
+ * 「太さの変化」と「金属の色味」が出る。
  */
-const WIRE_COLOR = 0x6b6357;
+const WIRE_MESSENGER = 0x9a9288;
+const WIRE_CONTACT = 0xb08a5e;
+const WIRE_HANGER = 0x8a8377;
+/** 断面の太さの倍率（基準半径 4.5cm に対して）。 */
+const R_MESSENGER = 1.2;
+const R_CONTACT = 0.78;
+const R_HANGER = 0.42;
 const PLATFORM_COLOR = 0xc8c4bc;
 
 /** 架線柱。高さと、線路中心からの張り出し。 */
@@ -215,8 +232,10 @@ function poleGeometry(): BufferGeometry {
  * ドローコールは 1 本のままで済む。
  */
 function wireGeometry(): BufferGeometry {
+  // 頂点カラーは白のまま。線の色は `instanceColor` で 1 本ずつ与える
+  // （吊架線・トロリ線・ハンガーで色が違う）。
   return mergeParts([
-    prism({ r: 0.045, len: 1, seg: 6, axis: 'z', caps: 'none', tint: WIRE_COLOR }),
+    prism({ r: 0.045, len: 1, seg: 6, axis: 'z', caps: 'none' }),
   ]);
 }
 
@@ -264,10 +283,14 @@ function crossingGeometry(): BufferGeometry {
 /**
  * 駅のホーム 1 タイルぶん。上屋（屋根）と柱、ホーム端の白線まで作る。
  * 線路の +X 側に置く前提で、反対側は Y 回転で裏返す。
+ *
+ * 幅はタイルの半分（5.0m）に収まる寸法にしてある。以前の 3.4m 幅では
+ * 外縁が線路中心から 6.1m に出ていて、**隣のタイルに建つ駅舎を突き抜けていた**。
+ * ホームは必ず駅舎の隣に敷かれるので、はみ出しは必ず貫通になる。
  */
 function platformGeometry(): BufferGeometry {
   const x0 = BALLAST_W / 2 + 0.2;
-  const w = 3.4;
+  const w = 2.1;
   const cx = x0 + w / 2;
   const h = 1.05;
   const specs: BoxSpec[] = [
@@ -277,12 +300,12 @@ function platformGeometry(): BufferGeometry {
     { w: 0.35, h: 0.04, d: TILE_M, x: x0 + 0.2, y: h + 0.01, tint: 0xf4f2ea },
     // 点字ブロック。
     { w: 0.4, h: 0.05, d: TILE_M, x: x0 + 0.62, y: h + 0.01, tint: 0xe0c040 },
-    // 上屋。
-    { w: w + 0.5, h: 0.16, d: TILE_M, x: cx + 0.1, y: h + 3.0, tint: 0xb4bac0 },
+    // 上屋。タイルの縁（線路中心から 5.0m）を越えない幅に留める。
+    { w: w + 0.2, h: 0.16, d: TILE_M, x: cx + 0.05, y: h + 3.0, tint: 0xb4bac0 },
   ];
   // 上屋の柱。
   for (const z of [-3.2, 3.2]) {
-    specs.push({ w: 0.18, h: 2.95, d: 0.18, x: cx + 0.6, y: h + 1.5, z, tint: 0x8f959b });
+    specs.push({ w: 0.18, h: 2.95, d: 0.18, x: cx + 0.42, y: h + 1.5, z, tint: 0x8f959b });
   }
   const g = mergeParts(boxes(specs));
   applyVerticalAO(g, 0.7, 1.06, 1.5);
@@ -314,6 +337,8 @@ export class RailLayer {
   private readonly axisY = new Vector3(0, 1, 0);
   private readonly dir = new Vector3();
   private readonly forward = new Vector3(0, 0, 1);
+  /** 架線 1 本ごとの色を書き込むための作業用。 */
+  private readonly wireColor = new Color();
 
   constructor() {
     this.group.name = 'rails';
@@ -324,8 +349,9 @@ export class RailLayer {
     this.deck = this.makeMesh(deckGeometry(), MAX_DECK, 0.88, 0.04);
     this.pole = this.makeMesh(poleGeometry(), MAX_POLES, 0.55, 0.55);
     // 架線は金属だが、細い円柱に強い鏡面を乗せると 1px の線の上でハイライトが
-    // 明滅して、かえってちらつく。粗く・金属度を落として拡散寄りに寝かせる。
-    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.78, 0.3);
+    // 明滅して、かえってちらつく。粗さは残しつつ金属度だけ上げて、
+    // 磨かれたトロリ線が空の明るさを少し拾うようにする。
+    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.55, 0.6, 1.2);
     this.crossing = this.makeMesh(crossingGeometry(), MAX_CROSSING, 0.7, 0.1);
     this.platform = this.makeMesh(platformGeometry(), MAX_PLATFORM, 0.85, 0.04);
   }
@@ -424,16 +450,30 @@ export class RailLayer {
       if (bits >= 2) {
         for (let d = 0; d < 4; d++) {
           if (!(dirs & (1 << d))) continue;
-          if (wires + 2 > MAX_WIRE) break;
+          if (wires + 3 > MAX_WIRE) break;
           // 中心から辺へ。辺は経路長で ±0.5 タイル先にあたる。
           const ex = cx + (d === 1 ? HALF : d === 3 ? -HALF : 0);
           const ez = cz + (d === 2 ? HALF : d === 0 ? -HALF : 0);
           const step = d === 1 || d === 2 ? 0.5 : -0.5;
           const y0 = gy + WIRE_Y - sagAt(along);
           const y1 = gy + WIRE_Y - sagAt(along + step);
-          this.segment(this.wire, wires++, cx, y0, cz, ex, y1, ez);
+          this.segment(this.wire, wires++, cx, y0, cz, ex, y1, ez, R_MESSENGER, WIRE_MESSENGER);
           // トロリ線（パンタグラフが擦る線）。たわませない。
-          this.segment(this.wire, wires++, cx, gy + CONTACT_Y, cz, ex, gy + CONTACT_Y, ez);
+          this.segment(
+            this.wire, wires++,
+            cx, gy + CONTACT_Y, cz, ex, gy + CONTACT_Y, ez,
+            R_CONTACT, WIRE_CONTACT,
+          );
+          // ハンガー。吊架線からトロリ線を吊る短い縦の線を、辺の手前に 1 本。
+          // これが無いと 2 本の線がただ平行に走っているだけに見える。
+          const hx = (cx + ex) / 2;
+          const hz = (cz + ez) / 2;
+          const hy = gy + WIRE_Y - sagAt(along + step / 2);
+          this.segment(
+            this.wire, wires++,
+            hx, hy, hz, hx, gy + CONTACT_Y, hz,
+            R_HANGER, WIRE_HANGER,
+          );
         }
       }
       // 架線柱。3 タイルごと、線路の左右に交互に立てる。
@@ -517,7 +557,12 @@ export class RailLayer {
     mesh.setMatrixAt(index, this.mat);
   }
 
-  /** 2 点を結ぶ棒（架線）。+Z 長さ 1 のジオメトリを伸ばして向ける。 */
+  /**
+   * 2 点を結ぶ棒（架線）。+Z 長さ 1 のジオメトリを伸ばして向ける。
+   *
+   * @param radius 断面の太さの倍率。吊架線・トロリ線・ハンガーで変える。
+   * @param color  線の色。`instanceColor` で与えるのでメッシュは 1 本のままでよい。
+   */
   private segment(
     mesh: InstancedMesh,
     index: number,
@@ -527,6 +572,8 @@ export class RailLayer {
     bx: number,
     by: number,
     bz: number,
+    radius: number,
+    color: number,
   ): void {
     this.dir.set(bx - ax, by - ay, bz - az);
     const len = this.dir.length();
@@ -534,9 +581,11 @@ export class RailLayer {
     this.dir.divideScalar(len);
     this.quat.setFromUnitVectors(this.forward, this.dir);
     this.pos.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
-    this.scl.set(1, 1, len);
+    this.scl.set(radius, radius, len);
     this.mat.compose(this.pos, this.quat, this.scl);
     mesh.setMatrixAt(index, this.mat);
+    this.wireColor.setHex(color);
+    mesh.setColorAt(index, this.wireColor);
   }
 
   dispose(): void {

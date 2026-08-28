@@ -13,13 +13,14 @@ import type { Simulation } from '@sim/simulation';
 import { neighbor, tileX, tileY } from '@sim/world/tiles';
 import { surface } from './materials';
 import { InstancePool } from './instancePool';
-import { hash2 } from './groundPalette';
+import { LOT_PROPS, SHRUB_SEASON, hash2, mixHex } from './groundPalette';
 import { CARRIAGE_HALF, WALK_OUTER } from './roadLayer';
 import {
   bambooGeometry,
   broadleafGeometry,
   bundGeometry,
   coniferGeometry,
+  lotPropGeometry,
   rockGeometry,
   shrubGeometry,
   streetTreeGeometry,
@@ -89,8 +90,20 @@ const REBUILD_COOLDOWN = 24;
  * 増えるだけになる。冬に樹冠が痩せると、その粒だけが残って
  * 「田園に赤い点が数千個散っている」ように見えていた。
  * 遠景では樹冠だけの LOD ジオメトリに差し替える。
+ *
+ * しきい値を 800 から下げてある。朝夕の低い日射は橙なので、幹の赤茶が
+ * そのまま増幅される。街区より引いた時点で幹は 1px を割っているのだから、
+ * 早めに落としたほうが「同じ色の粒が散っている」印象を避けられる。
  */
-const TRUNK_LOD_DISTANCE = 800;
+const TRUNK_LOD_DISTANCE = 600;
+
+/**
+ * 敷地の小物を描くカメラ距離 (m)。
+ *
+ * 塀も物置も 2m 前後の物なので、これより引くと数画素に潰れて
+ * 「地面に散った点」にしかならない。街区を見下ろす距離までで十分。
+ */
+const LOT_PROP_LOD_DISTANCE = 620;
 
 /** 向き d (0=北,1=東,2=南,3=西) の外向き単位ベクトル。街路樹をどの辺に植えるかで使う。 */
 const OUT_X = [0, 1, 0, -1] as const;
@@ -113,6 +126,18 @@ export class NatureLayer {
   /** 数の少ない種類は区画に切らずに 1 メッシュで持つ。 */
   private readonly streetTrees: InstancePool;
   private readonly bamboo: InstancePool;
+  /**
+   * 敷地の小物（塀・生垣・物置・駐車パッド）。
+   *
+   * 用途地域を指定しただけで建物がまだ建っていない土地は、以前は
+   * 「用途の色を混ぜた四角」で塗っていた。塗りをやめると今度はただの
+   * 草地になり、街区の中に穴が空く。実際の日本の街区の空き地は、
+   * 砕石を敷いた月極駐車場か、ブロック塀と生垣に囲われた更地で、
+   * だいたい隅にプレハブの物置が建っている。それを数個置くだけで
+   * 「区画データ」ではなく「まだ建っていない敷地」に見えるようになる。
+   */
+  private readonly lotProps: InstancePool;
+  private lotPropsShown = true;
   /** 街路樹の遠景版（植樹枡と幹を落としたもの）。 */
   private streetTreeFar: BufferGeometry;
   private streetTreeNear: BufferGeometry;
@@ -132,6 +157,13 @@ export class NatureLayer {
     roughness: 0.94,
     metalness: 0.0,
     envMapIntensity: 0.25,
+  });
+  /** 塀・物置・駐車パッド。人工物なので岩や葉より少しだけ反射する。 */
+  private readonly propMaterial = surface({
+    vertexColors: true,
+    roughness: 0.82,
+    metalness: 0.03,
+    envMapIntensity: 0.35,
   });
   private geomSeason = -1;
 
@@ -166,6 +198,7 @@ export class NatureLayer {
       true,
       512,
     );
+    this.lotProps = new InstancePool(lotPropGeometry(), this.propMaterial, this.group, true, 4096);
   }
 
   /** 情報表示のときは隠す（道路・線路レイヤと同じ理由）。 */
@@ -184,6 +217,11 @@ export class NatureLayer {
    */
   update(sim: Simulation, camDistance = 0): void {
     this.applyLod(camDistance > TRUNK_LOD_DISTANCE);
+    const showLots = camDistance < LOT_PROP_LOD_DISTANCE;
+    if (showLots !== this.lotPropsShown) {
+      this.lotPropsShown = showLots;
+      this.lotProps.setVisible(showLots);
+    }
     const e = sim.world.epochs;
     const season = sim.clock.season;
     const changed =
@@ -225,9 +263,13 @@ export class NatureLayer {
     this.cursors.fill(0);
     this.streetTrees.begin();
     this.bamboo.begin();
+    this.lotProps.begin();
     this.walk(sim, true);
     this.streetTrees.end();
     this.bamboo.end();
+    this.lotProps.end();
+    // grow() でメッシュが作り直されている可能性があるので、LOD を掛け直す。
+    this.lotProps.setVisible(this.lotPropsShown);
     this.finish();
   }
 
@@ -379,6 +421,16 @@ export class NatureLayer {
       // 線路・建物の上には何も生やさない。
       if (world.rail[i] !== 0 || world.buildingRef[i] !== 0) continue;
 
+      // --- 空き地の小物 ---
+      // 用途を指定しただけで建物がまだ建っていない土地。
+      // ここを空のままにすると街区の中に穴が空くので、敷地の設えを置く。
+      // 数える周と置く周で必ず同じ判定を通す（ここで枝分かれが食い違うと、
+      // 区画ごとの容量と実際に置く数がずれる）。
+      if (zone >= Zone.ResidentialLow && zone <= Zone.IndustrialHeavy) {
+        if (place) this.putLotProps(world, i, cx, cz, gy, h, season);
+        continue;
+      }
+
       if (terrain === Terrain.Mountain) {
         if (h % ROCK_PERIOD !== 0) continue;
         const slot = region * KIND_COUNT + Kind.Rock;
@@ -482,9 +534,16 @@ export class NatureLayer {
           continue;
         }
         // 植林地は列に並べる。自然林との違いが遠目にも分かる。
-        const ox = planted ? (k - (count - 1) / 2) * 3.2 : (((g >>> 3) % 100) / 100 - 0.5) * TILE_M * 0.72;
-        const oz = planted ? ((i % 3) - 1) * 3.0 : (((g >>> 11) % 100) / 100 - 0.5) * TILE_M * 0.72;
-        const height = conifer ? 9 + ((g >>> 23) % 70) / 10 : 7 + ((g >>> 23) % 50) / 10;
+        // 散布のオフセット。以前はタイルの ±36% に収めていたが、
+        // 平地の雑木は 11 タイルに 1 本しか生えないので、
+        // **散布の行がそのまま格子として見えていた**（前回の指摘）。
+        // タイルの外まではみ出すところまで広げると、格子の位相が壊れて
+        // 「まばらに散った雑木」に見える。
+        const ox = planted ? (k - (count - 1) / 2) * 3.2 : (((g >>> 3) % 100) / 100 - 0.5) * TILE_M * 1.6;
+        const oz = planted ? ((i % 3) - 1) * 3.0 : (((g >>> 11) % 100) / 100 - 0.5) * TILE_M * 1.6;
+        // 大きさの散らしも広げる。冬の落葉樹は葉が無いぶん個体の輪郭が
+        // 全部同じ「枝の塊」になるので、高さの幅で違いを作るしかない。
+        const height = conifer ? 8.5 + ((g >>> 23) % 80) / 10 : 5.4 + ((g >>> 23) % 88) / 10;
         // 樹形も少し崩す。幅を高さと別に散らすと、同じ木の反復が消える。
         const spread = height * (0.86 + ((g >>> 13) % 32) / 100);
         this.put(
@@ -499,14 +558,116 @@ export class NatureLayer {
           // 冬の落葉樹は「枝の塊」＝ほぼ無彩色なので、色相を振ると
           // 朝夕の低い日射を拾って個体ごとに赤やピンクに転ぶ。
           // 遠景ではそれが「田園に散った赤い粒」に戻るので、冬だけ振れ幅を絞る。
+          // 冬の落葉樹は「同じ黒い塊」に見えていた。色相を振ると朝夕の
+          // 低い日射を拾って赤に転ぶので、色相はほぼ据え置きのまま
+          // **明度の幅だけを大きく開く**。同じ灰褐色でも、明るい個体と
+          // 暗い個体が混ざっていれば林として読める。
           this.jitterCanopy(
             g,
-            conifer ? 0.022 : winter ? 0.014 : 0.05,
-            conifer ? 0.16 : winter ? 0.15 : 0.24,
+            conifer ? 0.022 : winter ? 0.02 : 0.05,
+            conifer ? 0.16 : winter ? 0.32 : 0.24,
           ),
         );
       }
     }
+  }
+
+  /**
+   * 空き地の設え。塀・生垣・物置・駐車パッド。
+   *
+   * 形はすべて 1 種類の面取り箱で、拡大率だけで作り分ける
+   * （`lotPropGeometry`）。ドローコールを 1 本に抑えるためで、
+   * 塀のように薄く長い物と物置のように厚い物を同じ箱で兼ねられる。
+   *
+   * 敷地の境界は「道路に面した辺」に置く。道路に接していない奥の敷地は
+   * ハッシュで辺を決める。全部の辺を囲うと升目になるので、必ず 1 辺だけ。
+   */
+  private putLotProps(
+    world: Simulation['world'],
+    i: number,
+    cx: number,
+    cz: number,
+    gy: number,
+    h: number,
+    season: number,
+  ): void {
+    // 道路に面した辺を探す。見つからなければハッシュで決める。
+    let edge = -1;
+    for (let d = 0; d < 4; d++) {
+      const nb = neighbor(i, d);
+      if (nb >= 0 && world.road[nb] !== RoadClass.None) {
+        edge = d;
+        break;
+      }
+    }
+    const key = h >>> 5;
+    if (edge < 0) edge = key % 4;
+    // 辺が南北向き（外向きが Z）なら、境界の物は X 方向に伸びる。
+    const alongX = edge === 0 || edge === 2;
+    const bx = cx + OUT_X[edge]! * (TILE_M / 2 - 0.45);
+    const bz = cz + OUT_Z[edge]! * (TILE_M / 2 - 0.45);
+    const run = TILE_M * 0.84;
+    const thin = 0.24;
+
+    switch (key % 4) {
+      case 0: {
+        // 月極駐車場。砕石を敷いた板と、奥側の低いブロック塀。
+        this.color.setHex(LOT_PROPS.gravel).multiplyScalar(0.92 + ((key >>> 7) % 18) / 100);
+        this.putBox(cx, gy + 0.01, cz, TILE_M * 0.82, 0.09, TILE_M * 0.82, this.color);
+        const back = (edge + 2) & 3;
+        this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.9 + ((key >>> 11) % 20) / 100);
+        this.putBox(
+          cx + OUT_X[back]! * (TILE_M / 2 - 0.45),
+          gy,
+          cz + OUT_Z[back]! * (TILE_M / 2 - 0.45),
+          alongX ? run : thin,
+          0.62,
+          alongX ? thin : run,
+          this.color,
+        );
+        break;
+      }
+      case 1: {
+        // 生垣。季節で色が変わるように、低木と同じパレットから引く。
+        const pal = SHRUB_SEASON[season] ?? SHRUB_SEASON[Season.Summer]!;
+        this.color.copy(mixHex(pal.dark, pal.light, ((key >>> 9) % 100) / 100));
+        this.putBox(bx, gy, bz, alongX ? run : 0.8, 1.0 + ((key >>> 13) % 30) / 100, alongX ? 0.8 : run, this.color);
+        break;
+      }
+      case 2: {
+        // 物置と塀。物置は敷地の隅に寄せる。
+        this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.9 + ((key >>> 11) % 20) / 100);
+        this.putBox(bx, gy, bz, alongX ? run : thin, 1.5, alongX ? thin : run, this.color);
+        const sx = ((key >>> 15) % 2 === 0 ? 1 : -1) * TILE_M * 0.26;
+        const sz = ((key >>> 17) % 2 === 0 ? 1 : -1) * TILE_M * 0.26;
+        this.color.setHex((key >>> 19) % 3 === 0 ? LOT_PROPS.shedAlt : LOT_PROPS.shed);
+        this.putBox(cx + sx, gy, cz + sz, 2.5, 2.0 + ((key >>> 21) % 8) / 10, 1.8, this.color);
+        break;
+      }
+      default: {
+        // ブロック塀だけ。高さを散らすと、同じ塀が並ぶ反復が消える。
+        this.color.setHex(LOT_PROPS.blockWall).multiplyScalar(0.88 + ((key >>> 11) % 24) / 100);
+        this.putBox(bx, gy, bz, alongX ? run : thin, 1.3 + ((key >>> 23) % 60) / 100, alongX ? thin : run, this.color);
+        break;
+      }
+    }
+  }
+
+  /** 底面 y=0 の単位箱を実寸で置く（敷地の小物専用）。 */
+  private putBox(
+    x: number,
+    y: number,
+    z: number,
+    sx: number,
+    sy: number,
+    sz: number,
+    color: Color,
+  ): void {
+    this.pos.set(x, y, z);
+    this.scl.set(sx, sy, sz);
+    this.quat.identity();
+    this.mat.compose(this.pos, this.quat, this.scl);
+    this.lotProps.push(this.mat, color);
   }
 
   /** 隣接 4 タイルにその地形があるか。里山の縁の判定に使う。 */
@@ -640,8 +801,11 @@ export class NatureLayer {
     this.streetTrees.dispose();
     this.bamboo.mesh.geometry.dispose();
     this.bamboo.dispose();
+    this.lotProps.mesh.geometry.dispose();
+    this.lotProps.dispose();
     this.treeMaterial.dispose();
     this.rockMaterial.dispose();
+    this.propMaterial.dispose();
   }
 }
 

@@ -1,4 +1,4 @@
-import { MeshStandardMaterial } from 'three';
+import { Color, MeshStandardMaterial } from 'three';
 import { surface } from './materials';
 
 /**
@@ -11,16 +11,17 @@ import { surface } from './materials';
  * 昼の路上でも車の上半分が真っ黒な天蓋になってしまっていた。
  * ガラスは空を映すものなので、屋外の昼にこの暗さはあり得ない。
  *
- * かといってガラスを別メッシュに割ると、車種 3 + トラック + バス + 電車 3 で
- * 8 ドローコール増える。そこで **頂点属性 1 本（`aGlass`）で
- * 「ここはガラス」と印を付け、シェーダの側で materials を切り替える**。
+ * かといってガラスを別メッシュに割ると、車種 5 + トラック + バス + 電車 3 で
+ * 10 ドローコール増える。そこで **頂点属性 1 本（`aGlass`）で
+ * 「ここはガラス」と印を付け、シェーダの側で塗り分ける**。
  * ドローコールは 1 つも増えず、ガラスだけを
  *
- *   - 車体色の変調から外す（絶対色にする）
- *   - ほぼ鏡（粗さ 0.07・金属度 0.94）にして環境マップ＝空を映す
+ *   - 車体色の変調から外す（暗い地の色にする）
+ *   - 反射だけで明るさを作る（空・地平・路面の 3 段 ＋ フレネル）
  *
- * ことができる。角度によって空が映り込んで明るくなるのが正しい見え方で、
- * これは頂点カラーでは絶対に作れない。
+ * ことができる。**ガラスは反射しか材質の証明を持たない**。地を明るい灰色に
+ * 塗ると、黒い天蓋は直っても今度は「白く塗った板」になる。明るさは
+ * 必ず反射の側から来なければならない。
  *
  * もう 1 つ、**夜の読めなさ**もここで直す。夜の車体は物理的には正しく真っ黒に
  * なるのだが、絵としては前照灯だけが飛んでいて車が消える。街灯の光を拾って
@@ -33,15 +34,63 @@ import { surface } from './materials';
 export const GLASS_ATTRIBUTE = 'aGlass';
 
 /**
- * ガラスの絶対色（＝金属度を上げたときの反射色）。
- * 空色に寄せた明るい青灰。ここが暗いと結局ガラスが黒くなる。
+ * 「インスタンス色（＝服の色）の変調を受けない」部位に 1 を立てる頂点属性。
+ *
+ * 人は 1 人 1 インスタンス色で服を塗り分けるが、three は
+ * `vColor = 頂点色 × instanceColor` と掛け算するので、**肌も髪も靴も
+ * 服の色に染まる**。そのため服の色は「暗すぎず明るすぎない中間色」にしか
+ * できず、結果として街じゅうの人が同じような薄い色の服を着ることになっていた。
+ *
+ * 印の付いた頂点だけ頂点シェーダで `vColor` を頂点色そのものへ戻す。
+ * これで黒いスーツも白いシャツも置けるようになり、顔は肌色のままでいられる。
+ * フラグメント側には一切手を入れないので、費用は属性 1 本ぶんだけ。
  */
-const GLASS_TINT = 'vec3(0.40, 0.43, 0.47)';
-/** ガラスの粗さと金属度。ほぼ鏡にして環境マップを拾わせる。 */
-const GLASS_ROUGHNESS = '0.07';
-const GLASS_METALNESS = '0.94';
+export const SKIN_ATTRIBUTE = 'aSkin';
+
+/**
+ * ガラスの地の色。
+ *
+ * 前回はここを明るい青灰（0.40 前後）に置いていたが、それだと
+ * **一様に明るいだけの板**になる。「黒い天蓋」を直そうとして、今度は
+ * 「白く塗った板」になっていた。ガラスの地は本来かなり暗く、
+ * 明るく見えているぶんはすべて**反射**である。地は暗く置き直し、
+ * 明るさは下の反射項で作る。
+ */
+const GLASS_TINT = 'vec3(0.055, 0.062, 0.075)';
+/** ガラスの粗さと金属度。反射は自前で足すので、環境マップは補助に留める。 */
+const GLASS_ROUGHNESS = '0.10';
+const GLASS_METALNESS = '0.65';
 /** ガラスだけ環境マップを強く拾わせる倍率。 */
-const GLASS_ENV_GAIN = '1.6';
+const GLASS_ENV_GAIN = '0.7';
+
+/**
+ * ガラスの反射。
+ *
+ * 環境マップ（PMREM の空）を当てるだけでは階調が出ない。窓は平らな板で
+ * 焼いてあるので、面の中で法線＝反射ベクトルが一定になり、1 枚が
+ * 単色に塗り潰されるためである（`vehicleParts.curveGlass` で法線を
+ * 反らせてあるのはその対策）。ここではさらに、
+ *
+ * - **反射ベクトルの上向き成分**から「空 / 地平 / 路面」を引く
+ * - **フレネル**で縁を明るくする
+ *
+ * を明示的に足す。上を向いている面は空の青、水平を向いている面は地平の
+ * 明るい帯、下を向いている面は路面の暗さを映すので、1 枚のガラスの中に
+ * 必ず階調が生まれる。ガラスが「ガラスに見える」条件はこれだけで足りる。
+ */
+const GLASS_REFLECT = /* glsl */ `
+	{
+		vec3 vDir = normalize( vViewPosition );
+		vec3 nrm = normalize( normal );
+		vec3 upView = normalize( ( viewMatrix * vec4( 0.0, 1.0, 0.0, 0.0 ) ).xyz );
+		float up = dot( reflect( -vDir, nrm ), upView );
+		vec3 refl = mix( uGlassGround, uGlassHorizon, smoothstep( -0.45, 0.0, up ) );
+		refl = mix( refl, uGlassSky, smoothstep( 0.0, 0.6, up ) );
+		// 視線が浅いほど強く映る（フレネル）。縁が光るとガラスの厚みが出る。
+		float fres = pow( 1.0 - clamp( dot( vDir, nrm ), 0.0, 1.0 ), 4.0 );
+		totalEmissiveRadiance += vGlass * refl * ( 0.34 + 1.15 * fres );
+	}
+`;
 
 /** 夜の持ち上げ量。一律の下駄と、車体色に比例する分。 */
 const NIGHT_FLOOR = 0.028;
@@ -53,6 +102,8 @@ export interface AgentSurfaceOptions {
   envMapIntensity?: number;
   /** ガラス（`aGlass` 属性）を持つジオメトリに使うか。 */
   glass?: boolean;
+  /** 肌・髪など、インスタンス色の変調を外す部位（`aSkin` 属性）を持つか。 */
+  skin?: boolean;
   /** 夜の持ち上げの強さ。人は車より弱くする。 */
   nightLift?: number;
 }
@@ -62,6 +113,13 @@ export interface AgentSurface {
   material: MeshStandardMaterial;
   /** `atmosphereAt().nightAmount` をそのまま入れる。 */
   night: { value: number };
+  /**
+   * ガラスが映す空・地平・路面の色。時刻に合わせて書き換える。
+   * ガラスを持たない材質でも同じ形で返す（書き換えても無害）。
+   */
+  glassSky: { value: Color };
+  glassHorizon: { value: Color };
+  glassGround: { value: Color };
 }
 
 export function agentSurface(o: AgentSurfaceOptions): AgentSurface {
@@ -72,13 +130,20 @@ export function agentSurface(o: AgentSurfaceOptions): AgentSurface {
     envMapIntensity: o.envMapIntensity ?? 1,
   });
   const night = { value: 0 };
+  const glassSky = { value: new Color(0x93b7dc) };
+  const glassHorizon = { value: new Color(0xc9d6e0) };
+  const glassGround = { value: new Color(0x2e3134) };
   const glass = o.glass === true;
+  const skin = o.skin === true;
   const floor = (NIGHT_FLOOR * (o.nightLift ?? 1)).toFixed(4);
   const tint = (NIGHT_TINT * (o.nightLift ?? 1)).toFixed(4);
 
   material.onBeforeCompile = (shader) => {
     // uniform には同じオブジェクトを差す。以後 night.value を書き換えるだけで届く。
     shader.uniforms.uNight = night;
+    shader.uniforms.uGlassSky = glassSky;
+    shader.uniforms.uGlassHorizon = glassHorizon;
+    shader.uniforms.uGlassGround = glassGround;
 
     if (glass) {
       shader.vertexShader = `attribute float ${GLASS_ATTRIBUTE};\nvarying float vGlass;\n${shader.vertexShader}`.replace(
@@ -86,8 +151,16 @@ export function agentSurface(o: AgentSurfaceOptions): AgentSurface {
         `vGlass = ${GLASS_ATTRIBUTE};\n\t#include <begin_vertex>`,
       );
     }
+    if (skin) {
+      // `color_vertex` は vColor = 頂点色 × instanceColor を作る。その直後に
+      // 頂点色そのものへ戻せば、印の付いた部位だけ服の色から切り離せる。
+      shader.vertexShader = `attribute float ${SKIN_ATTRIBUTE};\n${shader.vertexShader}`.replace(
+        '#include <color_vertex>',
+        `#include <color_vertex>\n\tvColor.xyz = mix(vColor.xyz, color.xyz, ${SKIN_ATTRIBUTE});`,
+      );
+    }
 
-    let fs = `uniform float uNight;\n${glass ? 'varying float vGlass;\n' : ''}${shader.fragmentShader}`;
+    let fs = `uniform float uNight;\nuniform vec3 uGlassSky;\nuniform vec3 uGlassHorizon;\nuniform vec3 uGlassGround;\n${glass ? 'varying float vGlass;\n' : ''}${shader.fragmentShader}`;
     if (glass) {
       fs = fs
         // 車体色の変調を捨てて絶対色にする。ここがガラスが黒くならない理由。
@@ -109,14 +182,18 @@ export function agentSurface(o: AgentSurfaceOptions): AgentSurface {
           `#include <lights_fragment_maps>\n\tradiance *= mix(1.0, ${GLASS_ENV_GAIN}, vGlass);`,
         );
     }
+    // 夜の持ち上げと、ガラスの反射。どちらも法線が確定した後でないと書けないので、
+    // `emissivemap_fragment`（＝ライティングの直前）にまとめて差し込む。
     fs = fs.replace(
       '#include <emissivemap_fragment>',
-      `#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += uNight * (vec3(${floor}) + diffuseColor.rgb * ${tint});`,
+      `#include <emissivemap_fragment>
+	totalEmissiveRadiance += uNight * (vec3(${floor}) + diffuseColor.rgb * ${tint});
+${glass ? GLASS_REFLECT : ''}`,
     );
     shader.fragmentShader = fs;
   };
   // 同じ差し込みをした材質どうしはプログラムを共有させる（コンパイル 1 回で済む）。
-  material.customProgramCacheKey = () => `agent:${glass ? 'g' : '-'}:${floor}:${tint}`;
+  material.customProgramCacheKey = () => `agent:${glass ? 'g' : '-'}${skin ? 's' : '-'}:${floor}:${tint}`;
 
-  return { material, night };
+  return { material, night, glassSky, glassHorizon, glassGround };
 }

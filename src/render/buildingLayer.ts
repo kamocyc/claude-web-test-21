@@ -1,14 +1,15 @@
-import { Color, Object3D } from 'three';
+import { Color, Object3D, Vector3 } from 'three';
 import { MAP_H, MAP_W, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
 import { archetype } from '@sim/buildings/archetypes';
 import type { Simulation } from '@sim/simulation';
 import { idx, tileX, tileY } from '@sim/world/tiles';
-import { BuildingParts, setBuildingNight } from './buildingParts';
+import { BuildingParts, setBuildingNight, setBuildingSky } from './buildingParts';
 import { composeBuilding, rnd, type BuildCtx, type Facing } from './buildingShapes';
-import { atmosphereAt } from './sky';
+import { atmosphereAt, sunDirection } from './sky';
 import { meshStyle, TIN_ROOFS } from './theme';
 
 const hsl = { h: 0, s: 0, l: 0 };
+const sunDir = new Vector3();
 
 /**
  * 基準色を棟ハッシュで散らす。
@@ -104,7 +105,13 @@ export class BuildingLayer {
    * 夕方から夜にかけて灯りが少しずつ増えていく。
    */
   setTimeOfDay(dayFraction: number): void {
-    setBuildingNight(atmosphereAt(dayFraction).nightAmount);
+    const atmo = atmosphereAt(dayFraction);
+    setBuildingNight(atmo.nightAmount);
+    // ガラスの映り込みは環境マップをやめてシェーダで空を引くようにしたので、
+    // 空の色と太陽の向きをここから材質へ渡す。
+    // 時刻が動くと窓に映る空も一緒に動く（夕方は窓が橙になる）。
+    sunDirection(dayFraction, sunDir);
+    setBuildingSky(atmo.zenith, atmo.horizon, sunDir, atmo.sunColor, atmo.sunIntensity);
   }
 
   /** 建物の増減があったときだけインスタンスを作り直す。 */
