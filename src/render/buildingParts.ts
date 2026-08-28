@@ -328,16 +328,22 @@ void facadeShade(vec3 base) {
     if (ground) { y0 = 0.24; y1 = 0.70; }
   }
 
-  // 遠景では窓 1 つが 1 画素に満たず、格子を計算しても被覆率に潰れるだけになる。
-  // 街を引いて見たときほど画面を覆う面積は大きいので、ここで抜けると一番効く。
+  // 遠景の「平均的な壁」。窓 1 つが 1 画素に満たなくなったら、
+  // 格子を描いても被覆率に潰れるだけなので、この平均へ寄せていく。
+  //
+  // 単に見た目の問題ではない。建物の隙間に見える 1〜2 画素幅の壁では
+  // fwidth が隣の面をまたいで壊れた値を返し、格子が砂嵐になる。
+  // 距離で確実に平均へ寄せておけば、その破綻がそもそも起きない。
   float aoFar = clamp(vScaleM.y * 0.45, 1.2, 4.5);
-  if (vViewDepth > 420.0) {
-    float cov = clamp((x1 - x0) * (y1 - y0), 0.0, 1.0);
-    gTint = mix(vec3(1.0), glassCol / max(base, vec3(0.02)), cov);
-    gTint *= mix(0.55, 1.0, clamp(y / aoFar, 0.0, 1.0));
-    gRough = mix(wallRough, glassRough, cov);
-    gMetal = mix(wallMetal, glassMetal, cov);
-    gEmis = litCol * cov * litRate * uNight * glow * 1.15;
+  float cov = clamp((x1 - x0) * (y1 - y0), 0.0, 1.0);
+  float aoDist = mix(0.55, 1.0, clamp(y / aoFar, 0.0, 1.0));
+  vec3 avgTint = mix(vec3(1.0), glassCol / max(base, vec3(0.02)), cov) * aoDist;
+  float avgRough = mix(wallRough, glassRough, cov);
+  float avgMetal = mix(wallMetal, glassMetal, cov);
+  vec3 avgEmis = litCol * cov * litRate * uNight * glow * 1.15;
+  float farMix = smoothstep(150.0, 380.0, vViewDepth);
+  if (farMix > 0.999) {
+    gTint = avgTint; gRough = avgRough; gMetal = avgMetal; gEmis = avgEmis;
     return;
   }
 
@@ -378,6 +384,12 @@ void facadeShade(vec3 base) {
   gEmis = litCol * litMask * lit * glow * 1.15;
   // 店の売り場は昼でも中が明るい。ガラス面が黒く沈むと閉店した街に見える。
   if (style > 2.5 && style < 3.5 && ground) gEmis += litCol * win * 0.12;
+
+  // 距離に応じて平均へ寄せる
+  gTint = mix(gTint, avgTint, farMix);
+  gRough = mix(gRough, avgRough, farMix);
+  gMetal = mix(gMetal, avgMetal, farMix);
+  gEmis = mix(gEmis, avgEmis, farMix);
 }
 `;
 
