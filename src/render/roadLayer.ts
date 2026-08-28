@@ -142,8 +142,15 @@ const INWARD_ROT = [-Math.PI / 2, Math.PI, Math.PI / 2, 0] as const;
 /** 部品の +Z を道路の中心へ向ける Y 回転（標識・ミラー・自販機の正面）。 */
 const FACE_ROT = [0, -Math.PI / 2, Math.PI, Math.PI / 2] as const;
 
-/** 電線の色。夜空を背景にしたときに黒く沈みすぎない灰色にする。 */
-const WIRE_COLOR = 0x3a3d42;
+/**
+ * 電線の色。
+ *
+ * 低圧配電線は黒い被覆なので暗くて正しいのだが、0x3a3d42 に金属度 0.35 を
+ * 掛けていたときは拡散反射が 3 割削られたうえに、太さが 1px を割る距離では
+ * 被覆率のぶんさらに暗く合成されて、**空や屋根の上を走る黒い糸くず**に見えていた。
+ * 金属度を落として拡散を返し、色も一段持ち上げる。
+ */
+const WIRE_COLOR = 0x55565a;
 /** 電線 1 本のたわみ（水平距離に対する比）。 */
 const WIRE_SAG = 0.055;
 /**
@@ -156,11 +163,25 @@ const WIRE_SAG = 0.055;
  * 実物の低圧配電線の外径は 1cm 前後だが、それだと遠景で消えるので少し太らせる。
  * 円柱にすると太さが距離で縮み、法線があるので光も乗る。
  */
-const WIRE_RADIUS = 0.03;
-/** カテナリーの分割数。3 で「たるみ」は十分読める。 */
-const WIRE_SEGMENTS = 3;
-/** これより引いたら電線を描かない。1px を割った電線はちらつきにしかならない。 */
-const WIRE_LOD_DISTANCE = 620;
+const WIRE_RADIUS = 0.05;
+/** カテナリーの分割数。近景でしか描かなくなったので 1 段増やして折れを消す。 */
+const WIRE_SEGMENTS = 4;
+/**
+ * これより引いたら電線を描かない。
+ *
+ * 620m から 190m まで大きく詰めた。細い円柱は、画面上の太さが 1px を割った
+ * 瞬間に**当たった画素だけが塗られる破線**になる。線の描画と違って
+ * ラスタライザは半端な被覆を返してくれないので、SMAA でも救えない。
+ * 実際、街路のカット（カメラ距離 210m）では屋根の上を黒い破線が
+ * 横切っているように見えていた。
+ *
+ * 太さが 1px になる距離は、垂直画角 50 度・高さ 900px なら焦点距離が約 965px
+ * なので `直径 × 965 / 距離 ≥ 1`、つまり直径 10cm の線で 100m 前後。
+ * カメラ距離 190m だと手前の電線がだいたいその辺りに来る。
+ * 電線は「目線の高さで空を切り取る」ためのものなので、
+ * 引いた画で無理に残す価値は無い。
+ */
+const WIRE_LOD_DISTANCE = 190;
 
 /**
  * 路面標示を 1 本ずつ描くのをやめるカメラ距離 (m)。
@@ -468,7 +489,7 @@ export class RoadLayer {
     // --- 電線 ---
     // 細い円柱を 1 区間 1 インスタンスで敷く。線ではなく立体なので、
     // 遠近で太さが変わり、SMAA も素直に効いてジャギーが出ない。
-    const wireMat = surface({ color: WIRE_COLOR, roughness: 0.55, metalness: 0.35, envMapIntensity: 0.5 });
+    const wireMat = surface({ color: WIRE_COLOR, roughness: 0.72, metalness: 0.18, envMapIntensity: 0.35 });
     this.materials.push(wireMat);
     // 中心が原点・+Y に高さ 1 の円柱。断面は 4 角形で十分（遠景では 1px 前後）。
     const wireGeom = new CylinderGeometry(WIRE_RADIUS, WIRE_RADIUS, 1, 4, 1, true);

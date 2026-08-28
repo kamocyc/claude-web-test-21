@@ -82,12 +82,17 @@ export function terrainNoise(x: number, y: number): number {
  */
 export function terrainNoise2(x: number, y: number): number {
   return (
-    (valueNoise(x * 0.019 + 71.3, y * 0.019 - 12.7) - 0.5) * 1.5 +
-    (valueNoise(x * 0.067 - 5.1, y * 0.067 + 33.9) - 0.5) * 0.62 +
+    (valueNoise(x * 0.019 + 71.3, y * 0.019 - 12.7) - 0.5) * 1.0 +
+    (valueNoise(x * 0.067 - 5.1, y * 0.067 + 33.9) - 0.5) * 0.7 +
     // 3 オクターブ目（1 周期 6 タイル ＝ 60m）。俯瞰でも 40px 前後あるので
     // ちらつきにはならず、街区の距離では「田の区切りくらいの色ムラ」になる。
-    // 低周波 2 本だけだと、視界に 1〜2 山しか入らず結局一様に見えていた。
-    (valueNoise(x * 0.17 + 19.7, y * 0.17 + 44.1) - 0.5) * 0.34
+    //
+    // オクターブの重みを平らにし直してある。最初は低周波 1 本が支配的な
+    // 1.5 : 0.62 : 0.34 だったが、それだと**視界に山が 1〜2 個しか入らず**、
+    // 郊外一面が端から端まで単調なグラデーション 1 枚に見えていた。
+    // 地面の情報量は、いちばん大きなむらの振幅ではなく
+    // 「視界に何個のむらが入るか」で決まる。
+    (valueNoise(x * 0.17 + 19.7, y * 0.17 + 44.1) - 0.5) * 0.62
   );
 }
 
@@ -101,7 +106,7 @@ export function terrainNoise2(x: number, y: number): number {
  * ノイズの実レンジを 0..1 いっぱいに写す傾きにしておくのが肝。
  */
 export function dryness(noise2: number): number {
-  return Math.min(1, Math.max(0, 0.5 + noise2 * 0.78));
+  return Math.min(1, Math.max(0, 0.5 + noise2 * 0.62));
 }
 
 // ---------------------------------------------------------------------------

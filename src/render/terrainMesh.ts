@@ -358,7 +358,7 @@ export class TerrainMesh {
             // 50m は俯瞰でも 30〜40px あるのでちらつかず、
             // 「田や原の区切りくらいの色ムラ」として読める。
             const nm = valueNoise((ox + cxl) * 0.2 + 41.5, (oy + cyl) * 0.2 - 17.9) - 0.5;
-            const nt = nz + nm * 0.62;
+            const nt = nz + nm * 0.9;
             const m = 1 + nt * 0.28;
             r *= m * (1 + nt * 0.075);
             g *= m;

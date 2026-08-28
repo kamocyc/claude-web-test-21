@@ -94,6 +94,7 @@ export class PostFx {
   enabled = false;
   private level: FxLevel;
   private slowFrames = 0;
+  private aoRadius = 3;
   private readonly renderer: WebGLRenderer;
 
   constructor(renderer: WebGLRenderer, scene: Scene, camera: Camera, level: FxLevel = 'auto') {
@@ -178,6 +179,22 @@ export class PostFx {
       // 周辺減光も夜は弱める。四隅が黒く沈むと、暗部の潰れがさらに広がる。
       u.uVignette!.value = 0.28 - nightAmount * 0.15;
     }
+  }
+
+  /**
+   * 環境遮蔽の半径をカメラ距離に合わせる。
+   *
+   * 半径は実寸（m）なので、1 つの値で近景と俯瞰の両方は賄えない。
+   * 街路の幅は 9m 前後あり、路上に降りたときに 3m では建物の足元しか
+   * 締まらず、谷間が高キーのまま平らに見える。逆に俯瞰で 9m にすると
+   * 1px 未満の凹凸を拾ってノイズだけが残る。距離で振るのが唯一の解。
+   */
+  setAoScale(cameraDistance: number): void {
+    if (!this.gtao) return;
+    const radius = Math.max(2.5, Math.min(9, cameraDistance * 0.055));
+    if (Math.abs(radius - this.aoRadius) < 0.25) return;
+    this.aoRadius = radius;
+    this.gtao.updateGtaoMaterial({ radius, thickness: radius * 0.55 });
   }
 
   setSize(w: number, h: number): void {

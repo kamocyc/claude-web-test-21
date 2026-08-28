@@ -426,6 +426,7 @@ export class Renderer {
     const h = frac * 24;
     const warmth = h > 15 && h < 20 ? 0.9 : h > 5 && h < 8 ? -0.55 : h < 5 || h >= 20 ? -0.7 : 0.1;
     this.postfx.setMood(atmo.nightAmount, warmth);
+    this.postfx.setAoScale(this.rig.distance);
     this.postfx.render(this.scene, this.rig.camera, this.lastFrameMs);
 
     this.drawCalls = this.renderer.info.render.calls;
