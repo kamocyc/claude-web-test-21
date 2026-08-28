@@ -357,8 +357,12 @@ export class Renderer {
     // 太陽が低いほど影は長く伸びる。仰角 10 度なら 30m のビルの影は 170m
     // 先まで届くので、範囲をカメラ距離だけで決めると夕方の影が途中で
     // 切り落とされ、「低い太陽なのに影が無い」絵になる。
-    const lowSun = Math.min(2.6, 1 / Math.max(0.32, this.sunDir.y));
-    const span = Math.max(110, Math.min(2400, this.rig.distance * 0.95 * lowSun));
+    // 伸ばすのは「太陽が低いときだけ」にする。1/y をそのまま使うと南中でも
+    // 1.6 倍に広がり、テクセルが粗くなって影の縁が数十 px のぼけになる。
+    // 正午の半影は角度 0.53 度＝数 px でなければならず、
+    // ぼけた影は「影」ではなく「汚れ」に見える。
+    const lowSun = 1 + Math.max(0, 0.5 - this.sunDir.y) * 4.2;
+    const span = Math.max(110, Math.min(2400, this.rig.distance * 0.9 * lowSun));
     // 解像度は 2048 に留める。4096 は帯域を倍以上使うわりに、
     // 実際に見える差は「影の縁が 1px 締まる」程度しかない。
     const wantSize = 2048;

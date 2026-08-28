@@ -41,6 +41,9 @@ const SHOTS = [
   // 道路は軸に平行なので、方位を軸に合わせないと街路を見通せない。
   { name: '07-eyelevel-noon', dist: 115, azim: 0.02, elev: 6, hour: 12 },
   { name: '08-eyelevel-night', dist: 118, azim: 0.02, elev: 6.5, hour: 20.5 },
+  // 空を大きく入れるカット。街の造形だけ見ていると、空が無地のままでも
+  // 気づけない（実際それで雲が 1 枚も出ていないことを長く見落とした）。
+  { name: '09-sky-noon', dist: 1500, azim: 2.2, elev: 4, hour: 11 },
 ];
 
 /**
