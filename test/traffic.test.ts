@@ -3,6 +3,7 @@ import {
   SIGNAL_CYCLE_STEPS,
   TILE_M,
   TILE_SPAN_M,
+  TRAFFIC_STEP_SEC,
   TRAFFIC_SUBSTEPS_PER_TICK,
   VEHICLE_LENGTH_M,
 } from '@shared/constants';
@@ -183,13 +184,19 @@ describe('交通流', () => {
     // 東西の流れが交差点に着くまでのリンク列（下流から上流の順）
     const approach = ew.edges.slice(0, ew.edges.findIndex((e) => graph.nodeTile[graph.edgeTo[e]!] === cross) + 1).reverse();
 
+    // 交差点のすぐ手前からも足す。端から入れるだけだと、入口のリンク自体が
+    // 待ち行列になって需要が交差点まで届かず、交差点の容量を超えられない
+    // （1 車線の飽和交通流率は 200 台列/時 = 3.3 台列/tick、青は半分なので
+    //   1 方向あたり 1.7 台列/tick しか捌けない）。
+    const ewNear = finder.search(graph, graph.roadNodeAt[idx(38, 40)]!, graph.roadNodeAt[idx(54, 40)]!, Mode.Car)!;
+    const nsNear = finder.search(graph, graph.roadNodeAt[idx(40, 38)]!, graph.roadNodeAt[idx(40, 54)]!, Mode.Car)!;
+
     let sent = 0;
     let maxQueue = 0;
     for (let tick = 0; tick < 300; tick++) {
-      // 交差点のすぐ手前から東西の流れを足す。上流の端から入れるだけだと、
-      // 入口そのものが待ち行列になって交差点まで需要が届かない。
-      while (traffic.enter(ew, VehicleKind.Car, sent, tick) >= 0) sent++;
-      while (traffic.enter(ns, VehicleKind.Car, sent, tick) >= 0) sent++;
+      for (const p of [ewNear, ew, nsNear, ns]) {
+        while (traffic.enter(p, VehicleKind.Car, sent, tick) >= 0) sent++;
+      }
       traffic.tick(graph, tick);
       traffic.events.length = 0;
       let run = 0;
@@ -265,12 +272,16 @@ describe('交通流', () => {
     const t: unknown = traffic;
     const inner = t as { count: Float32Array; head: Int32Array; next: Int32Array };
 
+    const ewNear = finder.search(graph, graph.roadNodeAt[idx(38, 40)]!, graph.roadNodeAt[idx(54, 40)]!, Mode.Car)!;
+    const nsNear = finder.search(graph, graph.roadNodeAt[idx(40, 38)]!, graph.roadNodeAt[idx(40, 54)]!, Mode.Car)!;
+
     let sent = 0;
     let tick = 0;
     let queued: number[] = [];
     for (; tick < 300 && queued.length < 2; tick++) {
-      while (traffic.enter(ew, VehicleKind.Car, sent, tick) >= 0) sent++;
-      while (traffic.enter(ns, VehicleKind.Car, sent, tick) >= 0) sent++;
+      for (const p of [ewNear, ew, nsNear, ns]) {
+        while (traffic.enter(p, VehicleKind.Car, sent, tick) >= 0) sent++;
+      }
       traffic.tick(graph, tick);
       traffic.events.length = 0;
       // 2 台以上いるリンクを探す
@@ -288,15 +299,124 @@ describe('交通流', () => {
       expect(traffic.pose(graph, v, sec, pose)).toBe(true);
       return { x: pose.x, z: pose.z };
     };
-    const now = tick * 60;
+    // 直前に解き終えた tick の中をなぞる（描画がそうしている）。
+    // 並びを見るのはその末尾＝行列が落ち着いたところ。
+    const base = (tick - 1) * 60;
+    const now = base + 59;
     const a = at(queued[0]!, now);
     const b = at(queued[1]!, now);
     // 重なっていない。車列 1 台ぶん（描画単位で TILE_M の 4 割強）は離れる。
     expect(Math.hypot(a.x - b.x, a.z - b.z)).toBeGreaterThan(3);
-    // 止まっている間は時間が進んでも位置が動かない
-    const a2 = at(queued[0]!, now + 40);
-    expect(a2.x).toBeCloseTo(a.x, 5);
-    expect(a2.z).toBeCloseTo(a.z, 5);
+
+    // 行列の中の車は、前がどいた分だけ前へ出る。**tick の境目でまとめて飛ばない。**
+    //
+    // 待ち行列の並びを tick の最後に 1 枚だけ配ると、行列に捕まった車は
+    // 1 tick まるごと固まったあと、次の tick の頭で車列 1 台ぶん（65m）から
+    // リンク 1 本ぶん（150m = 描画 1 タイル）を 1 フレームで移動する。
+    // tick をまたいで 5 秒ごとに追い、1 回の移動が車列 1 台ぶんを超えないことを見る。
+    // 待ち行列が空く単位がその車列 1 台ぶんなので、これがこのモデルの下限。
+    const platoonM = (TILE_M * VEHICLE_LENGTH_M) / TILE_SPAN_M;
+    const prev = new Map<number, { x: number; z: number }>();
+    let worst = 0;
+    for (let k = 0; k < 4; k++) {
+      const t0 = (tick - 1 + k) * 60;
+      for (const v of queued) {
+        // pose が答えられるのは tick の内側だけ。末尾ちょうどは次 tick の頭。
+        for (let s = 0; s < TRAFFIC_SUBSTEPS_PER_TICK; s++) {
+          if (!traffic.pose(graph, v, t0 + s * TRAFFIC_STEP_SEC, pose)) break;
+          const p = prev.get(v);
+          if (p) worst = Math.max(worst, Math.hypot(pose.x - p.x, pose.z - p.z));
+          prev.set(v, { x: pose.x, z: pose.z });
+        }
+      }
+      traffic.tick(graph, tick + k);
+      traffic.events.length = 0;
+    }
+    expect(worst).toBeGreaterThan(0);
+    expect(worst).toBeLessThanOrEqual(platoonM + 1e-3);
+  });
+
+  it('空いている道のリンク所要は自由流ちょうど（サブステップに切り上がらない）', () => {
+    // リンクを渡り終える時刻はサブステップの格子に載らない（街路は 18 秒、格子は 5 秒）。
+    // 放出を格子に丸めると、空いている道でも実測所要が 20/18 = 1.111 倍で記録され、
+    // 経路コストと「所要時間の倍率」に下駄が乗る。さらに車は毎リンク 2 秒ずつ
+    // 停止線で固まり、1 セルごとに加減速して見える。
+    const fx = straightRoad(30, 40);
+    expect(fx.traffic.enter(fx.path, VehicleKind.Car, 1, 0)).toBeGreaterThanOrEqual(0);
+    for (let t = 0; t < 10; t++) fx.traffic.tick(fx.graph, t);
+    const free = TILE_SPAN_M / (30 / 3.6);
+    for (const e of fx.path.edges) {
+      if (fx.graph.edgeObsTick[e]! < 0) continue;
+      expect(fx.graph.edgeObsSec[e]! / free).toBeCloseTo(1, 5);
+    }
+  });
+
+  it('空いている道では止まらずに走り続ける', () => {
+    // 1 台だけ走らせて、5 秒ごとの見た目の位置を追う。前も信号も無いのだから、
+    // 止まっている瞬間があってはいけない。
+    const fx = straightRoad(30, 40);
+    expect(fx.traffic.enter(fx.path, VehicleKind.Car, 1, 0)).toBeGreaterThanOrEqual(0);
+    const pose = { x: 0, z: 0, heading: 0, edge: -1 };
+    let stalled = 0;
+    let samples = 0;
+    for (let t = 0; t < 4; t++) {
+      fx.traffic.tick(fx.graph, t);
+      if (fx.traffic.events.length > 0) break;
+      let prev: { x: number; z: number } | null = null;
+      for (let s = 0; s < TRAFFIC_SUBSTEPS_PER_TICK; s++) {
+        if (!fx.traffic.pose(fx.graph, 0, t * 60 + s * TRAFFIC_STEP_SEC, pose)) break;
+        if (prev) {
+          samples++;
+          if (Math.hypot(pose.x - prev.x, pose.z - prev.z) < 1e-3) stalled++;
+        }
+        prev = { x: pose.x, z: pose.z };
+      }
+    }
+    expect(samples).toBeGreaterThan(20);
+    expect(stalled).toBe(0);
+  });
+
+  it('交差点では位置も向きも連続して曲がる', () => {
+    // 直角に曲がる経路。折れ線のままだと向きが 1 フレームで 90 度入れ替わる。
+    const world = makeTestWorld();
+    layRoadLine(world, 30, 40, 40, 40);
+    layRoadLine(world, 40, 40, 40, 50);
+    const graph = buildGraph(world);
+    const finder = new Pathfinder();
+    const path = finder.search(graph, graph.roadNodeAt[idx(30, 40)]!, graph.roadNodeAt[idx(40, 50)]!, Mode.Car)!;
+    expect(path).not.toBeNull();
+    const traffic = new TrafficSystem();
+    traffic.rebuild(graph);
+    expect(traffic.enter(path, VehicleKind.Car, 1, 0)).toBeGreaterThanOrEqual(0);
+
+    const pose = { x: 0, z: 0, heading: 0, edge: -1 };
+    let maxTurn = 0;
+    let maxStep = 0;
+    let turned = 0;
+    for (let t = 0; t < 8; t++) {
+      traffic.tick(graph, t);
+      if (traffic.events.length > 0) break;
+      let prev: { x: number; z: number; h: number } | null = null;
+      // 描画のフレーム間隔で追う（1 tick を 60 分割）。
+      for (let s = 0; s < 60; s++) {
+        if (!traffic.pose(graph, 0, t * 60 + s, pose)) break;
+        if (prev) {
+          let d = pose.heading - prev.h;
+          while (d > Math.PI) d -= Math.PI * 2;
+          while (d < -Math.PI) d += Math.PI * 2;
+          maxTurn = Math.max(maxTurn, Math.abs(d));
+          turned += Math.abs(d);
+          maxStep = Math.max(maxStep, Math.hypot(pose.x - prev.x, pose.z - prev.z));
+        }
+        prev = { x: pose.x, z: pose.z, h: pose.heading };
+      }
+    }
+    // 直角ぶんはきちんと曲がる
+    expect(turned).toBeGreaterThan(Math.PI / 2 - 0.2);
+    // ただし 1 フレームでまとめて曲がらない（折れ線のままなら必ず π/2 が出る）
+    expect(maxTurn).toBeLessThan(0.35);
+    // 位置も飛ばない（1 フレーム = 1 秒ぶんの自由流距離に収まる）
+    expect(maxStep).toBeLessThan((TILE_M * (30 / 3.6)) / TILE_SPAN_M + 0.05);
   });
 
 

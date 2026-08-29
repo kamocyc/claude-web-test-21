@@ -606,6 +606,17 @@ export function carGeometry(kind: CarKind): BufferGeometry {
 }
 
 /**
+ * 車種ごとの前輪軸・後輪軸の z 位置 (m)。車体原点から見た値。
+ *
+ * 車体の向きを「前軸と後軸を経路に載せた線」から出すのに使う（`agentLayer`）。
+ * 見た目の車輪の位置そのものなので、描いた車と曲がり方が食い違わない。
+ */
+export function carAxles(kind: CarKind): { front: number; rear: number } {
+  const s = CAR_SPECS[kind];
+  return { front: s.frontZ, rear: s.rearZ };
+}
+
+/**
  * 車種ごとの全幅の半分 (m)。
  * 路肩に寄せて停めるとき、縁石までの距離をこれで決める（`agentLayer`）。
  */
@@ -800,6 +811,8 @@ const BUS_LEN = 8.2;
 const BUS_W = 2.44;
 /** バスの全長・全幅 (m)。車間と接地影の大きさを決めるのに使う。 */
 export const BUS_BODY_M = BUS_LEN;
+/** バスの前輪軸・後輪軸の z 位置 (m)。下の車輪の座標と同じ値を使う。 */
+export const BUS_AXLES = { front: 2.6, rear: -2.35 };
 export const BUS_WIDTH_M = BUS_W;
 
 export function busGeometry(): BufferGeometry {
@@ -881,6 +894,11 @@ const TRUCK_LEN = 6.6;
 const TRUCK_W = 2.16;
 /** トラックの全長・全幅 (m)。 */
 export const TRUCK_BODY_M = TRUCK_LEN;
+/**
+ * トラックの前輪軸・後輪軸の z 位置 (m)。
+ * 後ろは 2 軸（-1.4 と -2.55）なので、その中間を 1 本の後軸として扱う。
+ */
+export const TRUCK_AXLES = { front: TRUCK_LEN / 2 - 1.05, rear: (-1.4 + -2.55) / 2 };
 export const TRUCK_WIDTH_M = TRUCK_W;
 
 /**

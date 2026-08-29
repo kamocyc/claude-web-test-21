@@ -68,8 +68,10 @@ import {
   beamGeometry,
   busBeamSpec,
   busConeSpec,
+  BUS_AXLES,
   BUS_BODY_M,
   BUS_WIDTH_M,
+  TRUCK_AXLES,
   TRUCK_BODY_M,
   TRAIN_WIDTH_M,
   TRUCK_WIDTH_M,
@@ -82,6 +84,7 @@ import {
   carHalfWidth,
   carKind,
   carLampGeometry,
+  carAxles,
   carLength,
   carPaint,
   truckLivery,
@@ -103,8 +106,11 @@ import { atmosphereAt, sunDirection } from './sky';
  */
 const RAIL_TOP_M = 0.55;
 
-/** 1 フレームで進行方向をどれだけ目標へ寄せるか。1 = 即座（＝スナップ）。 */
-const HEADING_SMOOTHING = 0.15;
+/**
+ * これ以上ヨーが振れていたら「曲がっている最中」とみなす (rad)。
+ * 車線に沿った並べ直しから外す判定に使う（`drawVehicles` の 2 巡目）。
+ */
+const TURNING_YAW_RAD = 0.08;
 
 /**
  * 路面（アスファルトの上面）の高さ (m)。
@@ -497,6 +503,9 @@ export class AgentLayer {
   private readonly axisX = new Vector3(1, 0, 0);
   private readonly color = new Color();
   private readonly tmp: PathPose = { x: 0, z: 0, heading: 0, edge: -1 };
+  /** 前輪軸・後輪軸を別々に置くための作業領域（`drawVehicles`）。 */
+  private readonly tmpFront: PathPose = { x: 0, z: 0, heading: 0, edge: -1 };
+  private readonly tmpRear: PathPose = { x: 0, z: 0, heading: 0, edge: -1 };
   /** ガラスの映り込みに配る色（毎フレーム書き換える）。 */
   private readonly glassSky = new Color();
   private readonly glassHorizon = new Color();
@@ -563,6 +572,10 @@ export class AgentLayer {
   private vehX = new Float32Array(0);
   private vehZ = new Float32Array(0);
   private vehHeading = new Float32Array(0);
+  /** 曲がっている最中の印。車線に沿った並べ直しから外す（`drawVehicles` の 2 巡目）。 */
+  private vehTurning = new Int32Array(0);
+  /** その車の車線オフセット (m)。接地タイルの左右判定に使う。 */
+  private vehSide = new Float32Array(0);
   /** 車間を空けきれず、今フレームは描かないことにした車の印（0 = 描かない）。 */
   private vehDrawn = new Int32Array(0);
   private readonly vehOrder: number[] = [];
@@ -850,10 +863,6 @@ export class AgentLayer {
    * 対向車が中心線上で重なって「流れ」に見えない。
    * 前方 = (sin h, cos h)、左 = 上 × 前方 = (cos h, -sin h)。
    */
-  /** 車両スロットごとの直前の向きと、そのときの出発 tick。 */
-  private headingOf = new Float32Array(0);
-  private headingTag = new Int32Array(0);
-
   private laneOffsetX(heading: number, side: number): number {
     return Math.cos(heading) * side;
   }
@@ -896,7 +905,10 @@ export class AgentLayer {
      * それだと端数 0 の瞬間から既に「最後のリンクの終端」に着いていて、
      * 毎 tick「4 マス瞬間移動 → 停止線で待つ」に見える。
      */
-    const tick = sim.clock.tick - 1 + Math.max(0, Math.min(1, tickFraction));
+    // 端数は 1 未満に留める。1 ちょうどは次 tick の頭にあたり、交通流が
+    // tick の中を答えるために持っているサブステップの標本の外へ出る（停止中は
+    // 端数 1 で呼ばれる）。
+    const tick = sim.clock.tick - 1 + Math.max(0, Math.min(0.9999, tickFraction));
 
     // 歩行者は寄ったときだけ描く。引きの画では 1px 未満にしかならず、
     // 描画予算だけを食って何も見えない。
@@ -1674,37 +1686,6 @@ export class AgentLayer {
    * 車列 1 台ぶんずつ下がって並ぶので、そのまま描けば行列に見える。
    * 経路長からの補間ではないので、詰まっている車は本当に止まって見える。
    */
-  /**
-   * 曲がり角で向きがスナップするのを抑える。
-   *
-   * 進行方向はリンクの両端から出しているので、交差点を曲がると 90 度が 1 フレームで入れ替わる。
-   * 直前の向きから少しずつ寄せる。車両スロットは使い回されるので、
-   * 出発 tick が変わっていたら別の車とみなして即座に合わせる（古い向きを引き継がない）。
-   */
-  private smoothHeading(vehicle: number, departTick: number, target: number): number {
-    if (vehicle >= this.headingOf.length) {
-      const n = Math.max(vehicle + 1, this.headingOf.length * 2, 1024);
-      const h = new Float32Array(n);
-      h.set(this.headingOf);
-      this.headingOf = h;
-      const g = new Int32Array(n).fill(-1);
-      g.set(this.headingTag);
-      this.headingTag = g;
-    }
-    let next = target;
-    if (this.headingTag[vehicle] === departTick) {
-      const cur = this.headingOf[vehicle]!;
-      // -π..π に畳んでから寄せる。畳まないと 359 度回る。
-      let d = target - cur;
-      while (d > Math.PI) d -= Math.PI * 2;
-      while (d < -Math.PI) d += Math.PI * 2;
-      next = cur + d * HEADING_SMOOTHING;
-    }
-    this.headingOf[vehicle] = next;
-    this.headingTag[vehicle] = departTick;
-    return next;
-  }
-
   private drawVehicles(sim: Simulation, camX: number, camZ: number, maxDist2: number, tick: number): void {
     const tr = sim.traffic;
     const graph = sim.graph;
@@ -1729,6 +1710,60 @@ export class AgentLayer {
       if (dx * dx + dz * dz > maxDist2) return;
       const edge = this.tmp.edge;
       if (edge < 0) return;
+
+      // --- 車体の姿勢は前輪軸と後輪軸を経路に載せて決める ---
+      //
+      // 経路上の 1 点と、そのリンクの向きから置くと、交差点で向きが 90 度
+      // 入れ替わる。以前は指数平滑でごまかしていたが、それだと車体が
+      // 進行方向とずれたまま横滑りする。実車と同じく「前輪が通った跡を
+      // 後輪が追う」形にすれば、平滑化なしで曲がり方そのものが自然になる。
+      // 角の丸め自体は経路側で入っている（`pathCurvePoint`）。
+      const bodyKind = this.pickCarKind((tr.owner[v]! * 2654435761) >>> 0);
+      const axles =
+        kind === VehicleKind.Truck
+          ? TRUCK_AXLES
+          : kind === VehicleKind.Bus
+            ? BUS_AXLES
+            : carAxles(bodyKind);
+      const length =
+        kind === VehicleKind.Truck
+          ? TRUCK_BODY_M
+          : kind === VehicleKind.Bus
+            ? BUS_BODY_M
+            : carLength(bodyKind);
+
+      // 左側通行。横位置は車ごとに少し散らす（`DRIVE_LATERAL_JITTER` の注記）。
+      const side =
+        LANE_OFFSET_M +
+        ((((v * 2654435761) >>> 12) % 64) / 64) * DRIVE_LATERAL_JITTER -
+        DRIVE_LATERAL_JITTER / 2;
+      // 車線オフセットは軸ごとにその場の法線へ掛ける。剛体のままずらすと
+      // 曲がっている間だけ内側／外側にはみ出す。
+      const hasF = tr.pose(graph, v, nowSec, this.tmpFront, axles.front);
+      const hasR = tr.pose(graph, v, nowSec, this.tmpRear, axles.rear);
+      let px = this.tmp.x + this.laneOffsetX(this.tmp.heading, side);
+      let pz = this.tmp.z + this.laneOffsetZ(this.tmp.heading, side);
+      let heading = this.tmp.heading;
+      let turning = false;
+      if (hasF && hasR) {
+        const fx = this.tmpFront.x + this.laneOffsetX(this.tmpFront.heading, side);
+        const fz = this.tmpFront.z + this.laneOffsetZ(this.tmpFront.heading, side);
+        const rx = this.tmpRear.x + this.laneOffsetX(this.tmpRear.heading, side);
+        const rz = this.tmpRear.z + this.laneOffsetZ(this.tmpRear.heading, side);
+        const wb = axles.front - axles.rear;
+        if ((fx - rx) * (fx - rx) + (fz - rz) * (fz - rz) > 1e-6 && wb > 0) {
+          heading = Math.atan2(fx - rx, fz - rz);
+          // 車体原点は 2 軸を結んだ線上の z = 0 の点。
+          const k = -axles.rear / wb;
+          px = rx + (fx - rx) * k;
+          pz = rz + (fz - rz) * k;
+        }
+        let turn = this.tmpFront.heading - this.tmpRear.heading;
+        while (turn > Math.PI) turn -= Math.PI * 2;
+        while (turn < -Math.PI) turn += Math.PI * 2;
+        turning = Math.abs(turn) > TURNING_YAW_RAD;
+      }
+
       const a = graph.edgeFrom[edge]!;
       const b = graph.edgeTo[edge]!;
       const ex = graph.nodeX[b]! - graph.nodeX[a]!;
@@ -1736,24 +1771,10 @@ export class AgentLayer {
       const alongZ = Math.abs(ez) >= Math.abs(ex);
       const sign = (alongZ ? ez : ex) >= 0 ? 1 : -1;
       // 車線 ID。直交方向のタイル列で束ねる（同じ通りの同じ向きが 1 本になる）。
-      const perp = Math.round((alongZ ? this.tmp.x : this.tmp.z) / TILE_M);
+      const perp = Math.round((alongZ ? px : pz) / TILE_M);
       const lane = perp * 4 + (alongZ ? 2 : 0) + (sign > 0 ? 1 : 0);
-      const along = (alongZ ? this.tmp.z : this.tmp.x) * sign;
-      this.pushVehicle(
-        v,
-        lane,
-        along,
-        kind === VehicleKind.Truck
-          ? TRUCK_BODY_M
-          : kind === VehicleKind.Bus
-            ? BUS_BODY_M
-            : carLength(this.pickCarKind((tr.owner[v]! * 2654435761) >>> 0)),
-        this.tmp.x,
-        this.tmp.z,
-        Math.atan2(ex, ez),
-        alongZ,
-        sign,
-      );
+      const along = (alongZ ? pz : px) * sign;
+      this.pushVehicle(v, lane, along, length, px, pz, heading, alongZ, sign, turning, side);
     });
 
     // --- 2 巡目: 同じ車線の前後で最小車間を強制する ---
@@ -1771,6 +1792,11 @@ export class AgentLayer {
     for (const i of order) {
       const lane = this.vehLane[i]!;
       const len = this.vehLength[i]!;
+      // 曲がっている最中の車は車線に沿った座標が意味を持たない（車体が
+      // 交差点を斜めに横切っている）。並べ直しから外して、経路が出した
+      // 位置のまま置く。ここを押し下げると、曲がりかけの車だけが
+      // 交差点の手前へ引き戻されて跳ねる。
+      if (this.vehTurning[i] === 1) continue;
       if (lane !== curLane) {
         curLane = lane;
       } else {
@@ -1803,33 +1829,34 @@ export class AgentLayer {
       if (isBus && this.buses.count >= MAX_VISIBLE_BUSES) continue;
 
       // 車線の向きの成分だけを、車間を空けた値に差し替える。
+      // 曲がっている車は 2 巡目を通していないので、そのままの位置が入っている。
       const alongZ = this.vehAlongZ[i] === 1;
       const sign = this.vehSign[i]!;
       const moved = this.vehAlong[i]! * sign;
-      const px = alongZ ? this.vehX[i]! : moved;
-      const pz = alongZ ? moved : this.vehZ[i]!;
+      const asIs = this.vehTurning[i] === 1;
+      const px = asIs || alongZ ? this.vehX[i]! : moved;
+      const pz = asIs || !alongZ ? this.vehZ[i]! : moved;
 
-      const heading = this.smoothHeading(v, tr.departTick[v]!, this.vehHeading[i]!)
-        // 走行中もほんの少しだけ向きを散らす。全車が完璧に車線と平行だと、
-        // 消失点まで伸びる列が 1 本の定規に見える。
-        + (((v * 2654435761) >>> 20) % 32) / 32 * DRIVE_YAW_JITTER - DRIVE_YAW_JITTER / 2;
+      // 向きは前後の車軸から出ているので、角でも連続している（平滑化は要らない）。
+      // 走行中もほんの少しだけ向きを散らす。全車が完璧に車線と平行だと、
+      // 消失点まで伸びる列が 1 本の定規に見える。
+      const heading =
+        this.vehHeading[i]! +
+        ((((v * 2654435761) >>> 20) % 32) / 32) * DRIVE_YAW_JITTER -
+        DRIVE_YAW_JITTER / 2;
       this.quat.setFromAxisAngle(this.axisY, heading);
-      // 左側通行。対向車が別の車線を流れる。
-      // 横位置は車ごとに少し散らす（`DRIVE_LATERAL_JITTER` の注記）。
-      const lane =
-        LANE_OFFSET_M +
-        (((v * 2654435761) >>> 12) % 64) / 64 * DRIVE_LATERAL_JITTER -
-        DRIVE_LATERAL_JITTER / 2;
-      const ox = this.laneOffsetX(heading, lane);
-      const oz = this.laneOffsetZ(heading, lane);
-      this.pos.set(px + ox, this.groundAt(sim, px + ox, pz + oz) + ROAD_SURFACE_M, pz + oz);
+      // 車線オフセットは 1 巡目で既に入っている。向きだけ取り出して
+      // 接地タイルの左右判定（`markLane`）に使う。
+      const ox = this.laneOffsetX(heading, this.vehSide[i]!);
+      const oz = this.laneOffsetZ(heading, this.vehSide[i]!);
+      this.pos.set(px, this.groundAt(sim, px, pz) + ROAD_SURFACE_M, pz);
       const owner = tr.owner[v]!;
       // 寸法を数 % 振る。とくにトラックは形が 1 種類しか無いので、
       // これが無いと目線のカットで同じ箱が定規のように並ぶ。
       this.setVehicleScale(Math.imul(owner + 1, 2654435761) ^ (kind * 0x9e3779b9));
       this.mat.compose(this.pos, this.quat, this.scl);
       this.scl.set(1, 1, 1);
-      this.markLane(px + ox, pz + oz, heading, ox, oz, isTruck || isBus);
+      this.markLane(px, pz, heading, ox, oz, isTruck || isBus);
       const dx = px - camX;
       const dz = pz - camZ;
       const d2 = dx * dx + dz * dz;
@@ -1897,6 +1924,8 @@ export class AgentLayer {
     heading: number,
     alongZ: boolean,
     sign: number,
+    turning: boolean,
+    side: number,
   ): void {
     if (this.vehCount >= this.vehSlot.length) {
       const n = Math.max(512, this.vehSlot.length * 2);
@@ -1920,6 +1949,8 @@ export class AgentLayer {
       this.vehX = growF(this.vehX);
       this.vehZ = growF(this.vehZ);
       this.vehHeading = growF(this.vehHeading);
+      this.vehTurning = grow32(this.vehTurning);
+      this.vehSide = growF(this.vehSide);
     }
     const i = this.vehCount++;
     this.vehSlot[i] = slot;
@@ -1932,6 +1963,8 @@ export class AgentLayer {
     this.vehHeading[i] = heading;
     this.vehAlongZ[i] = alongZ ? 1 : 0;
     this.vehSign[i] = sign;
+    this.vehTurning[i] = turning ? 1 : 0;
+    this.vehSide[i] = side;
   }
 
   /**
