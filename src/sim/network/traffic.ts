@@ -611,11 +611,21 @@ export class TrafficSystem {
           // という事実と食い違い、描画は交差点の手前で一拍止まってから
           // 自由流の 1.4 倍で飛び出す。動かした車の標本はここで取り直す。
           const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
-          const sample = v * stride + (stepIndex % TRAFFIC_SUBSTEPS_PER_TICK);
+          const sub = stepIndex % TRAFFIC_SUBSTEPS_PER_TICK;
+          const sample = v * stride + sub;
           const freeNext = this.freeSec[nx]!;
+          // 入った先で前を走っている車（同じ車線）の後ろに収める。経過時間だけで
+          // 置くと、その車の車間より前に出てしまい、次のサブステップで上限に
+          // 引き戻される ―― 画面では後ろへワープする。
+          let ahead = 2;
+          for (let q = this.head[nx]!; q >= 0 && q !== v; q = this.next[q]!) {
+            if (this.laneOf[q] === this.laneOf[v]) ahead = this.posSamples[q * stride + sub]!;
+          }
+          const limit = ahead >= 2 ? 1 : Math.max(0, ahead - PITCH_FRAC);
           this.edgeSamples[sample] = ni;
           this.enterSamples[sample] = releaseSec;
-          this.posSamples[sample] = freeNext > 0 ? Math.min(1, (nowSec - releaseSec) / freeNext) : 0;
+          this.posSamples[sample] =
+            freeNext > 0 ? Math.min(limit, (nowSec - releaseSec) / freeNext) : 0;
         }
       }
     }
@@ -687,7 +697,16 @@ export class TrafficSystem {
         this.edgeSamples[b + sub] = this.edgeIndex[v]!;
         this.enterSamples[b + sub] = this.enterSec[v]!;
         if (pos < tail) tail = pos;
-        cap[l] = cap[l]! - PITCH_FRAC;
+        // 次の車の上限は「前の車が**実際にいる位置**」の車列 1 台ぶん後ろ。
+        //
+        // 前の車の*上限*から引くと、上限だけが下がった（交差点の先に車が入った、
+        // 赤になった）ときに、前の車は動いていないのに後ろの車の上限だけが
+        // 下がる。上限は位置より前にあるので差は最大で車列 1 台ぶんあり、
+        // 後ろの車が実際に後戻りして描かれていた（実測で 0.06% のフレーム）。
+        //
+        // 位置から引けば、位置は必ず単調に増えるので上限も単調に増える。
+        // どの車も後ろへ動かないことが構成から保証される。
+        cap[l] = pos - PITCH_FRAC;
       }
       this.tailPos[e] = tail;
     }
