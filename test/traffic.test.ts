@@ -400,6 +400,76 @@ describe('交通流', () => {
     expect(stalled).toBe(0);
   });
 
+  it('前に車がいないのに止まっている車は、道の向きを向いている', () => {
+    // 描画では角の前後が曲線に差し替わる（`curve.ts`）。停止線がその曲線の中に
+    // あると、信号待ちの車が曲がりかけの姿勢のまま固まる ―― 前にも対向にも車が
+    // いないのに、交差点で斜めを向いて止まっている画になっていた。
+    const world = makeTestWorld();
+    layRoadLine(world, 30, 40, 50, 40);
+    layRoadLine(world, 40, 30, 40, 50);
+    const graph = buildGraph(world); // 十字路 → 信号が付く
+    const finder = new Pathfinder();
+    const corner = graph.roadNodeAt[idx(40, 40)]!;
+    const goal = graph.roadNodeAt[idx(40, 50)]!;
+    const traffic = new TrafficSystem();
+    traffic.rebuild(graph);
+
+    /** いま乗っているリンクの向き（＝道なりの向き）。 */
+    const linkHeading = (edge: number): number =>
+      Math.atan2(
+        graph.nodeX[graph.edgeTo[edge]!]! - graph.nodeX[graph.edgeFrom[edge]!]!,
+        graph.nodeZ[graph.edgeTo[edge]!]! - graph.nodeZ[graph.edgeFrom[edge]!]!,
+      );
+
+    const pose = { x: 0, z: 0, heading: 0, edge: -1 };
+    const other = { x: 0, z: 0, heading: 0, edge: -1 };
+    const prev = new Map<number, { x: number; z: number; still: number }>();
+    const cars: number[] = [];
+    let approach = -1;
+    let alone = 0;
+    let worstTilt = 0;
+    // 信号の現示は時刻の関数。出発地をずらして、赤に当たる車を作る。
+    for (let t = 0; t < 24; t++) {
+      const start = graph.roadNodeAt[idx(30 + (t % 8), 40)]!;
+      const path = finder.search(graph, start, goal, Mode.Car);
+      if (path) {
+        if (approach < 0) approach = Array.from(path.edges).find((e) => graph.edgeTo[e] === corner)!;
+        const v = traffic.enter(path, VehicleKind.Car, t + 1, t);
+        if (v >= 0 && !cars.includes(v)) cars.push(v);
+      }
+      traffic.tick(graph, t);
+      for (let s = 0; s < 60; s++) {
+        const now = t * 60 + s;
+        for (const c of cars) {
+          if (!traffic.pose(graph, c, now, pose)) continue;
+          const p = prev.get(c);
+          const moved = p === undefined || Math.hypot(pose.x - p.x, pose.z - p.z) > 1e-6;
+          const still = moved ? 0 : (p?.still ?? 0) + 1;
+          prev.set(c, { x: pose.x, z: pose.z, still });
+          // 数フレーム続けて動いていないものだけを「止まっている」とみなす。
+          if (still < 5 || pose.edge !== approach) continue;
+          // まわりに 1 台もいないこと。行列の中の車は前との間隔を保つために
+          // 曲線の中で止まることがあり、それは正しい姿（`CORNER_PITCH` の注記）。
+          let near = Infinity;
+          for (const o of cars) {
+            if (o === c || !traffic.pose(graph, o, now, other)) continue;
+            near = Math.min(near, Math.hypot(other.x - pose.x, other.z - pose.z));
+          }
+          if (near < 15) continue;
+          alone++;
+          let tilt = pose.heading - linkHeading(pose.edge);
+          while (tilt > Math.PI) tilt -= Math.PI * 2;
+          while (tilt < -Math.PI) tilt += Math.PI * 2;
+          worstTilt = Math.max(worstTilt, Math.abs(tilt));
+        }
+      }
+    }
+    // 「前に車がいないのに止まっている」状況が実際に起きていること
+    expect(alone).toBeGreaterThan(20);
+    // そのとき車はまっすぐ。曲線は停止線より先からしか始まらない。
+    expect(worstTilt).toBeLessThan(0.02);
+  });
+
   it('交差点では位置も向きも連続して曲がる', () => {
     // 直角に曲がる経路。折れ線のままだと向きが 1 フレームで 90 度入れ替わる。
     const world = makeTestWorld();
@@ -417,10 +487,11 @@ describe('交通流', () => {
     let maxTurn = 0;
     let maxStep = 0;
     let turned = 0;
+    // tick をまたいでも追い続ける（境目で切ると曲がった角度を取りこぼす）。
+    let prev: { x: number; z: number; h: number } | null = null;
     for (let t = 0; t < 8; t++) {
       traffic.tick(graph, t);
       if (traffic.events.length > 0) break;
-      let prev: { x: number; z: number; h: number } | null = null;
       // 描画のフレーム間隔で追う（1 tick を 60 分割）。
       for (let s = 0; s < 60; s++) {
         if (!traffic.pose(graph, 0, t * 60 + s, pose)) break;

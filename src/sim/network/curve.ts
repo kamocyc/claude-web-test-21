@@ -13,7 +13,8 @@ import type { Graph } from './graph';
  * 3 点が等間隔に並んで元の直線に戻る（分岐を書かなくていい）。
  *
  * 半径は隣り合う 2 本の短い方の 45% で頭打ちにする。連続した角で
- * フィレット同士が食い合わないようにするため。
+ * フィレット同士が食い合わないようにするため。上限は呼び出し側が渡す
+ * （道路は停止線に合わせて小さい ―― `ROAD_CORNER_RADIUS_M`）。
  */
 
 /** 折れ線上の 1 点の姿勢（描画単位）。 */
@@ -35,6 +36,7 @@ export function segmentLength(graph: Graph, nodes: ArrayLike<number>, k: number)
  * @param count nodes の有効な長さ（区間は count - 1 本）
  * @param i     何本目の区間か
  * @param d     その区間の始点からの距離（描画単位）
+ * @param maxRadius 角を丸める半径の上限。道路と線路で違う（`ROAD_CORNER_RADIUS_M`）。
  */
 export function curvePointOnNodes(
   graph: Graph,
@@ -43,6 +45,7 @@ export function curvePointOnNodes(
   i: number,
   d: number,
   out: CurvePose,
+  maxRadius = CORNER_RADIUS_M,
 ): void {
   const lastSeg = count - 2;
   const len = segmentLength(graph, nodes, i);
@@ -64,7 +67,7 @@ export function curvePointOnNodes(
 
   // 始点側・終点側それぞれのフィレット半径。線の端のノードには角が無いので 0。
   const radius = (k: number): number =>
-    Math.min(CORNER_RADIUS_M, segmentLength(graph, nodes, k) * 0.45, segmentLength(graph, nodes, k + 1) * 0.45);
+    Math.min(maxRadius, segmentLength(graph, nodes, k) * 0.45, segmentLength(graph, nodes, k + 1) * 0.45);
   const rs = i > 0 ? radius(i - 1) : 0;
   const re = i < lastSeg ? radius(i) : 0;
 

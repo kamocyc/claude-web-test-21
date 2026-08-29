@@ -4,10 +4,12 @@ import {
   MAX_TRIP_TICKS,
   VEHICLES_PER_LANE,
   SATURATION_VPH_PER_LANE,
+  ROAD_CORNER_RADIUS_M,
   SIGNAL_CYCLE_STEPS,
   SIGNAL_MAJOR_GREEN_STEPS,
   SIGNAL_MIN_DEGREE,
   TICKS_PER_DAY,
+  TILE_M,
   TILE_SPAN_M,
   TRAFFIC_STEP_SEC,
   TRAFFIC_SUBSTEPS_PER_TICK,
@@ -93,8 +95,11 @@ const PITCH_FRAC = VEHICLE_LENGTH_M / TILE_SPAN_M;
  * 交わる道から来た車も同じ点で待つので、画面では車体が完全に重なる。
  * 描画上の交差点は 1 タイル 10m のうち 6〜9m を占めるので、その手前で止める。
  * 進めるようになったら 1.0（＝交差点の中心）まで出てから次のリンクへ移る。
+ *
+ * **描画で角を丸め始める位置と同じ**にしてある（`ROAD_CORNER_RADIUS_M`）。
+ * 停止線が曲線の中にあると、待っている車が曲がりかけの姿勢で固まる。
  */
-const STOP_LINE_SETBACK = 0.25;
+const STOP_LINE_SETBACK = ROAD_CORNER_RADIUS_M / TILE_M;
 
 export class TrafficSystem {
   // ---- 車両（SoA。同時に走るのは数百台なので配列で足りる） ----
@@ -962,7 +967,7 @@ function pathCurvePoint(
     idx++;
   }
 
-  curvePointOnNodes(graph, p.nodes, count, idx, d, out);
+  curvePointOnNodes(graph, p.nodes, count, idx, d, out, ROAD_CORNER_RADIUS_M);
   out.edge = p.edges[idx]!;
   return true;
 }
