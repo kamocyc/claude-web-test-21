@@ -202,8 +202,6 @@ describe('交通流', () => {
     const finder = new Pathfinder();
     const ew = finder.search(graph, graph.roadNodeAt[idx(26, 40)]!, graph.roadNodeAt[idx(54, 40)]!, Mode.Car)!;
     const ns = finder.search(graph, graph.roadNodeAt[idx(40, 26)]!, graph.roadNodeAt[idx(40, 54)]!, Mode.Car)!;
-    const t: unknown = traffic;
-    const inner = t as { count: Float32Array };
     const cross = idx(40, 40);
     // 東西の流れが交差点に着くまでのリンク列（下流から上流の順）
     const approach = ew.edges.slice(0, ew.edges.findIndex((e) => graph.nodeTile[graph.edgeTo[e]!] === cross) + 1).reverse();
@@ -223,9 +221,11 @@ describe('交通流', () => {
       }
       traffic.tick(graph, tick);
       traffic.events.length = 0;
+      // 「もう車を受け入れられない」が満杯。位置で車間を取るので、
+      // 台数が収容に届く前に入れなくなることがある（`isFull`）。
       let run = 0;
       for (const e of approach) {
-        if (inner.count[e]! >= traffic.storage[e]!) run++;
+        if (traffic.isFull(e)) run++;
         else break;
       }
       maxQueue = Math.max(maxQueue, run);

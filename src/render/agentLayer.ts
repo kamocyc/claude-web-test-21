@@ -112,6 +112,11 @@ const RAIL_TOP_M = 0.55;
  * 車線に沿った並べ直しから外す判定に使う（`drawVehicles` の 2 巡目）。
  */
 const TURNING_YAW_RAD = 0.08;
+/**
+ * 曲がる内側で車線オフセットを詰めるときに、車間の縮みをどこで止めるか。
+ * 0.25 = 「弧長が 25% 以上は縮まない」。小さくするほど交差点で中心線に寄る。
+ */
+const CORNER_LANE_KEEP = 0.25;
 
 /**
  * 路面（アスファルトの上面）の高さ (m)。
@@ -1746,28 +1751,47 @@ export class AgentLayer {
             ? BUS_BODY_M
             : carLength(bodyKind);
 
+      // 車線オフセットは軸ごとにその場の法線へ掛ける。剛体のままずらすと
+      // 曲がっている間だけ内側／外側にはみ出す。
+      const hasF = tr.pose(graph, v, nowSec, this.tmpFront, axles.front);
+      const hasR = tr.pose(graph, v, nowSec, this.tmpRear, axles.rear);
+      const wb = axles.front - axles.rear;
+
+      // 曲がり具合。前後の車軸の向きの差なので、そのまま「ホイールベース ÷ 曲率半径」。
+      let turn = 0;
+      if (hasF && hasR) {
+        turn = this.tmpFront.heading - this.tmpRear.heading;
+        while (turn > Math.PI) turn -= Math.PI * 2;
+        while (turn < -Math.PI) turn += Math.PI * 2;
+      }
+      const turning = Math.abs(turn) > TURNING_YAW_RAD;
+
       // 左側通行。多車線の道では交通流が割り当てた車線に載せる。
       // 散らし幅は車線の間隔（1.8m）から車幅（1.7m）を引いた余りしかないので、
       // 隣に車線があるときは絞る。1 車線の道は従来どおり大きく散らす。
       const cls = graph.edgeRoadClass[edge] as RoadClass;
       const multi = (DRAWN_LANES[cls] ?? 1) > 1;
       const spread = multi ? DRIVE_LATERAL_JITTER * 0.12 : DRIVE_LATERAL_JITTER;
-      const side =
+      let side =
         laneCenterM(cls, tr.laneOf[v]!) + ((((v * 2654435761) >>> 12) % 64) / 64) * spread - spread / 2;
-      // 車線オフセットは軸ごとにその場の法線へ掛ける。剛体のままずらすと
-      // 曲がっている間だけ内側／外側にはみ出す。
-      const hasF = tr.pose(graph, v, nowSec, this.tmpFront, axles.front);
-      const hasR = tr.pose(graph, v, nowSec, this.tmpRear, axles.rear);
+      // **曲がる内側では車線オフセットを詰める。**
+      //
+      // 左へ曲がる車は、車線の左寄せがそのまま旋回の内側になる。中心線の
+      // 曲率半径が 4.5m しかない交差点で 2.2m 内側にずらすと、実際に通る弧の
+      // 半径は 2.3m ―― 弧長がほぼ半分になり、交通流が 6.8m 空けた車間が
+      // 画面では 3m まで潰れて前の車にめり込む。実車も交差点では内側へ寄せる。
+      // 縮み方が 25% を超えないところで頭を押さえる。
+      if (turn > 0 && wb > 0) {
+        side = Math.min(side, (CORNER_LANE_KEEP * wb) / turn);
+      }
       let px = this.tmp.x + this.laneOffsetX(this.tmp.heading, side);
       let pz = this.tmp.z + this.laneOffsetZ(this.tmp.heading, side);
       let heading = this.tmp.heading;
-      let turning = false;
       if (hasF && hasR) {
         const fx = this.tmpFront.x + this.laneOffsetX(this.tmpFront.heading, side);
         const fz = this.tmpFront.z + this.laneOffsetZ(this.tmpFront.heading, side);
         const rx = this.tmpRear.x + this.laneOffsetX(this.tmpRear.heading, side);
         const rz = this.tmpRear.z + this.laneOffsetZ(this.tmpRear.heading, side);
-        const wb = axles.front - axles.rear;
         if ((fx - rx) * (fx - rx) + (fz - rz) * (fz - rz) > 1e-6 && wb > 0) {
           heading = Math.atan2(fx - rx, fz - rz);
           // 車体原点は 2 軸を結んだ線上の z = 0 の点。
@@ -1775,10 +1799,6 @@ export class AgentLayer {
           px = rx + (fx - rx) * k;
           pz = rz + (fz - rz) * k;
         }
-        let turn = this.tmpFront.heading - this.tmpRear.heading;
-        while (turn > Math.PI) turn -= Math.PI * 2;
-        while (turn < -Math.PI) turn += Math.PI * 2;
-        turning = Math.abs(turn) > TURNING_YAW_RAD;
       }
 
       const a = graph.edgeFrom[edge]!;

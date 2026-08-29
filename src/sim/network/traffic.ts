@@ -72,13 +72,27 @@ export interface VehicleEvent {
 }
 
 const INITIAL_VEHICLE_CAPACITY = 1024;
-/**
- * 描画用に覚えておくリンク乗り換えの件数。
- * 実測で 1 tick に進むのは最大 6 リンクなので、その前の 1 件ぶんを足しても 8 で足りる。
- */
-const TRAJECTORY_HISTORY = 8;
 /** 道路ではない区間（駅前の歩行者エッジなど）の放出率。実質無制限。 */
 const FREE_SEGMENT_RELEASE = 1000;
+/**
+ * 曲がる交差点で車間を何倍にするか。
+ *
+ * 角を丸めた曲線の内側を通る車は、中心線より短い弧を走る（`curve.ts`）。
+ * 経路の上で車列 1 台ぶん空けても、画面ではその 7 割ほどに潰れる。
+ * 直進する交差点には掛けない（そこは潰れないので、容量を削るだけになる）。
+ */
+const CORNER_PITCH = 1.4;
+/** 車列 1 台ぶんの間隔（リンク長に対する比）。 */
+const PITCH_FRAC = VEHICLE_LENGTH_M / TILE_SPAN_M;
+/**
+ * 停止線を交差点の中心からどれだけ手前に置くか（リンク長に対する比）。
+ *
+ * リンクの位置 1.0 は交差点の**中心**にあたる。赤で待つ車をそこに置くと、
+ * 交わる道から来た車も同じ点で待つので、画面では車体が完全に重なる。
+ * 描画上の交差点は 1 タイル 10m のうち 6〜9m を占めるので、その手前で止める。
+ * 進めるようになったら 1.0（＝交差点の中心）まで出てから次のリンクへ移る。
+ */
+const STOP_LINE_SETBACK = 0.25;
 
 export class TrafficSystem {
   // ---- 車両（SoA。同時に走るのは数百台なので配列で足りる） ----
@@ -116,6 +130,17 @@ export class TrafficSystem {
    * 補間するのに「次の点」が要るため。
    */
   posSamples = new Float32Array(0);
+  /** その標本のときにいたリンク（`path.edges` の添字）。`posSamples` と対。 */
+  private edgeSamples = new Int32Array(0);
+  /**
+   * その標本のリンクに入った時刻（秒）。
+   *
+   * 放出はサブステップの格子に丸めていない（`step` の注記）ので、標本と標本の
+   * あいだでリンクを移る。乗り換えの時刻を残しておかないと、その 5 秒を
+   * まるごと等速で按分することになり、交差点の手前で止まって見えたあと
+   * 自由流の 1.4 倍で飛び出す。
+   */
+  private enterSamples = new Float64Array(0);
   /** 連続で前に進めなかったサブステップ数。グリッドロックの逃がし弁に使う。 */
   private blocked = new Int32Array(0);
   /** 車両が交差点の放出枠を食う量（乗用車の車列 = 1）。場所には使わない。 */
@@ -127,23 +152,6 @@ export class TrafficSystem {
    * 毎 tick 並び順から決め直すと、前の車が抜けるたびに横へ跳ぶ。
    */
   laneOf = new Uint8Array(0);
-
-  /**
-   * 直近の軌跡（どのリンクに、いつ入ったか）。**描画専用**で、判断には一切使わない。
-   *
-   * 車は 1 tick に平均 2〜3 リンク（実測。自由流なら最大 6）進む。今いるリンクしか
-   * 持たないと、描画側は毎 tick「数マス瞬間移動 → 停止線でじっと待つ」しか描けない。
-   * tick の中の任意の時刻について、そのとき本当にいた場所を返せるように
-   * リンクの乗り換えを記録しておく。
-   *
-   * 1 tick を平均して滑らかにする手もあるが、信号の 1 周期が 60 秒 ＝ ちょうど 1 tick なので、
-   * それだと赤で止まっている様子が完全に消える。せっかくの挙動が見えなくなる。
-   */
-  private histEdgeIndex = new Int32Array(0);
-  private histEnterSec = new Float64Array(0);
-  /** リング内の最新の位置と、入っている件数。 */
-  private histHead = new Uint8Array(0);
-  private histCount = new Uint8Array(0);
 
   // ---- リンク ----
   private edgeCount = 0;
@@ -174,6 +182,14 @@ export class TrafficSystem {
 
   /** 車線ごとの「ここまで進んでよい」位置。`samplePositions` の作業用。 */
   private readonly laneCaps = new Float32Array(4);
+  /**
+   * リンクごとの最後尾の車の位置（0..1）。車がいなければ 2（＝十分遠い）。
+   *
+   * 交差点をまたぐ車間を作るのに使う。リンクの中だけで車間を取っても、
+   * 停止線の車（位置 1.0）と、その先のリンクに入ったばかりの車（位置 0.3）は
+   * 交差点をはさんで 3m しか離れず、画面では車体がめり込む。
+   */
+  private tailPos = new Float32Array(0);
 
   /** 車両がいるリンクの一覧。tick の頭で昇順に整えるので処理順は決定的。 */
   private active: number[] = [];
@@ -214,6 +230,7 @@ export class TrafficSystem {
     this.credit = new Float32Array(m);
     this.storage = new Uint16Array(m);
     this.lanes = new Uint8Array(m);
+    this.tailPos = new Float32Array(m).fill(2);
     this.releasePerStep = new Float32Array(m);
     this.freeSec = new Float32Array(m);
     this.greenFrom = new Uint8Array(m);
@@ -353,18 +370,15 @@ export class TrafficSystem {
     const poss = new Float32Array(cap * (TRAFFIC_SUBSTEPS_PER_TICK + 1));
     poss.set(this.posSamples);
     this.posSamples = poss;
+    const edges = new Int32Array(cap * (TRAFFIC_SUBSTEPS_PER_TICK + 1));
+    edges.set(this.edgeSamples);
+    this.edgeSamples = edges;
+    const ent = new Float64Array(cap * (TRAFFIC_SUBSTEPS_PER_TICK + 1));
+    ent.set(this.enterSamples);
+    this.enterSamples = ent;
     this.blocked = grow(this.blocked, (k) => new Int32Array(k));
     this.size = grow(this.size, (k) => new Float32Array(k));
     this.laneOf = grow(this.laneOf, (k) => new Uint8Array(k));
-    this.histHead = grow(this.histHead, (k) => new Uint8Array(k));
-    this.histCount = grow(this.histCount, (k) => new Uint8Array(k));
-    // 履歴は車両ごとに HIST 件の連続領域。伸ばすときは要素ごとに詰め替える。
-    const hist = new Int32Array(cap * TRAJECTORY_HISTORY);
-    hist.set(this.histEdgeIndex);
-    this.histEdgeIndex = hist;
-    const secs = new Float64Array(cap * TRAJECTORY_HISTORY);
-    secs.set(this.histEnterSec);
-    this.histEnterSec = secs;
     this.capacity = cap;
   }
 
@@ -390,16 +404,23 @@ export class TrafficSystem {
     this.alive[slot] = 1;
     this.departTick[slot] = tick;
     this.blocked[slot] = 0;
-    this.histHead[slot] = 0;
-    this.histCount[slot] = 1;
-    this.histEdgeIndex[slot * TRAJECTORY_HISTORY] = 0;
-    this.histEnterSec[slot * TRAJECTORY_HISTORY] = tick * 60;
+    // 標本を経路の先頭で埋めておく。tick の途中で投入された車（物流の折り返し）は
+    // その tick のあいだ標本が書かれないので、埋めないと前の車の値が読まれる。
+    const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
+    for (let k = 0; k < stride; k++) {
+      this.posSamples[slot * stride + k] = 0;
+      this.edgeSamples[slot * stride + k] = 0;
+      this.enterSamples[slot * stride + k] = tick * 60;
+    }
     this.pushLink(first, slot);
     return slot;
   }
 
   private pushLink(edge: number, v: number): void {
     this.laneOf[v] = this.pickLane(edge);
+    // 入った車は入口（位置 0）にいる。次の車が同じサブステップで入ってきて
+    // 重なるのを防ぐため、標本を待たずにここで最後尾を更新する。
+    this.tailPos[edge] = 0;
     this.next[v] = -1;
     const t = this.tail[edge]!;
     if (t < 0) {
@@ -444,15 +465,6 @@ export class TrafficSystem {
     this.count[edge] = Math.max(0, this.count[edge]! - 1);
     this.next[v] = -1;
     return v;
-  }
-
-  /** 軌跡に「このリンクへ、この時刻に入った」を 1 件積む。 */
-  private pushTrajectory(v: number, edgeIndex: number, nowSec: number): void {
-    const head = (this.histHead[v]! + 1) % TRAJECTORY_HISTORY;
-    this.histHead[v] = head;
-    if (this.histCount[v]! < TRAJECTORY_HISTORY) this.histCount[v] = this.histCount[v]! + 1;
-    this.histEdgeIndex[v * TRAJECTORY_HISTORY + head] = edgeIndex;
-    this.histEnterSec[v * TRAJECTORY_HISTORY + head] = nowSec;
   }
 
   private release(v: number): void {
@@ -509,10 +521,10 @@ export class TrafficSystem {
 
     for (let sub = 0; sub < TRAFFIC_SUBSTEPS_PER_TICK; sub++) {
       const at = tick * 60 + sub * TRAFFIC_STEP_SEC;
-      this.samplePositions(sub, at);
+      this.samplePositions(graph, sub, at, tick * TRAFFIC_SUBSTEPS_PER_TICK + sub);
       this.step(graph, at, tick * TRAFFIC_SUBSTEPS_PER_TICK + sub);
     }
-    this.samplePositions(TRAFFIC_SUBSTEPS_PER_TICK, tick * 60 + 60);
+    this.samplePositions(graph, TRAFFIC_SUBSTEPS_PER_TICK, tick * 60 + 60, (tick + 1) * TRAFFIC_SUBSTEPS_PER_TICK);
 
     this.refreshQueueSlots(graph, tick * 60 + 60);
     this.expireLongTrips(tick);
@@ -538,7 +550,11 @@ export class TrafficSystem {
         // まだ停止線まで来ていない車は出せない。行列の後ろにいた車は、前が
         // どいてから車間を詰めるぶんだけ遅れて出る（実車の発進遅れ）。
         // これを省くと、描画は「詰めきる前にワープして次のリンクへ」になる。
-        if (this.posSamples[v * (TRAFFIC_SUBSTEPS_PER_TICK + 1) + (stepIndex % TRAFFIC_SUBSTEPS_PER_TICK)]! < 1) break;
+        // 交差点の先の車との間隔もここで効く（`tailPos` の注記）。
+        if (this.posSamples[v * (TRAFFIC_SUBSTEPS_PER_TICK + 1) + (stepIndex % TRAFFIC_SUBSTEPS_PER_TICK)]! < 1) {
+          this.blocked[v] = this.blocked[v]! + 1;
+          if (this.blocked[v]! < GRIDLOCK_RELIEF_STEPS) break;
+        }
         if (this.credit[e]! < 1) break;
         // 大きい車ほど交差点の枠を食う。クレジットは負になってよい。
         const weight = this.size[v]!;
@@ -548,7 +564,10 @@ export class TrafficSystem {
         const last = ni >= p.edges.length;
         if (!last) {
           const nx = p.edges[ni]!;
-          if (this.count[nx]! + 1 > this.storage[nx]!) {
+          // 次のリンクの入口に、車列 1 台ぶんの空きが要る。台数だけで見ると
+          // 相次いで入った 2 台がどちらも入口（位置 0）に描かれて重なる。
+          const need = axisOf(graph, e) === axisOf(graph, nx) ? PITCH_FRAC : PITCH_FRAC * CORNER_PITCH;
+          if (this.tailPos[nx]! < need || this.count[nx]! + 1 > this.storage[nx]!) {
             // 下流が詰まっている → ここで止まる。これが渋滞の伝播。
             this.blocked[v] = this.blocked[v]! + 1;
             if (this.blocked[v]! < GRIDLOCK_RELIEF_STEPS) break;
@@ -586,8 +605,17 @@ export class TrafficSystem {
           this.edgeIndex[v] = ni;
           this.enterSec[v] = releaseSec;
           this.blocked[v] = 0;
-          this.pushTrajectory(v, ni, releaseSec);
           this.pushLink(nx, v);
+          // 標本はサブステップの頭（＝放出前）に取っている。放出時刻は格子に
+          // 丸めていないので、そのままだと「この時刻にはもう次のリンクにいた」
+          // という事実と食い違い、描画は交差点の手前で一拍止まってから
+          // 自由流の 1.4 倍で飛び出す。動かした車の標本はここで取り直す。
+          const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
+          const sample = v * stride + (stepIndex % TRAFFIC_SUBSTEPS_PER_TICK);
+          const freeNext = this.freeSec[nx]!;
+          this.edgeSamples[sample] = ni;
+          this.enterSamples[sample] = releaseSec;
+          this.posSamples[sample] = freeNext > 0 ? Math.min(1, (nowSec - releaseSec) / freeNext) : 0;
         }
       }
     }
@@ -599,29 +627,69 @@ export class TrafficSystem {
    * tick に 13 回走るので、走行中の車両（実測で数百台）のリンクリストを
    * 1 回なぞるだけに留める。
    */
-  private samplePositions(sub: number, nowSec: number): void {
+  private samplePositions(graph: Graph, sub: number, nowSec: number, stepIndex: number): void {
     const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
     const cap = this.laneCaps;
     const prevSub = sub === 0 ? TRAFFIC_SUBSTEPS_PER_TICK : sub - 1;
     for (const e of this.active) {
-      if (this.count[e]! <= 0) continue;
+      if (this.count[e]! <= 0) {
+        this.tailPos[e] = 2;
+        continue;
+      }
       const free = this.freeSec[e]!;
       // 1 サブステップで自由流なら進める割合。
       const perStep = free > 0 ? TRAFFIC_STEP_SEC / free : 1;
+      const green = this.isGreen(e, stepIndex);
       cap.fill(1);
+      const first = [true, true, true, true];
+      let tail = 2;
       for (let v = this.head[e]!; v >= 0; v = this.next[v]!) {
         const l = this.laneOf[v]!;
         const b = v * stride;
         // 入ってからの経過で進める分。
         const cruise = free > 0 ? (nowSec - this.enterSec[v]!) / free : 1;
-        // このリンクに入ったのが前の標本より後なら、前の値は前のリンクのもの。
-        const base = this.enterSec[v]! > nowSec - TRAFFIC_STEP_SEC ? 0 : this.posSamples[b + prevSub]!;
-        this.posSamples[b + sub] = Math.max(
-          0,
-          Math.min(cap[l]!, cruise, base + perStep),
-        );
-        cap[l] = cap[l]! - VEHICLE_LENGTH_M / TILE_SPAN_M;
+        // 前の標本が別のリンクのものなら引き継がない。リンクに入ったのは
+        // サブステップの途中（放出時刻は格子に丸めていない）なので、
+        // 0 から数え直すと 1 サブステップぶん取りこぼして所要が水増しされる。
+        // 入った時刻から数えた分を初期値にする。
+        const base =
+          this.edgeSamples[b + prevSub] === this.edgeIndex[v]
+            ? this.posSamples[b + prevSub]!
+            : Math.max(0, cruise - perStep);
+        if (first[l]) {
+          // この車線の先頭。
+          first[l] = false;
+          // **渡り切れると分かったときだけ交差点に入る。**
+          //
+          // 位置 1.0 は交差点の中心にあたる。赤や、放出枠待ち、先が詰まっている
+          // といった理由でそこに留まると、交わる道から来た車と同じ点に重なって
+          // 描かれる。渡れないうちは停止線（`STOP_LINE_SETBACK` ぶん手前）で待たせる。
+          //
+          // 既に停止線より前に出ている車は下げない。下げると画面では
+          // 後ろへワープするので、そのまま渡らせる（黄で入った車と同じ扱い）。
+          let canGo = green && this.credit[e]! >= 1;
+          const p = this.path[v];
+          const ni = this.edgeIndex[v]! + 1;
+          if (p && ni < p.edges.length) {
+            const nx = p.edges[ni]!;
+            // 曲がる交差点では広めに空ける。角を丸めた内側の弧は中心線より
+            // 短いので、経路上で同じだけ空けても画面では詰まって見える。
+            const need = axisOf(graph, e) === axisOf(graph, nx) ? PITCH_FRAC : PITCH_FRAC * CORNER_PITCH;
+            const ahead = this.tailPos[nx]!;
+            if (ahead < need || this.count[nx]! + 1 > this.storage[nx]!) canGo = false;
+            // 交差点の先の車との間隔。渡れる場合でも、詰めすぎないように押さえる。
+            if (ahead < need) cap[l] = Math.min(cap[l]!, Math.max(base, 1 - (need - ahead)));
+          }
+          if (!canGo) cap[l] = Math.min(cap[l]!, Math.max(base, 1 - STOP_LINE_SETBACK));
+        }
+        const pos = Math.max(0, Math.min(cap[l]!, cruise, base + perStep));
+        this.posSamples[b + sub] = pos;
+        this.edgeSamples[b + sub] = this.edgeIndex[v]!;
+        this.enterSamples[b + sub] = this.enterSec[v]!;
+        if (pos < tail) tail = pos;
+        cap[l] = cap[l]! - PITCH_FRAC;
       }
+      this.tailPos[e] = tail;
     }
   }
 
@@ -696,9 +764,14 @@ export class TrafficSystem {
   /**
    * 車両の見た目の位置。
    *
-   * 走行中は「入ってからの経過 ÷ 自由流時間」で進み、
-   * 放出待ちなら停止線から車列 1 台ぶんずつ後ろに並ぶ。
-   * 信号の手前に車が整列して見えるのはここ。
+   * **サブステップごとに記録した「どのリンクの、どこにいたか」を補間するだけ**で、
+   * 自由流時間からの逆算は一切しない。逆算に頼ると、行列で停止線に張り付いていた
+   * 車が「もう走り切っている／まだ半分」と食い違い、tick をまたいだ瞬間に
+   * 数メートル飛んで後続にめり込む。位置そのものを残しておけば食い違いようがない。
+   *
+   * 標本の間でリンクをまたいでいたら、その間を等速で渡ったものとして按分する。
+   * リンクの境目は「前のリンクの 1.0 ＝ 次のリンクの 0.0」で同じ地点なので、
+   * ここで切れ目は出ない。
    *
    * @param offsetM その地点から経路に沿って前（負なら後ろ）へずらした点を返す。
    *   前後の車軸を別々に置くのに使う（`pathCurvePoint` と `agentLayer` の注記）。
@@ -709,58 +782,68 @@ export class TrafficSystem {
     const p = this.path[v];
     if (!p) return false;
 
-    // その時刻にいたリンクを軌跡から引く。新しい方から見て、
-    // 「もう入っていた」最初の 1 件がその瞬間の居場所。
-    const base = v * TRAJECTORY_HISTORY;
-    const head = this.histHead[v]!;
-    const n = this.histCount[v]!;
-    let slot = -1;
-    for (let k = 0; k < n; k++) {
-      const at = (head - k + TRAJECTORY_HISTORY) % TRAJECTORY_HISTORY;
-      if (this.histEnterSec[base + at]! <= nowSec) {
-        slot = at;
-        break;
+    const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
+    const b = v * stride;
+    const u = Math.max(
+      0,
+      Math.min(TRAFFIC_SUBSTEPS_PER_TICK, (nowSec / TRAFFIC_STEP_SEC) % TRAFFIC_SUBSTEPS_PER_TICK),
+    );
+    const k0 = Math.floor(u);
+    const frac = u - k0;
+
+    let i = this.edgeSamples[b + k0]!;
+    let f = this.posSamples[b + k0]!;
+    const i1 = this.edgeSamples[b + k0 + 1]!;
+    const f1 = this.posSamples[b + k0 + 1]!;
+    if (i1 === i) {
+      f += (f1 - f) * frac;
+    } else if (i1 === i + 1) {
+      // 標本の間でリンクを 1 本またいだ。またいだ時刻が分かっているので、
+      // 前後を別々に等速で結ぶ。境目（前のリンクの 1.0 ＝ 次の 0.0）で
+      // つながるので切れ目は出ない。
+      // 標本 k の時刻は「この tick の頭 + k * サブステップ」。
+      const tickStart = nowSec - (nowSec % 60);
+      const at0 = tickStart + k0 * TRAFFIC_STEP_SEC;
+      const at1 = at0 + TRAFFIC_STEP_SEC;
+      // 次のリンクに入った時刻。標本の間にあるはずだが、念のため挟み込む。
+      const crossAt = Math.max(at0, Math.min(at1, this.enterSamples[b + k0 + 1]!));
+      if (nowSec < crossAt) {
+        // まだ前のリンク。そこから停止線（1.0）までを等速で。
+        const span = crossAt - at0;
+        f = span > 0 ? f + (1 - f) * ((nowSec - at0) / span) : 1;
+      } else {
+        // もう次のリンク。入口（0.0）から次の標本までを等速で。
+        const span = at1 - crossAt;
+        i = i1;
+        f = span > 0 ? f1 * ((nowSec - crossAt) / span) : f1;
+      }
+    } else if (i1 > i) {
+      // 2 本以上またいだ（ごく短い区間）。距離で按分する。
+      const total = i1 - i + (f1 - f);
+      f += total * frac;
+      while (f >= 1 && i < i1) {
+        f -= 1;
+        i++;
       }
     }
-    // 履歴のどれよりも古い時刻を聞かれたら、いちばん古い記録で答える。
-    if (slot < 0) slot = (head - (n - 1) + TRAJECTORY_HISTORY) % TRAJECTORY_HISTORY;
-
-    const i = this.histEdgeIndex[base + slot]!;
     if (i >= p.edges.length) return false;
-    const edge = p.edges[i]!;
-    const free = this.freeSec[edge]!;
-    const cruise = free > 0 ? (nowSec - this.histEnterSec[base + slot]!) / free : 1;
-    // 前の車につかえるのは「今いるリンク」だけ。既に通り過ぎたリンクでは走り切っている。
-    // 今いるリンクの上限はサブステップの標本から取る（`capSamples` の注記）。
-    let f: number;
-    if (slot === head) {
-      // 今いるリンクの位置はサブステップの標本を補間して出す。
-      const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
-      const u = Math.max(
-        0,
-        Math.min(TRAFFIC_SUBSTEPS_PER_TICK, (nowSec / TRAFFIC_STEP_SEC) % TRAFFIC_SUBSTEPS_PER_TICK),
-      );
-      const k0 = Math.floor(u);
-      const b = v * stride;
-      const p0 = this.posSamples[b + k0]!;
-      const p1 = this.posSamples[b + k0 + 1]!;
-      // このリンクに入る前の標本には前のリンクの位置が残っている。
-      // 入ってからの経過で進める分で頭を押さえておけば、それを読んでも
-      // 「入った直後なのに先の方に描かれる」ことはない。
-      f = Math.min(cruise, p0 + (p1 - p0) * (u - k0));
-    } else {
-      // 既に通り過ぎたリンク。自由流で逆算すると、そこで行列に並んでいた車は
-      // 「もう走り切っている」ことになり、tick をまたいだ瞬間にリンクの末端へ飛ぶ
-      // （今いるリンクの位置は行列を反映しているのに、1 本前になった途端に
-      //   反映されなくなるため）。軌跡には出た時刻も残っているので、
-      // 入った時刻から出た時刻までを等速で渡ったものとして描く。
-      const exitAt = (slot + 1) % TRAJECTORY_HISTORY;
-      const span = this.histEnterSec[base + exitAt]! - this.histEnterSec[base + slot]!;
-      f = span > 0 ? (nowSec - this.histEnterSec[base + slot]!) / span : 1;
-    }
-    f = Math.max(0, Math.min(1, f));
 
-    return pathCurvePoint(graph, p, i, f, offsetM, out);
+    return pathCurvePoint(graph, p, i, Math.max(0, Math.min(1, f)), offsetM, out);
+  }
+
+  /**
+   * そのリンクがもう車を受け入れられないか。
+   *
+   * 台数が収容に達したときだけでなく、**入口に車列 1 台ぶんの空きが無い**
+   * ときも満杯。位置で車間を取るようになったので、台数が収容に届く前に
+   * 入れなくなる（＝そこから上流へ行列が伸びる）ことがある。
+   *
+   * 統計の「混雑リンク」（`stats.fullLinks`）には使わない。自由流の車が
+   * 入った直後も一時的に真になるので、混み具合の指標としては騒がしい。
+   */
+  isFull(edge: number): boolean {
+    if (edge >= this.edgeCount) return false;
+    return this.count[edge]! + 1 > this.storage[edge]! || this.tailPos[edge]! < PITCH_FRAC;
   }
 
   /** リンクの占有率 0..1。交通量オーバーレイに使う。 */
