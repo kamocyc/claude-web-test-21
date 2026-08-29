@@ -12,6 +12,8 @@ import {
   TRAFFIC_STEP_SEC,
   TRAFFIC_SUBSTEPS_PER_TICK,
   TRUCK_PLATOON_EQUIV,
+  VEHICLE_ACCEL_MS2,
+  VEHICLE_DECEL_MS2,
   VEHICLE_LENGTH_M,
   VEHICLE_PLATOON,
 } from '@shared/constants';
@@ -152,6 +154,14 @@ export class TrafficSystem {
    * 毎 tick 並び順から決め直すと、前の車が抜けるたびに横へ跳ぶ。
    */
   laneOf = new Uint8Array(0);
+  /**
+   * 走行速度（シミュレーション上の m/s）。
+   *
+   * 位置を「進めるところまで進める」で決めると、赤信号でも渋滞の最後尾でも
+   * 全速から一瞬で停止し、青になった瞬間に全速へ戻る。速度を状態として持ち、
+   * 加速度・減速度で変化させることで、停止と発進に溜めができる。
+   */
+  speedOf = new Float32Array(0);
 
   // ---- リンク ----
   private edgeCount = 0;
@@ -182,6 +192,8 @@ export class TrafficSystem {
 
   /** 車線ごとの「ここまで進んでよい」位置。`samplePositions` の作業用。 */
   private readonly laneCaps = new Float32Array(4);
+  /** 車線ごとの、前を走っている車の速度 (m/s)。`samplePositions` の作業用。 */
+  private readonly laneLeadSpeed = new Float32Array(4);
   /**
    * リンクごとの最後尾の車の位置（0..1）。車がいなければ 2（＝十分遠い）。
    *
@@ -379,6 +391,7 @@ export class TrafficSystem {
     this.blocked = grow(this.blocked, (k) => new Int32Array(k));
     this.size = grow(this.size, (k) => new Float32Array(k));
     this.laneOf = grow(this.laneOf, (k) => new Uint8Array(k));
+    this.speedOf = grow(this.speedOf, (k) => new Float32Array(k));
     this.capacity = cap;
   }
 
@@ -404,6 +417,10 @@ export class TrafficSystem {
     this.alive[slot] = 1;
     this.departTick[slot] = tick;
     this.blocked[slot] = 0;
+    // 走り出しの速度は自由流。道に出るまでの加速は建物側の話で、ここでは
+    // 「もう流れに乗っている」ものとして扱う。0 から始めると、空いている道でも
+    // 最初のリンクだけ所要が伸びて経路コストに乗ってしまう。
+    this.speedOf[slot] = this.freeSec[first]! > 0 ? TILE_SPAN_M / this.freeSec[first]! : TILE_SPAN_M;
     // 標本を経路の先頭で埋めておく。tick の途中で投入された車（物流の折り返し）は
     // その tick のあいだ標本が書かれないので、埋めないと前の車の値が読まれる。
     const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
@@ -624,8 +641,10 @@ export class TrafficSystem {
           const limit = ahead >= 2 ? 1 : Math.max(0, ahead - PITCH_FRAC);
           this.edgeSamples[sample] = ni;
           this.enterSamples[sample] = releaseSec;
-          this.posSamples[sample] =
-            freeNext > 0 ? Math.min(limit, (nowSec - releaseSec) / freeNext) : 0;
+          // 進んだ量は自由流ではなく**いまの速度**で測る（減速中に交差点を
+          // 渡ることがある）。
+          const moved = (this.speedOf[v]! * (nowSec - releaseSec)) / TILE_SPAN_M;
+          this.posSamples[sample] = freeNext > 0 ? Math.max(0, Math.min(limit, moved)) : 0;
         }
       }
     }
@@ -640,6 +659,7 @@ export class TrafficSystem {
   private samplePositions(graph: Graph, sub: number, nowSec: number, stepIndex: number): void {
     const stride = TRAFFIC_SUBSTEPS_PER_TICK + 1;
     const cap = this.laneCaps;
+    const lead = this.laneLeadSpeed;
     const prevSub = sub === 0 ? TRAFFIC_SUBSTEPS_PER_TICK : sub - 1;
     for (const e of this.active) {
       if (this.count[e]! <= 0) {
@@ -649,21 +669,26 @@ export class TrafficSystem {
       const free = this.freeSec[e]!;
       // 1 サブステップで自由流なら進める割合。
       const perStep = free > 0 ? TRAFFIC_STEP_SEC / free : 1;
+      /** このリンクの自由流速度 (m/s)。 */
+      const vFree = free > 0 ? TILE_SPAN_M / free : TILE_SPAN_M;
       const green = this.isGreen(e, stepIndex);
       cap.fill(1);
+      lead.fill(vFree);
       const first = [true, true, true, true];
+      // その車線の先頭が「止まらずに通り抜けられる」か。
+      const through = [false, false, false, false];
       let tail = 2;
-      for (let v = this.head[e]!; v >= 0; v = this.next[v]!) {
-        const l = this.laneOf[v]!;
-        const b = v * stride;
+      for (let v0 = this.head[e]!; v0 >= 0; v0 = this.next[v0]!) {
+        const l = this.laneOf[v0]!;
+        const b = v0 * stride;
         // 入ってからの経過で進める分。
-        const cruise = free > 0 ? (nowSec - this.enterSec[v]!) / free : 1;
+        const cruise = free > 0 ? (nowSec - this.enterSec[v0]!) / free : 1;
         // 前の標本が別のリンクのものなら引き継がない。リンクに入ったのは
         // サブステップの途中（放出時刻は格子に丸めていない）なので、
         // 0 から数え直すと 1 サブステップぶん取りこぼして所要が水増しされる。
         // 入った時刻から数えた分を初期値にする。
         const base =
-          this.edgeSamples[b + prevSub] === this.edgeIndex[v]
+          this.edgeSamples[b + prevSub] === this.edgeIndex[v0]
             ? this.posSamples[b + prevSub]!
             : Math.max(0, cruise - perStep);
         if (first[l]) {
@@ -678,8 +703,8 @@ export class TrafficSystem {
           // 既に停止線より前に出ている車は下げない。下げると画面では
           // 後ろへワープするので、そのまま渡らせる（黄で入った車と同じ扱い）。
           let canGo = green && this.credit[e]! >= 1;
-          const p = this.path[v];
-          const ni = this.edgeIndex[v]! + 1;
+          const p = this.path[v0];
+          const ni = this.edgeIndex[v0]! + 1;
           if (p && ni < p.edges.length) {
             const nx = p.edges[ni]!;
             // 曲がる交差点では広めに空ける。角を丸めた内側の弧は中心線より
@@ -691,11 +716,40 @@ export class TrafficSystem {
             if (ahead < need) cap[l] = Math.min(cap[l]!, Math.max(base, 1 - (need - ahead)));
           }
           if (!canGo) cap[l] = Math.min(cap[l]!, Math.max(base, 1 - STOP_LINE_SETBACK));
+          // 渡り切れるなら、この上限は「止まる場所」ではない（そのまま次の
+          // リンクへ抜ける）。減速の目標にしないよう印を付ける。
+          through[l] = canGo && cap[l]! >= 1;
+          lead[l] = 0;
         }
-        const pos = Math.max(0, Math.min(cap[l]!, cruise, base + perStep));
+
+        // --- 速度を加速度・減速度で動かす ---
+        //
+        // 「進めるところまで進める」だと、赤信号でも渋滞の最後尾でも全速から
+        // 一瞬で止まり、青になった瞬間に全速に戻る。前方の制約（停止線・前の車）
+        // までに前の車の速度まで落とせる速度を上限にし、そこへ向けて
+        // 加速度ぶんずつ寄せる。
+        let v = this.speedOf[v0]! + VEHICLE_ACCEL_MS2 * TRAFFIC_STEP_SEC;
+        if (!through[l]) {
+          const gapM = Math.max(0, cap[l]! - base) * TILE_SPAN_M;
+          const vLead = lead[l]!;
+          const vSafe = Math.sqrt(Math.max(0, vLead * vLead + 2 * VEHICLE_DECEL_MS2 * gapM));
+          if (v > vSafe) v = vSafe;
+        }
+        if (v > vFree) v = vFree;
+        if (v < 0) v = 0;
+        const want = base + (v * TRAFFIC_STEP_SEC) / TILE_SPAN_M;
+        // 前方の制約で頭打ちになった分は速度に返す（頭打ちのまま速度だけ
+        // 上がっていくと、制約が外れた瞬間に飛び出す）。
+        // そのまま次のリンクへ抜ける車にとって、リンクの端（1.0）は制約ではない。
+        // ここで頭打ちにすると、リンクを渡るたびに速度が落ちて所要が伸びる。
+        const held = through[l] ? want : Math.min(cap[l]!, want);
+        this.speedOf[v0] = Math.max(0, ((held - base) * TILE_SPAN_M) / TRAFFIC_STEP_SEC);
+        // `cruise` は「入ってからの経過で進める分」。リンクに入った直後だけ
+        // 効く頭打ちで、前方の制約ではないので速度には返さない。
+        const pos = Math.max(0, Math.min(cap[l]!, held, cruise));
         this.posSamples[b + sub] = pos;
-        this.edgeSamples[b + sub] = this.edgeIndex[v]!;
-        this.enterSamples[b + sub] = this.enterSec[v]!;
+        this.edgeSamples[b + sub] = this.edgeIndex[v0]!;
+        this.enterSamples[b + sub] = this.enterSec[v0]!;
         if (pos < tail) tail = pos;
         // 次の車の上限は「前の車が**実際にいる位置**」の車列 1 台ぶん後ろ。
         //
@@ -707,6 +761,8 @@ export class TrafficSystem {
         // 位置から引けば、位置は必ず単調に増えるので上限も単調に増える。
         // どの車も後ろへ動かないことが構成から保証される。
         cap[l] = pos - PITCH_FRAC;
+        lead[l] = this.speedOf[v0]!;
+        through[l] = false;
       }
       this.tailPos[e] = tail;
     }
