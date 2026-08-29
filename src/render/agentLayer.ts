@@ -14,6 +14,7 @@ import {
 import {
   AGENT_DRAW_DISTANCE_M,
   LANE_OFFSET_M,
+  LANE_PITCH_M,
   MAP_H,
   MAP_W,
   MAX_VISIBLE_AGENTS,
@@ -30,7 +31,7 @@ import {
   TRAIN_DRAW_DISTANCE_M,
   VEHICLE_DRAW_DISTANCE_M,
 } from '@shared/constants';
-import { Activity, Good, Mode, ModeBit, RoadClass, Zone } from '@shared/enums';
+import { Activity, DRAWN_LANES, Good, Mode, ModeBit, RoadClass, Zone } from '@shared/enums';
 import { idx, tileX, tileY } from '@sim/world/tiles';
 import { citizenPosition } from '@sim/agents/activity';
 import { CitizenFlag } from '@sim/agents/citizens';
@@ -183,6 +184,19 @@ const CARRIAGE_HALF_M: Record<number, number> = {
   [RoadClass.Avenue]: 3.7,
   [RoadClass.Boulevard]: 4.3,
 };
+/**
+ * 車線の中心（進行方向の左へのオフセット、描画 m）。
+ *
+ * 外側（路肩側）の車線を縁石ぎりぎりに置き、内側へ `LANE_PITCH_M` ずつ寄せる。
+ * 車幅 1.7m に対して 1.8m 刻みなので、隣の車線の車と 10cm 空く。
+ * 生活道路は 1 車線なので、従来どおり `LANE_OFFSET_M` にそのまま乗る。
+ */
+function laneCenterM(cls: RoadClass, lane: number): number {
+  const outer = Math.max(LANE_OFFSET_M, (CARRIAGE_HALF_M[cls] ?? CARRIAGE_HALF_M[RoadClass.Street]!) - 0.9);
+  // 中心線を越えさせない（対向車線に食い込ませない）。
+  return Math.max(1.0, outer - lane * LANE_PITCH_M);
+}
+
 /** 歩道の外縁 (m)。タイルの端まで歩道。 */
 const WALK_OUTER_M = TILE_M / 2;
 
@@ -1732,11 +1746,14 @@ export class AgentLayer {
             ? BUS_BODY_M
             : carLength(bodyKind);
 
-      // 左側通行。横位置は車ごとに少し散らす（`DRIVE_LATERAL_JITTER` の注記）。
+      // 左側通行。多車線の道では交通流が割り当てた車線に載せる。
+      // 散らし幅は車線の間隔（1.8m）から車幅（1.7m）を引いた余りしかないので、
+      // 隣に車線があるときは絞る。1 車線の道は従来どおり大きく散らす。
+      const cls = graph.edgeRoadClass[edge] as RoadClass;
+      const multi = (DRAWN_LANES[cls] ?? 1) > 1;
+      const spread = multi ? DRIVE_LATERAL_JITTER * 0.12 : DRIVE_LATERAL_JITTER;
       const side =
-        LANE_OFFSET_M +
-        ((((v * 2654435761) >>> 12) % 64) / 64) * DRIVE_LATERAL_JITTER -
-        DRIVE_LATERAL_JITTER / 2;
+        laneCenterM(cls, tr.laneOf[v]!) + ((((v * 2654435761) >>> 12) % 64) / 64) * spread - spread / 2;
       // 車線オフセットは軸ごとにその場の法線へ掛ける。剛体のままずらすと
       // 曲がっている間だけ内側／外側にはみ出す。
       const hasF = tr.pose(graph, v, nowSec, this.tmpFront, axles.front);

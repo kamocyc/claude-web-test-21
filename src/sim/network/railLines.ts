@@ -5,9 +5,11 @@ import {
   TRAIN_CARS,
   TRAIN_CAR_GAP_M,
   TRAIN_CAR_LENGTH_M,
+  TRAIN_TURNAROUND_SEC,
 } from '@shared/constants';
 import { ModeBit } from '@shared/enums';
 import { idx, inBounds, tileX, tileY } from '@sim/world/tiles';
+import { curvePointOnNodes, segmentLength } from './curve';
 import { Graph, NodeKind } from './graph';
 
 /**
@@ -201,23 +203,24 @@ export function railPoseAt(graph: Graph, line: RailLine, distM: number, forward:
     if (line.cumM[mid]! <= d) lo = mid;
     else hi = mid;
   }
-  const a = line.nodes[lo]!;
-  const b = line.nodes[hi]!;
   const seg = line.cumM[hi]! - line.cumM[lo]!;
   const f = seg > 0 ? (d - line.cumM[lo]!) / seg : 0;
-  const ax = graph.nodeX[a]!;
-  const az = graph.nodeZ[a]!;
-  const bx = graph.nodeX[b]!;
-  const bz = graph.nodeZ[b]!;
-  out.x = ax + (bx - ax) * f;
-  out.z = az + (bz - az) * f;
-  out.heading = forward ? Math.atan2(bx - ax, bz - az) : Math.atan2(ax - bx, az - bz);
+  // 折れ線のままだと分岐やカーブで向きが 1 フレームで入れ替わる。
+  // 道路と同じく角を丸めた曲線の上に載せる（`curve.ts`）。
+  curvePointOnNodes(graph, line.nodes, n, lo, f * segmentLength(graph, line.nodes, lo), out);
+  // 戻りの列車は同じ線路を逆向きに走る。
+  if (!forward) out.heading += Math.PI;
   return true;
 }
 
-/** 線を端から端まで走って戻るのに掛かる秒数。 */
+/** 片道で先頭が動ける距離 (m)。編成が線からはみ出さないぶんだけ短い。 */
+function travelSpanM(line: RailLine): number {
+  return Math.max(0, line.lengthM - TRAIN_LENGTH_M);
+}
+
+/** 線を端から端まで走り、折り返して戻ってくるまでの秒数（両端の停車を含む）。 */
 export function shuttleCycleSec(line: RailLine): number {
-  return (2 * line.lengthM) / RAIL_MS;
+  return (2 * travelSpanM(line)) / RAIL_MS + 2 * TRAIN_TURNAROUND_SEC;
 }
 
 /**
@@ -232,7 +235,6 @@ export function shuttleCycleSec(line: RailLine): number {
 export function trainHeads(line: RailLine, tickFloat: number, out: TrainHead[]): number {
   if (!line.served || line.lengthM < TRAIN_LENGTH_M) return 0;
   const cycle = shuttleCycleSec(line);
-  const oneWay = cycle / 2;
   const headwaySec = DEFAULT_HEADWAY_MIN * 60;
   const count = Math.max(1, Math.min(out.length, Math.round(cycle / headwaySec)));
   const spacing = cycle / count;
@@ -240,15 +242,34 @@ export function trainHeads(line: RailLine, tickFloat: number, out: TrainHead[]):
   const offset = (line.nodes[0]! * 37) % cycle;
   const timeSec = tickFloat * 60;
 
+  const span = travelSpanM(line);
+  const runSec = span / RAIL_MS;
+
   for (let k = 0; k < count; k++) {
     let phase = (timeSec + offset + k * spacing) % cycle;
     if (phase < 0) phase += cycle;
     const h = out[k]!;
-    if (phase < oneWay) {
-      h.distM = phase * RAIL_MS;
+    // 1 周期 = 往路 → 終端で停車 → 復路 → 起点で停車。
+    //
+    // distM は**進行方向の先頭**の位置。編成の残りはその後ろ（＝進行方向と
+    // 逆側）に付くので、先頭が動ける範囲は編成長ぶん狭い。ここを線の端から端に
+    // すると、編成の後ろが線からはみ出して描画から落ち（両端で車両が消える）、
+    // 折り返した瞬間に後続車が先頭を飛び越して反対側へ現れる。
+    if (phase < runSec) {
+      // 往路。先頭は編成長の位置から終端へ。
+      h.distM = TRAIN_LENGTH_M + phase * RAIL_MS;
       h.forward = true;
+    } else if (phase < runSec + TRAIN_TURNAROUND_SEC) {
+      // 終端で停車。止まっている間に向きが入れ替わるので、走行中に
+      // 車体が反転して見えることがない。
+      h.distM = line.lengthM;
+      h.forward = true;
+    } else if (phase < 2 * runSec + TRAIN_TURNAROUND_SEC) {
+      // 復路。折り返した直後の先頭は、いま編成の後ろだった端にいる。
+      h.distM = span - (phase - runSec - TRAIN_TURNAROUND_SEC) * RAIL_MS;
+      h.forward = false;
     } else {
-      h.distM = (cycle - phase) * RAIL_MS;
+      h.distM = 0;
       h.forward = false;
     }
   }

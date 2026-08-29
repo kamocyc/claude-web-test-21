@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  VEHICLES_PER_LANE,
   SIGNAL_CYCLE_STEPS,
   TILE_M,
   TILE_SPAN_M,
@@ -7,7 +8,7 @@ import {
   TRAFFIC_SUBSTEPS_PER_TICK,
   VEHICLE_LENGTH_M,
 } from '@shared/constants';
-import { Mode, RoadClass } from '@shared/enums';
+import { DRAWN_LANES, Mode, RoadClass } from '@shared/enums';
 import { Pathfinder, type Path } from '@sim/network/pathfinder';
 import { TrafficSystem, VehicleKind } from '@sim/network/traffic';
 import { idx } from '@sim/world/tiles';
@@ -82,13 +83,36 @@ describe('交通流', () => {
     const fx = straightRoad(30, 40);
     const first = fx.path.edges[0]!;
     const storage = fx.traffic.storage[first]!;
-    // 生活道路 1 車線: 150m ÷ 車列 65m = 2 台
-    expect(storage).toBe(Math.floor(TILE_SPAN_M / VEHICLE_LENGTH_M));
+    // 生活道路は描き分けられる車線が 1 本、1 車線に 2 台
+    expect(storage).toBe(VEHICLES_PER_LANE);
     for (let k = 0; k < storage; k++) {
       expect(fx.traffic.enter(fx.path, VehicleKind.Car, k, 0)).toBeGreaterThanOrEqual(0);
     }
     // 満杯。ここで入れてしまうと車が重なって描かれる。
     expect(fx.traffic.enter(fx.path, VehicleKind.Car, 99, 0)).toBe(-1);
+  });
+
+  it('リンクの収容は重ならずに描ける台数に等しい', () => {
+    // 車列 1 台の占有長は描画で 6.8m、リンクは 10m。1 車線には停止線に 1 台と
+    // その後ろに 1 台まで並ぶ。溜められる台数はそれ × 描き分けられる車線数。
+    for (const cls of [RoadClass.Street, RoadClass.Avenue, RoadClass.Boulevard]) {
+      const fx = straightRoad(30, 34, cls);
+      expect(fx.traffic.storage[fx.path.edges[0]!]!).toBe(DRAWN_LANES[cls]! * VEHICLES_PER_LANE);
+    }
+    // 1 車線ぶんの車列がリンク長に収まっている
+    const drawnPitch = (TILE_M * VEHICLE_LENGTH_M) / TILE_SPAN_M;
+    expect(drawnPitch * (VEHICLES_PER_LANE - 1)).toBeLessThanOrEqual(TILE_M);
+  });
+
+  it('トラックも 1 台ぶんの場所を占める（重みで数えない）', () => {
+    // トラックが交差点で食う枠は乗用車の車列の 0.22 だが、画面では 1 台ぶんの
+    // 場所を取る。重みで収容を数えると 1 リンクに十数台が載って必ず重なる。
+    const fx = straightRoad(30, 34);
+    const storage = fx.traffic.storage[fx.path.edges[0]!]!;
+    for (let k = 0; k < storage; k++) {
+      expect(fx.traffic.enter(fx.path, VehicleKind.Truck, k, 0)).toBeGreaterThanOrEqual(0);
+    }
+    expect(fx.traffic.enter(fx.path, VehicleKind.Truck, 99, 0)).toBe(-1);
   });
 
   it('追い越しが起きない（出発した順に到着する）', () => {

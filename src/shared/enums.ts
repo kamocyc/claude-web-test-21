@@ -98,6 +98,23 @@ export const ROAD_LANES: Record<number, number> = {
   [RoadClass.Avenue]: 2,
   [RoadClass.Boulevard]: 3,
 };
+/**
+ * **描き分けられる**車線数。収容台数はこちらで決まる。
+ *
+ * 車道の半幅は生活道路 3.1m・大通り 3.7m・幹線 4.3m（`CARRIAGE_HALF`）で、
+ * 車幅は 1.7m。中心線から車 1 台ぶん空けて置くと、片方向に並べられる列は
+ * 生活道路で 1 本、大通りと幹線で 2 本しかない（幹線の 3 本目は歩道に乗る）。
+ *
+ * モデルの車線数（`ROAD_LANES`）どおりに溜め込むと、描画は 1 リンクに
+ * 収まらない台数を渡されて車体をめり込ませるか、はみ出した車を描かずに落とす。
+ * 交差点で捌ける量は `ROAD_LANES` のままなので、道を広げる効果は失われない。
+ */
+export const DRAWN_LANES: Record<number, number> = {
+  [RoadClass.None]: 0,
+  [RoadClass.Street]: 1,
+  [RoadClass.Avenue]: 2,
+  [RoadClass.Boulevard]: 2,
+};
 /** 建設費 (円/タイル) と月次維持費 (円/タイル)。 */
 export const ROAD_BUILD_COST: Record<number, number> = {
   [RoadClass.None]: 0,

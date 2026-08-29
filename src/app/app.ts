@@ -576,8 +576,12 @@ export class App {
       }
 
       // 端数 tick を渡して補間させる。これが無いと車も人も 12 段階/秒で飛ぶ。
-      // 停止中は端数 1 ＝「最後に計算した tick の終わり」＝今の状態を出す。
-      this.renderer.render(this.sim, dt, this.speed > 0 ? this.accumulator : 1);
+      //
+      // 停止中も端数はそのまま渡す。以前は 1（＝最後に計算した tick の終わり）に
+      // 差し替えていたが、止めた瞬間に端数が今の値から 1 へ跳ぶので、
+      // 画面の車と人が最大 1 tick ぶん（車なら 500m 近く）前へワープしていた。
+      // tick を進めなければ端数も動かないので、そのまま渡せば絵が止まる。
+      this.renderer.render(this.sim, dt, this.accumulator);
       this.ui.update(
         this.sim,
         now,
