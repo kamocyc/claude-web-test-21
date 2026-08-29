@@ -201,6 +201,25 @@ const WIRE_LOD_DISTANCE = 190;
  * 距離で太さを細らせるのと同じ効果を、線が消える手前まで連続して掛けられる。
  */
 const WIRE_FADE_DISTANCE = 70;
+/**
+ * 1 径間に張る電線の配置。腕金上の横位置（`ARM_HALF` 比）・段・たるみの倍率。
+ *
+ * `streetProps.ts` の碍子とまったく同じ位置に並べてある。**線の端点が
+ * 碍子に取り付いて見えるかどうか**は、線の太さや色より強く「電線らしさ」を
+ * 決める。上段（高圧）は腕金の左右と中央の 3 本、下段（低圧・引込）は左右の 2 本。
+ * 上段だけを張っていたときは、下段の腕金と碍子が宙に残ったままで、
+ * 腕金が 2 段ある意味が絵に出ていなかった。
+ *
+ * たるみは下段を 1.45 倍にする。同じたるみで平行に張ると、
+ * 遠目に 2 段が 1 本の太い線へ潰れて、太い黒線が 1 本走るだけになる。
+ */
+const WIRE_TIERS = [
+  { off: 0.82, tier: 0, sag: 1.0 },
+  { off: 0.0, tier: 0, sag: 1.0 },
+  { off: -0.82, tier: 0, sag: 1.0 },
+  { off: 0.62, tier: 1, sag: 1.45 },
+  { off: -0.62, tier: 1, sag: 1.45 },
+] as const;
 
 /**
  * 路面標示を 1 本ずつ描くのをやめるカメラ距離 (m)。
@@ -493,11 +512,26 @@ export class RoadLayer {
     // --- 夜の発光。ライトではなく「光って見える面」で作る ---
     // 本物の PointLight を数百個置くと、影響を受けるメッシュごとに
     // ライト数ぶんのシェーダ分岐が走って描画が止まる。
-    this.lampHeadMat = new MeshBasicMaterial({ color: LAMP_WARM, toneMapped: false, transparent: true });
+    // 灯具・自販機の発光面も既定の不透明度 1 では作らない。
+    // 表示フラグ 1 つで昼夜を切り替えていると、そのフラグが 1 フレームでも
+    // 立ちっぱなしになった瞬間に**正午の街に光る面が出る**（07 の指摘）。
+    // 「消えているときは強度も 0」を材質の初期値として持たせておけば、
+    // 表示の掛け違いが起きても絵には出ない。
+    this.lampHeadMat = new MeshBasicMaterial({
+      color: LAMP_WARM,
+      toneMapped: false,
+      transparent: true,
+      opacity: 0,
+    });
     this.materials.push(this.lampHeadMat);
     this.lampHead = this.pool(lampHeadGeometry(), this.lampHeadMat, true, 2048);
 
-    this.vendingGlowMat = new MeshBasicMaterial({ color: 0xfff0d0, toneMapped: false, transparent: true });
+    this.vendingGlowMat = new MeshBasicMaterial({
+      color: 0xfff0d0,
+      toneMapped: false,
+      transparent: true,
+      opacity: 0,
+    });
     this.materials.push(this.vendingGlowMat);
     this.vendingGlow = this.pool(vendingGlowGeometry(), this.vendingGlowMat, false, 512);
 
@@ -832,10 +866,9 @@ export class RoadLayer {
     // 出るという理屈）。だが標示が LOD で消える中距離になると、交差点ごとの
     // 色差だけが残って、街に数百個の斑点が規則正しく並ぶ。
     // 交差点の位置は横断歩道と歩道の切れ目が伝えればよく、舗装の色を
-    // 変える必要は無い。隣接する腕とまったく同じ色にする。
-    this.color.setHex(conn === 0b1111 ? PAVEMENT.junction : base).multiplyScalar(jitter);
-    this.place(this.asphalt, cx, y, cz, half * 2, half * 2, 0, this.color);
+    // 変える必要は無い。腕とまったく同じ色・同じ散らしで敷く。
     this.color.setHex(base).multiplyScalar(jitter);
+    this.place(this.asphalt, cx, y, cz, half * 2, half * 2, 0, this.color);
 
     // 各方向への腕
     const armLen = TILE_M / 2 - half;
@@ -1113,16 +1146,18 @@ export class RoadLayer {
       const dx = b.x - a.x;
       const dz = b.z - a.z;
       const span = Math.hypot(dx, dz);
-      // 電柱の腕金は外向き（±X ローカル）に伸びているので、
-      // 電線もその左右 + 中央の 3 本を張る。
+      // 腕金は径間に直交する向き（外向き ±X ローカル）に伸びているので、
+      // 碍子の並ぶ軸は径間の法線。ここを取り違えると、線は柱の位置を
+      // 通ってはいても腕金の端に取り付かず、「柱の横を素通りする線」になる。
       const px = -dz / (span || 1);
       const pz = dx / (span || 1);
-      for (let w = -1; w <= 1; w++) {
-        const offX = px * w * ARM_HALF * 0.82;
-        const offZ = pz * w * ARM_HALF * 0.82;
-        const y0 = a.y + ARM_Y[0]! + 0.1;
-        const y1 = b.y + ARM_Y[0]! + 0.1;
-        const sag = span * WIRE_SAG;
+      for (const wire of WIRE_TIERS) {
+        const offX = px * wire.off * ARM_HALF;
+        const offZ = pz * wire.off * ARM_HALF;
+        const armY = ARM_Y[wire.tier]! + 0.1;
+        const y0 = a.y + armY;
+        const y1 = b.y + armY;
+        const sag = span * WIRE_SAG * wire.sag;
         this.segA.set(a.x + offX, y0, a.z + offZ);
         for (let seg = 1; seg <= WIRE_SEGMENTS; seg++) {
           const t2 = seg / WIRE_SEGMENTS;

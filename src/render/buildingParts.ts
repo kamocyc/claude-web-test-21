@@ -721,8 +721,10 @@ void parapetShade(vec3 base) {
   // ---- 全種共通の 2 本：天端キャップの見付と、その真下に落ちる影 ----
   // 眼高では「4cm の見切り 1 本」が素材の説得力を決める。
   // これがゼロだと、淡い色の腰壁が発泡スチロールの板に見える。
+  // 影の帯は面取りより下まで伸ばす。箱のキットは天端 11cm が 45 度の
+  // 面取りなので、そこだけに影を置くと丸みの陰影に紛れて線として読めない。
   float capFace = bandAA(dTop, 0.0, 0.05, wy);
-  float capShad = bandAA(dTop, 0.05, 0.115, wy);
+  float capShad = bandAA(dTop, 0.05, 0.15, wy);
   // 下端の水切り。床スラブとの取り合いに必ず影が溜まる。
   float dripS = bandAA(y, 0.0, 0.05, wy);
 
@@ -780,17 +782,33 @@ void parapetShade(vec3 base) {
   t -= dripS * 0.26;                      // 下端の水切り
   // パネルの縦目地。打ち継ぎか、乾式パネルの継ぎ目が必ず 1 本ある。
   // 見えるのは幅 1cm 前後の線 1 本だが、これが無い帯は必ず板に見える。
-  t -= bandAA(fract(ul / panelW), 0.0, 0.014, fwidth(ul / panelW)) * 0.34;
+  //
+  // 溝は「暗い 1 本」ではなく「暗い 1 本＋その脇の明るい 1 本」で描く。
+  // 実物の目地は深さ 1cm ほどの彫り込みで、片側の面には必ず光が回る。
+  // 暗い線だけだと、彫った溝ではなく「線を引いた板」に見えてしまう。
+  float jf = fract(ul / panelW);
+  float jw = fwidth(ul / panelW);
+  float jointW = 0.013 / panelW;              // 1.3cm を割付の比に直す
+  t -= bandAA(jf, 0.0, jointW, jw) * 0.44;
+  t += bandAA(jf, jointW, jointW * 2.4, jw) * 0.17;
+  // 吹付けタイル／打ち放しの肌。5〜8cm の斑が見えるかどうかで、
+  // 眼高では「塗った板」と「打った壁」が分かれる。
+  // ここは画面の 3〜4 割を占める面なので、肌が無いと帯全体が発泡スチロールに見える。
+  // 1 画素より細かくなったら消す（遠景でビデオノイズにしない）。
+  vec2 sp = vec2(ul, y) * 13.0;
+  t *= 1.0 + (vnoise(sp) - 0.5) * 0.11 * detailFade(fwidth(sp.x), 1.2);
   // 笠木から垂れる雨だれ。遠景では必ず消す（近くでしか意味を持たない）。
   float sc = ul * 0.7;
   float streak = smoothstep(0.62, 1.0, h21(vec2(floor(sc), 5.0) + vFacadeV.w * 31.0))
                * sin(fract(sc) * 3.14159)
                * clamp(1.0 - dTop / 0.9, 0.0, 1.0);
-  t -= streak * 0.16 * detailFade(fwidth(sc), 1.6);
+  t -= streak * 0.20 * detailFade(fwidth(sc), 1.6);
   // 足元がわずかに暗い。板ではなく「立ち上がった壁」に見せる最小の勾配。
-  t *= mix(0.90, 1.02, clamp(y / max(H, 0.2), 0.0, 1.0));
+  t *= mix(0.86, 1.04, clamp(y / max(H, 0.2), 0.0, 1.0));
   gTint = vec3(t);
-  gRough = 0.86; gMetal = 0.04;
+  // 天端の 5cm だけはアルミの笠木。粗さと金属度まで切り替えないと、
+  // 明るい線を 1 本引いただけになって、載っている別部材には見えない。
+  gRough = mix(0.86, 0.40, capFace); gMetal = mix(0.04, 0.42, capFace);
 }
 
 void facadeShade(vec3 base) {
@@ -812,6 +830,19 @@ void facadeShade(vec3 base) {
     // 明るいままだと、眼高でどれも「厚みの無い板」に見える。
     // 影マップは薄い板の裏側までは届かないので、ここで 1 行入れておく。
     gTint *= mix(1.0, 0.52, clamp(-n.y, 0.0, 1.0));
+    // 天端の見切りと下端の水切り。実寸 4cm・3cm の線を 2 本だけ入れる。
+    //
+    // 眼高では「4cm の見切り 1 本」が素材の説得力を決める。ここは
+    // バルコニーの床スラブ・庇・屋上のパラペット・笠木がまとめて通る場所で、
+    // どれも小口（＝立ち上がった板の側面）が画面のかなりの面積を占めるのに、
+    // 天端も水切りも無い一様な塗り面だった。レビューの「天端キャップも
+    // 水切りも目地も無い」はここが出所。
+    // 立面にだけ掛ける（上下面に掛けると板の縁が全周光って輪郭が浮く）。
+    float side = 1.0 - step(0.5, ay);
+    float wyP = fwidth(vLocalM.y);
+    gTint *= 1.0 + bandAA(vScaleM.y - vLocalM.y, 0.0, 0.04, wyP) * 0.26 * side;
+    gTint *= 1.0 - bandAA(vScaleM.y - vLocalM.y, 0.04, 0.14, wyP) * 0.22 * side;
+    gTint *= 1.0 - bandAA(vLocalM.y, 0.0, 0.03, wyP) * 0.30 * side;
     return;
   }
 
@@ -847,7 +878,12 @@ void facadeShade(vec3 base) {
     // 遠景では文字が 1 画素を割るので、平均的な濃さへ寄せる（ちらつき防止）
     float fade = smoothstep(45.0, 110.0, vViewDepth);
     float aa = max(fwidth(p.x), fwidth(p.y)) * 0.9 + 0.006;
-    float ink = mix(signGlyphs(p, chars, sd, aa), 0.30, fade) * panel;
+    // 遠景で寄せる先を 0.30 から 0.46 に上げた。0.30 だと白地が 7 割残り、
+    // 街を少し引いて見ただけで袖看板が「白い紙を貼り付けた板」になっていた
+    // （夜と夕方はそこが光るので、白い長方形の列としていちばん目に付く）。
+    // 実際の看板は地の色より文字の色のほうが面積が広いことが多いので、
+    // 引いたときは地色寄りではなく中間へ寄せるほうが近い。
+    float ink = mix(signGlyphs(p, chars, sd, aa), 0.46, fade) * panel;
     // 縁の枠（アルミのフチ）。厚みのある板であることが近景で読める。
     float edge = (1.0 - step(0.055, min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y)))) * panel;
     // 白地＋アクセント 1 色。原色べた塗りをやめると夜も昼も色が濁らない。
@@ -916,7 +952,10 @@ void facadeShade(vec3 base) {
     float yn = clamp(vLocalM.y / rise, 0.0, 1.0);
     float dRidge = (1.0 - yn) * slopeLen;
     float dEave = yn * slopeLen;
-    float pitch = max(abs(vFacadeV.w), 0.15);
+    // 葺き足。寄棟は +10 の下駄を履いて渡ってくる（hip() の注記を参照）。
+    float pRaw = vFacadeV.w;
+    float isHip = step(5.0, pRaw);
+    float pitch = max(abs(pRaw) - isHip * 10.0, 0.15);
     float q = downZ ? vLocalM.x : vLocalM.z;
     // テクスチャ 1 枚に瓦が ROOF_TILES_X 枚 × ROOF_TILES_Y 段ぶん焼いてある。
     // ここで枚数まで割らないと、瓦 1 枚が数センチの砂目になってしまう。
@@ -931,7 +970,7 @@ void facadeShade(vec3 base) {
     float metalRoof = step(0.25, vFacadeV.z);
     // 葺き足に負の値が来たら「屋根ではないもの」（植林の樹冠・東屋）の印。
     // 同じ寄棟のキットを流用しているので、瓦を貼らせないための逃げ道が要る。
-    float noTile = step(vFacadeV.w, 0.0);
+    float noTile = step(pRaw, 0.0);
     float plain = max(max(metalRoof, board), noTile);
 
     vec3 col = vec3(1.0);
@@ -939,11 +978,14 @@ void facadeShade(vec3 base) {
     // この材質は屋根キット専用なので、style の分岐は材質の全画素で真になる。
     // つまりテクスチャの読み出しは一様な制御フローの中にあり、
     // ミップ選択の導関数が壊れる心配が無い（材質を分けた理由の半分はこれ）。
-    // ミップを半段早く落とす。俯瞰では瓦 1 枚が 1〜2 画素しかなく、
+    // ミップを 1/3 段だけ早く落とす。俯瞰では瓦 1 枚が 1〜2 画素しかなく、
     // 素のミップ選択だと瓦の格子と画素の格子が干渉して、
     // 屋根に規則正しい光る点の並び（モアレ）が出る。
-    col = mix(texture2D(uRoofMap, gRoofUV, 0.55).rgb * uRoofGain, vec3(1.0), plain);
-    gRoofN = mix(texture2D(uRoofNrm, gRoofUV, 0.55).xyz * 2.0 - 1.0, vec3(0.0, 0.0, 1.0), plain);
+    // 以前は 0.55 だったが、それだと中距離で瓦がほとんど溶けていた。
+    // 中距離の目地は下の bandAA（葺き足の横線）が受け持つので、
+    // テクスチャ側はもう少し粘らせてよい。
+    col = mix(texture2D(uRoofMap, gRoofUV, 0.35).rgb * uRoofGain, vec3(1.0), plain);
+    gRoofN = mix(texture2D(uRoofNrm, gRoofUV, 0.35).xyz * 2.0 - 1.0, vec3(0.0, 0.0, 1.0), plain);
 #endif
 
     // 折板葺きの山と谷。流れ方向に通る太い縦線で、瓦とは読みが変わる。
@@ -981,16 +1023,74 @@ void facadeShade(vec3 base) {
     // 棟瓦の下端に落ちる影。この 1 本があって初めて棟が「線」ではなく
     // 「盛り上がり」になる。
     float ridgeSh = (1.0 - smoothstep(capW * 1.4 - aaR, capW * 1.9 + aaR, dRidge)) * (1.0 - ridge);
-    // 軒先。最下段の瓦の鼻と、その下に回る唐草の陰。
+    // 軒先。最下段の瓦の鼻（明るい）と、その一段上に溜まる陰（暗い）。
+    // 以前は暗い 1 本しか置いていなかったので、屋根の下端がただ暗くなるだけで
+    // 「軒」として読めず、俯瞰では隣の屋根との境が消えていた。
     float aaE = max(fwidth(dEave), pitch * 0.2);
-    float eave = 1.0 - smoothstep(pitch * 0.55 - aaE, pitch * 0.55 + aaE, dEave);
+    float eaveNose = 1.0 - smoothstep(pitch * 0.34 - aaE, pitch * 0.34 + aaE, dEave);
+    float eave = (1.0 - smoothstep(pitch * 0.9 - aaE, pitch * 1.25 + aaE, dEave)) * (1.0 - eaveNose);
     float solid = (1.0 - board) * (1.0 - noTile);
+
+    // ---- 妻側の端（ケラバ）／隅棟 ----
+    //
+    // 俯瞰で屋根が「色紙を折った模型」に見える最大の理由は、瓦の目地よりも
+    // **面の輪郭が無いこと**にある。隣り合う屋根の色が近いと、境が消えて
+    // 一枚の色面に溶けてしまう。屋根の 4 辺のうち、棟と軒には線を入れて
+    // あったが、流れの左右（切妻ならケラバ、寄棟なら隅棟）が素通しだった。
+    //
+    // 流れの面がどこで終わるかは、切妻なら一定（矩形）、寄棟なら上へ行くほど
+    // 狭まる（台形／三角形）。寄棟かどうかは葺き足の下駄で分かる。
+    float qEdge1 = mix(0.56, downZ ? 0.22 : 0.0, isHip);
+    float qHalf = mix(mix(0.56, 0.58, isHip), qEdge1, yn)
+                * max(downZ ? vScaleM.x : vScaleM.z, 0.2);
+    float dVerge = max(qHalf - abs(q), 0.0);
+    // 隅棟もケラバも、平部より一段高い別部材が載る。だから
+    // 「明るい細い線 ＋ そのすぐ内側の影」の対で描くのは棟とまったく同じ。
+    float capV = pitch * 0.6;
+    float aaV = max(fwidth(dVerge), capV * 0.3);
+    float verge = 1.0 - smoothstep(capV - aaV, capV + aaV, dVerge);
+    float vergeSh = (1.0 - smoothstep(capV * 1.5 - aaV, capV * 2.2 + aaV, dVerge)) * (1.0 - verge);
+
+    // ---- 経年のむら（苔・退色・煤）----
+    //
+    // 瓦 1 枚（0.3m）の目地は、俯瞰では 1〜2 画素しか無くミップで消える。
+    // 俯瞰で屋根に情報を残せるのは 1〜3m の粗いむらだけで、実際の屋根も
+    // その大きさで苔・退色・雨筋の斑を持っている。ここを入れないと、
+    // どれだけ瓦を描き込んでも引いた瞬間に単色へ戻る。
+    // 種は寸法から引く。屋根には棟ハッシュが渡っていないが、
+    // 幅・高さ・奥行きは棟ごとに散らしてあるので、これで十分ばらける。
+    // 粗さの違う 2 段を別々に距離で消す。細かいほうは街区のカット
+    //（1 画素 0.2m 前後）で効き、粗いほうは俯瞰（1 画素 1.5m）でも残る。
+    // 1 つの周期だけだと、必ずどちらかの距離で情報がゼロに戻る。
+    vec2 wseed = vec2(vScaleM.x * 7.31 + vScaleM.y * 2.13, vScaleM.z * 13.7 + vScaleM.y * 5.91);
+    vec2 wp = vec2(q, dRidge) * 0.55 + wseed;
+    float wRate = fwidth(wp.x);
+    float weather = (vnoise(wp) - 0.5) * 0.62 * detailFade(wRate, 1.0)
+                  + (vnoise(wp * 0.28) - 0.5) * 0.52 * detailFade(wRate * 0.28, 1.0);
+    // 棟の近くは乾き、軒に近いほど水が溜まって苔と汚れが濃くなる。
+    // 一様な斑より、流れ方向に偏りがあるほうが「勾配のある面」に見える。
+    col *= 1.0 + weather * 0.30 * mix(1.25, 0.75, yn) * solid;
+
+    // 葺き足の横線を、テクスチャとは別にシェーダでも 1 本引く。
+    //
+    // テクスチャの目地はミップで平均されるので、瓦 1 枚が 1〜2 画素になる
+    // 中距離（街区のカット）でちょうど消えてしまう。俯瞰でも眼高でもなく
+    // **その間の距離**で屋根が単色に落ちるのは、これが原因だった。
+    // bandAA は 1 画素を割ると 0 ではなく「被覆率」へ収束するので、
+    // 消えても濁らずに残り、ちらつきもしない。位相はテクスチャと揃えてある
+    //（どちらも dRidge / pitch を刻む）ので、線が二重にはならない。
+    float cf = dRidge / pitch;
+    col *= 1.0 - bandAA(fract(cf), 0.0, 0.09, fwidth(cf)) * 0.13 * solid * (1.0 - metalRoof);
+
     // 棟瓦は平部と同じ材だが、丸い断面が光を拾うぶん必ず明るく見える。
     // 明るい 1 本と、その真下の暗い 1 本を対で置かないと、
     // 遠景で棟が消えて「二等辺三角形の色板」に戻ってしまう。
-    col *= 1.0 + ridge * 0.16 * solid;
-    col *= 1.0 - ridgeSh * 0.34 * solid;
-    col *= 1.0 - eave * 0.18 * solid;
+    col *= 1.0 + ridge * 0.18 * solid;
+    col *= 1.0 - ridgeSh * 0.36 * solid;
+    col *= 1.0 + eaveNose * 0.15 * solid;
+    col *= 1.0 - eave * 0.24 * solid;
+    col *= 1.0 + verge * 0.13 * solid;
+    col *= 1.0 - vergeSh * 0.20 * solid;
     // 鼻隠し・破風は少し暗く、軒天（下を向く面）はさらに暗い。
     // ここが明るいと、下から見上げた屋根が紙のように見える。
     col *= mix(1.0, mix(0.70, 0.42, step(n.y, -0.3)), board);
@@ -1002,6 +1102,12 @@ void facadeShade(vec3 base) {
     gRoofN.y = mix(gRoofN.y, -0.72, ridge * solid);
     gRoofN.y = mix(gRoofN.y, 0.42, ridgeSh * solid);
     gRoofN.y = mix(gRoofN.y, 0.38, eave * 0.7 * solid);
+    // ケラバ・隅棟も法線で折る。明暗を塗るだけだと、日陰に入った屋根で
+    // 線が消えて元の色板に戻ってしまう（棟でまったく同じことが起きていた）。
+    // 左右の端で逆向きに倒すので、どちらか一方は必ず日を受ける。
+    float qs = q > 0.0 ? 1.0 : -1.0;
+    gRoofN.x = mix(gRoofN.x, qs * 0.55, verge * solid);
+    gRoofN.x = mix(gRoofN.x, -qs * 0.30, vergeSh * solid);
     return;
   }
 
@@ -1856,10 +1962,16 @@ function gableGeometry(overX = 0.06, overZ = 0.1, thick = 0.12): BufferGeometry 
     [-ez, -thick],
   ];
   const at = (x: number, i: number): [number, number, number] => [x, sec[i]![1]!, sec[i]![0]!];
-  // 側面（6 本の稜線に沿った帯）
+  // 側面（6 本の稜線に沿った帯）。
+  //
+  // 断面の 6 点は (z, y) 平面を時計回りに並べてあるので、押し出す向きを
+  // -x → +x にすると全部の面が裏返る。これまで屋根として見えていたのは
+  // 流れの面ではなく**その裏の軒天**（thick ぶん下、法線がたまたま
+  // 上を向いている）で、本物の流れ・鼻隠しはカリングで消えていた。
+  // そのせいで軒先に木口の線が出ず、棟の位置も thick ぶんずれていた。
   for (let i = 0; i < 6; i++) {
     const j = (i + 1) % 6;
-    quad(at(-ex, i), at(ex, i), at(ex, j), at(-ex, j));
+    quad(at(ex, i), at(-ex, i), at(-ex, j), at(ex, j));
   }
   // 妻側の面（六角形を 2 つの四角形に割る）
   quad(at(-ex, 0), at(-ex, 5), at(-ex, 4), at(-ex, 1));
@@ -1880,8 +1992,13 @@ function hipGeometry(over = 0.08, thick = 0.1): BufferGeometry {
   const e = 0.5 + over;
   const rx = 0.22; // 棟の半長
   const tris: number[] = [];
+  // 三角形の向きを 1 か所で裏返す。
+  //
+  // 元の並びは全 16 面が内向きで、寄棟は表からだと全面がカリングされていた
+  // （＝屋根がまったく描かれず、下の軒天の板だけが見えていた）。
+  // 頂点を書き並べた側ではなく、ここで 1 度だけ入れ替える。
   const tri = (a: number[], b: number[], c: number[]): void => {
-    tris.push(...a, ...b, ...c);
+    tris.push(...a, ...c, ...b);
   };
   const quad = (a: number[], b: number[], c: number[], d: number[]): void => {
     tri(a, b, c);
@@ -2564,7 +2681,17 @@ export class BuildingParts {
     this.put('gable', x, y, z, w, h, d, rotY, 0, color, Facade.Roof, rough, metal, pitch);
   }
 
-  /** 寄棟屋根。 */
+  /**
+   * 寄棟屋根。
+   *
+   * 葺き足に +10 の下駄を履かせて「これは寄棟だ」を埋めておく。
+   * 隅棟（棟の端から四隅へ下りる 4 本の斜めの稜線）は、面がどこで
+   * 終わるかを知らないと描けない。切妻の流れは矩形だが、寄棟の流れは
+   * 上へ行くほど狭まる台形なので、同じ式では端の位置が出ない。
+   * 属性を 1 つ増やすとインスタンスの帯域が 1 棟あたり 4 バイト増えるので、
+   * 立面の階高と同じ手口で数値の側に押し込む。
+   * 負の値は「屋根ではないもの」（樹冠・東屋）の印なので、下駄は正のときだけ。
+   */
   hip(
     x: number,
     y: number,
@@ -2578,7 +2705,8 @@ export class BuildingParts {
     rough = 0.72,
     metal = 0.06,
   ): void {
-    this.put('hip', x, y, z, w, h, d, rotY, 0, color, Facade.Roof, rough, metal, pitch);
+    const p = pitch > 0 ? pitch + 10 : pitch;
+    this.put('hip', x, y, z, w, h, d, rotY, 0, color, Facade.Roof, rough, metal, p);
   }
 
   /** 屋上の受水槽。ステンレス・FRP・塗装鋼板で光り方が違う。 */

@@ -33,9 +33,22 @@ import {
 
 /** 板の分割数。8 角形だと縁の直線が見えるので 10 にしてある。 */
 const SEGMENTS = 10;
-/** 内側リングの半径と、そこでの濃さ。中心 1.0 → 内側 → 外周 0.0。 */
-const INNER_R = 0.56;
-const INNER_A = 0.6;
+/**
+ * 芯（濃さを落とさない平らな部分）の半径。外周は 1.0。
+ *
+ * **ここが「影を敷いたのに 1 枚も見えない」の急所だった。** 以前は
+ * 中心だけが濃く、半径 0.28 から外周へ向かってなだらかに 0 へ落ちていた。
+ * ところが影が路面に見えるのは**物の輪郭より外に出た部分だけ**である。
+ * 人なら肩幅 42cm、車なら車体幅そのものが真下を隠すので、
+ * 濃い中心はすべて体の下に隠れ、外へ出るのは「もう薄れ切った縁」しかない。
+ * 実際、0.9m の板を敷いても路面に出るのは濃さ 0.1 前後の霞だけで、
+ * 撮った絵ではまったく読めなかった（＝人も車も浮いたまま）。
+ *
+ * 芯を 0.62 まで広げて**平らに**すると、体の輪郭の外側にも濃さ 1.0 の帯が
+ * 残る。接地影は「柔らかいぼかし」ではなく「はっきり暗い接地面」でよく、
+ * ぼかしは最後の 4 割で足りる。
+ */
+const CORE_R = 0.62;
 
 /**
  * 単位の楕円板。半径 0.5 の円なので、インスタンス行列の x/z スケールに
@@ -64,27 +77,19 @@ function shadowGeometry(): BufferGeometry {
   // ではなく巻き方向で決まるので、裏向きに積んだ面は既定の `FrontSide` では
   // 背面カリングで 1 枚残らず消える（行列は書いているのに画面に出ない）。
   //
-  // 前回ここを直したとき、**中心の扇だけ**を直して外周のリングを直し忘れた。
-  // その結果、残っていたのは半径 0.28 のハードエッジの円板だけで、
-  //
-  //   - 車 … 円板が車体幅の半分ほどあるので、車体の外へ出て影として読めた
-  //   - 人 … 円板の差し渡しが 15cm しかなく、**靴と胴の真下に完全に隠れた**
-  //
-  // ということが起きていた。「車には付いたが人には 1 枚も無い」の正体はこれで、
-  // 板を大きくするだけでは直らない（ぼかしのリングごと消えているため）。
   // リングは (内 k → 外 k → 外 k+1) と (内 k → 外 k+1 → 内 k+1) が表向き。
   for (let k = 0; k < SEGMENTS; k++) {
-    // 中心 → 内側リング
+    // 中心 → 芯の縁。ここまでは濃さ 1.0 の平らな面。
     center();
-    push(INNER_R, INNER_A, k + 1);
-    push(INNER_R, INNER_A, k);
-    // 内側リング → 外周（外周のアルファ 0 でぼかす）
-    push(INNER_R, INNER_A, k);
+    push(CORE_R, 1, k + 1);
+    push(CORE_R, 1, k);
+    // 芯 → 外周（外周のアルファ 0 でぼかす）
+    push(CORE_R, 1, k);
     push(1, 0, k);
     push(1, 0, k + 1);
-    push(INNER_R, INNER_A, k);
+    push(CORE_R, 1, k);
     push(1, 0, k + 1);
-    push(INNER_R, INNER_A, k + 1);
+    push(CORE_R, 1, k + 1);
   }
   const g = new BufferGeometry();
   g.setAttribute('position', new BufferAttribute(new Float32Array(pos), 3));
@@ -123,6 +128,15 @@ export class GroundShadows {
       toneMapped: false,
       opacity: 0.5,
     });
+    // **深度を手前へ押し出す。** 路面のアスファルトは
+    // `roadLayer` 側で polygonOffset(-3, -3) を掛けてあり、目線の高さ（仰角 6 度）
+    // では路面の三角形が視線に対してほぼ平行になるので、傾き項が効いて
+    // 実寸で 7cm 以上も手前へ来る。板を 2cm 持ち上げた程度ではまったく足りず、
+    // **車の接地影が路面に 1 画素も出ない**（歩道の上の人だけ影が出て、
+    // 車道の車には出なかったのはこれが理由）。同じ手で押し返す。
+    this.material.polygonOffset = true;
+    this.material.polygonOffsetFactor = -6;
+    this.material.polygonOffsetUnits = -6;
     this.material.onBeforeCompile = (shader) => {
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <color_fragment>',

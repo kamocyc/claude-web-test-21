@@ -54,6 +54,7 @@ import { agentSurface, type AgentSurface } from './agentMaterial';
 import { GroundShadows } from './groundShadow';
 import {
   LIMB_PIVOT_Y,
+  PED_HEIGHT,
   PED_SHOULDER_M,
   bodyGeometry,
   limbGeometry,
@@ -94,7 +95,7 @@ import {
   truckLampGeometry,
   type ConeSpec,
 } from './vehicleParts';
-import { atmosphereAt } from './sky';
+import { atmosphereAt, sunDirection } from './sky';
 
 /**
  * レール面の高さ (m)。線路レイヤが敷くバラスト・枕木・レールの厚みの合計。
@@ -228,8 +229,12 @@ const MIN_HEADWAY_RATIO = 0.34;
  *
  * 1.3m でも足りなかった。消失点方向に並ぶ列では車間が遠近で潰れるので、
  * 実距離で 2m 近く空いていないと「隙間ゼロの数珠つなぎ」に見える。
+ *
+ * 2.0m でもまだ足りない。目線の高さ（仰角 6 度）で車列を真後ろから見ると、
+ * 車間 2m は路面に射影して 20cm ぶんの帯にしかならず、前の車のルーフに
+ * 次の車の鼻が接して見える。撮った絵で数えると 25m 先で 4 台が繋がっていた。
  */
-const MIN_HEADWAY_M = 2.0;
+const MIN_HEADWAY_M = 2.6;
 
 /**
  * 車間を空けるために 1 台を後ろへ下げてよい最大量 (m)。
@@ -266,15 +271,19 @@ const SIZE_JITTER_Y = 0.05;
 const PARK_YAW_JITTER = 0.052;
 const DRIVE_YAW_JITTER = 0.02;
 /**
- * 走行中の車の、車線内での左右の揺らぎ (m)。±0.22m。
+ * 走行中の車の、車線内での左右の揺らぎ (m)。±0.36m。
  *
  * 車間を空けても、**全車が同じ横位置に並んでいる**と、消失点方向に見た車列は
  * 1 本の押し出し形状に潰れて「隙間ゼロの数珠つなぎ」に見えたままだった。
  * 実際の車は車線の中でこのくらい左右にばらついていて、そのばらつきこそが
  * 前の車の輪郭を後ろの車から切り離している。向きの揺らぎ（±0.6°）だけでは
  * 車体 4m ぶんで 4cm しか動かず、この役には立たない。
+ *
+ * ±0.22m では車幅 1.7m に対して 1/4 も動かず、目線の高さでは列の輪郭が
+ * まだ 1 本に繋がっていた。車線の実効幅（3m）と車幅の差は 1.3m あるので、
+ * ±0.36m はまだ車線の内側に収まる。
  */
-const DRIVE_LATERAL_JITTER = 0.44;
+const DRIVE_LATERAL_JITTER = 0.72;
 
 /** 路肩の枠のうち、はじめから空けておく割合 (%)。理由は `tryShoulder` の注記に。 */
 const EMPTY_SLOT_PCT = 27;
@@ -289,6 +298,19 @@ const EMPTY_SLOT_PCT = 27;
 const SHADOW_DISTANCE_M = 260;
 const SHADOW_FADE_FROM = 0.6;
 const MAX_SHADOWS = 2600;
+
+/**
+ * 人の接地影の差し渡し (m) と、太陽と反対へ倒す長さの上限 (m)。
+ *
+ * 幅は肩幅（0.42m）の 2.6 倍。板の芯は半径の 62% まで濃さが落ちないので、
+ * 濃い部分の差し渡しは 0.68m ＝ **体の輪郭より 13cm 外まで濃い**。
+ * 影が路面に見えるのは輪郭の外に出た部分だけなので、この 13cm が
+ * 「足が地面に付いている」を作る全部である。逆にここが 0 だと、
+ * どれだけ濃く敷いても絵には 1 枚も出ない。
+ */
+const PED_SHADOW_W = PED_SHOULDER_M * 2.6;
+const PED_SHADOW_L = PED_SHOULDER_M * 2.76;
+const PED_SHADOW_STRETCH_M = 1.2;
 
 /**
  * 接地影と光の円錐を描くカメラ距離 (m)。
@@ -446,9 +468,13 @@ export class AgentLayer {
    * 板のジオメトリは 1 つを使い回し、色だけ `instanceColor` で変える。
    */
   private readonly beamWhite = new Color(1, 1, 1);
-  private readonly beamRed = new Color(0.8, 0.11, 0.07);
-  /** 停車中の光溜まり。走行中の半分の濃さにして、路肩が光の帯にならないようにする。 */
-  private readonly beamIdle = new Color(0.5, 0.5, 0.5);
+  private readonly beamRed = new Color(0.55, 0.08, 0.05);
+  /**
+   * 停車中の光溜まり。走行中の 1/3 の濃さにして、路肩が光の帯にならないようにする。
+   * 走行中の板を明るくした（`beamMaterial.opacity`）ぶん、こちらは 0.5 → 0.33 に
+   * 下げて、路肩に並ぶ車の光が互いに繋がらないようにしてある。
+   */
+  private readonly beamIdle = new Color(0.33, 0.33, 0.33);
 
   /** 接地影。車も人もここに 1 枚ずつ置く（1 ドローコール）。 */
   private readonly shadows = new GroundShadows(MAX_SHADOWS);
@@ -478,6 +504,20 @@ export class AgentLayer {
   /** 接地影を描く距離のしきい値（2 乗）。 */
   private shadowNear2 = 0;
   private shadowFar2 = 0;
+  /**
+   * 人の接地影が伸びる向き（＝太陽と反対の水平方向）と、その伸び (m)。
+   *
+   * 人の影だけ真円ではなく太陽の反対へ倒す。人は幅 42cm しかないので、
+   * 影マップの normalBias（0.5m 前後）に丸ごと食われて**一切影を落とさない**。
+   * 車（全長 4m）と違い、そこは接地影の板で肩代わりするしかない。
+   * 真下に円を敷くだけだと仰角 6 度の目線では靴の陰に隠れて読めないので、
+   * 横へずらして初めて路面に出る。
+   */
+  private shadowDirX = 0;
+  private shadowDirZ = 1;
+  private shadowHeading = 0;
+  private shadowStretch = 0;
+  private readonly sunTmp = new Vector3();
 
   /** 線路の折れ線。グラフが作り直されたときだけ再計算する。 */
   private railLines: RailLine[] = [];
@@ -635,6 +675,18 @@ export class AgentLayer {
       toneMapped: false,
       opacity: 0,
     });
+    // **前照灯の光が路面に出なかった本当の原因はここ。**
+    //
+    // 路面のアスファルトには `roadLayer` 側で polygonOffset(-3, -3) が掛かっている。
+    // 目線の高さ（仰角 6 度）では路面の三角形が視線とほぼ平行になるため、
+    // オフセットの傾き項が大きく効いて、アスファルトが実寸で 7cm 以上
+    // 手前へせり出す。光の板は路面の 5cm 上に置いてあったので、
+    // **深度試験でアスファルトに負けて 1 画素も描かれていなかった**。
+    // 板を持ち上げても（傾き項は距離とともに増えるので）追いつかない。
+    // 街灯の光溜まりが -8 で描けているのと同じ手で、こちらも押し返す。
+    this.beamMaterial.polygonOffset = true;
+    this.beamMaterial.polygonOffsetFactor = -10;
+    this.beamMaterial.polygonOffsetUnits = -10;
     this.materials.push(this.beamMaterial);
     this.beams = new InstancedMesh(beamGeometry(), this.beamMaterial, MAX_VISIBLE_VEHICLES);
     this.beams.count = 0;
@@ -742,7 +794,12 @@ export class AgentLayer {
     for (const m of this.lampMaterials) m.color.setScalar(0.28 + lit * 1.36);
     // 路面の光と空中の円錐は「夜の深さ」側。夕方の明るい路面に光溜まりが
     // 乗ると、点いていない街灯の下まで濡れたように光ってしまう。
-    this.beamMaterial.opacity = on * 0.34;
+    //
+    // 0.34 → 0.52。加算合成の板は焼いた頂点カラー（山の頂点で 0.72）に
+    // これが掛かるので、0.34 では路面に足される量が 0.25 にしかならない。
+    // 街灯の光溜まりだけで既に同じくらい明るいので、前照灯が「路面を照らして
+    // いる」とは読めず、車の前が薄ぼんやり明るいだけになっていた。
+    this.beamMaterial.opacity = on * 0.52;
     this.coneMaterial.opacity = on * 0.1;
     // 夜の車体・人が真っ黒なシルエットに潰れるのを、街灯を拾っている想定の
     // 弱い自発光で戻す。灯りの点灯と同じカーブに乗せて、夕方に段が出ないようにする。
@@ -766,7 +823,26 @@ export class AgentLayer {
 
     // 接地影は日向でいちばん濃い。夜は街灯の拡散光しかないので薄くする
     // （ただし 0 にはしない。夜でも足元は必ず暗い）。
-    this.shadows.setOpacity(0.5 - on * 0.26);
+    //
+    // 昼の値を 0.5 → 0.62 に上げた。板の芯を平らにして体の外へ出るように
+    // した（`groundShadow.CORE_R`）ので、ここで初めて濃さが絵に効く。
+    // 以前は濃い部分がまるごと体の下に隠れていたため、いくら上げても
+    // 「薄い霞が少しだけ濃くなる」だけで浮きは直らなかった。
+    this.shadows.setOpacity(0.62 - on * 0.34);
+
+    // 人の影を倒す向きと長さ。太陽（夜は月）の反対側へ、身長 ÷ tan(仰角) だけ。
+    const sun = sunDirection(dayFraction, this.sunTmp);
+    const horiz = Math.max(1e-4, Math.hypot(sun.x, sun.z));
+    this.shadowDirX = -sun.x / horiz;
+    this.shadowDirZ = -sun.z / horiz;
+    // 板の +Z を影の向きに合わせる（Y 回転は +Z を (sin h, cos h) へ送る）。
+    this.shadowHeading = Math.atan2(this.shadowDirX, this.shadowDirZ);
+    // 太陽が低いほど影は伸びるが、伸ばし切ると日没前に 10m の帯になる。
+    // しかも路上の人は建物の陰に入っていることが多く、そこへ長い黒帯を
+    // 落とすと「地面に貼った棒」に見える。1.2m で頭打ちにして、
+    // 「足元から一方向へはみ出す」ぶんだけに留める。
+    const tan = sun.y / horiz;
+    this.shadowStretch = Math.min(PED_SHADOW_STRETCH_M, PED_HEIGHT / Math.max(0.6, tan));
   }
 
   /**
@@ -1014,19 +1090,23 @@ export class AgentLayer {
     // 足元の接地影。人が浮いて見えるのは、影マップの解像度と normalBias で
     // 必ず抜ける「足元の数十 cm」が空いているせい。
     //
-    // 大きさが命。前は肩幅 ×1.3（＝差し渡し 55cm）しか敷いていなかったが、
-    // 人の胴と靴もちょうどそのくらいの幅がある。**板が体の真下に完全に
-    // 隠れてしまい、1 枚も置いていないのと同じ絵になっていた**
-    //（車の影が効いて人の影が効かなかったのはこの一点の違い）。
-    // 外周のアルファは 0 まで落ちるので、靴の外へ十分はみ出す大きさに取って
-    // 初めて「足元が路面に付いている」と読める。強さも車と揃える。
+    // 前回はここを「板を大きくする」方向で直そうとして失敗した。板の濃さが
+    // 中心から外へなだらかに 0 へ落ちる作りだったので、大きくすればするほど
+    // **体の外に出るのは薄れ切った縁だけ**になり、絵の上では 1 枚も無いのと
+    // 同じままだった。今回は板の側で芯を平らにしてある（`groundShadow`）。
+    //
+    // そのうえで、**向きを人の向きではなく太陽の反対へ取り、その方向へずらす**。
+    // 人は幅 42cm しかなく、影マップの normalBias（0.5m 前後）に丸ごと
+    // 食われて一切影を落とさない。真下の円だけでは仰角 6 度の目線から
+    // 靴の陰に隠れてしまうので、一方向へはみ出させて初めて路面に出る。
+    const half = this.shadowStretch * 0.5 * sxz;
     this.shadows.add(
-      x,
+      x + this.shadowDirX * half,
       y + 0.02,
-      z,
-      heading,
-      PED_SHOULDER_M * 2.15 * sxz,
-      PED_SHOULDER_M * 2.5 * sxz,
+      z + this.shadowDirZ * half,
+      this.shadowHeading,
+      PED_SHADOW_W * sxz,
+      PED_SHADOW_L * sxz + this.shadowStretch * sxz,
       this.shadowStrength(d2),
     );
 
@@ -1128,7 +1208,13 @@ export class AgentLayer {
 
   /**
    * 車体 1 台ぶんの接地影。`this.pos` に車体の位置が入っている状態で呼ぶ。
-   * 幅は車体幅の 1.1 倍、長さは全長の 1.05 倍。
+   *
+   * 幅を 1.1 → 1.38 倍に広げてある。板の濃い芯は半径の 62% までなので、
+   * 1.1 倍だと芯が車体幅の 68% にしかならず、**濃い部分がまるごと車体の下に
+   * 隠れて路面に 1 画素も出ない**（目線の高さで車が浮いて見えた正体）。
+   * 1.38 倍なら車体の輪郭のところでまだ濃さ 0.9 が残り、そこから 40cm ほど
+   * かけて 0 へ抜ける。長さは車輪の間から覗く路面が濃くなればよいので、
+   * 車体の外へ出す必要はない（1.10 倍に留める）。
    */
   private addVehicleShadow(heading: number, width: number, length: number, d2: number): void {
     this.shadows.add(
@@ -1136,8 +1222,8 @@ export class AgentLayer {
       this.pos.y + 0.02,
       this.pos.z,
       heading,
-      width * 1.1 * this.jitterW,
-      length * 1.05 * this.jitterL,
+      width * 1.38 * this.jitterW,
+      length * 1.1 * this.jitterL,
       this.shadowStrength(d2),
     );
   }
@@ -1565,8 +1651,10 @@ export class AgentLayer {
             this.pos.y - 0.12,
             this.railPose.z,
             this.railPose.heading,
-            TRAIN_WIDTH_M,
-            TRAIN_CAR_LENGTH_M * 0.92,
+            // 車と同じ理由で車体幅より広く取る（`addVehicleShadow` の注記）。
+            // 等倍だと濃い芯が車体の下に隠れ、道床には何も出ない。
+            TRAIN_WIDTH_M * 1.3,
+            TRAIN_CAR_LENGTH_M * 0.96,
             this.shadowStrength(dx * dx + dz * dz),
           );
           this.addLamps(fleet, MAX_VISIBLE_TRAIN_CARS);

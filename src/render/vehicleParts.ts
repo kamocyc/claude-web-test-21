@@ -728,12 +728,20 @@ export function beamGeometry(): BufferGeometry {
   const NX = 5;
   const c = new Color(BEAM);
   // 手前で立ち上がり、遠くへ緩やかに落ちる。実際の配光に近い山形。
+  //
+  // 立ち上がりを 0.18 → 0.10 に詰めた。前照灯の光は**バンパーのすぐ先**から
+  // 路面に乗るもので、そこが暗いままだと車と光溜まりが切り離されて、
+  // 「車の前方 3m から急に道が明るくなる」不自然な絵になる。
   const alongFall = (t: number): number =>
-    Math.min(1, t / 0.18) * Math.pow(1 - Math.min(1, t), 1.6);
+    Math.min(1, t / 0.1) * Math.pow(1 - Math.min(1, t), 1.6);
   // 左右は端で 0 に。
   const sideFall = (u: number): number => Math.pow(Math.max(0, 1 - Math.abs(u) * 2), 1.3);
   // 遠いほど広がる。
-  const halfWidth = (t: number): number => 0.2 + t * 0.3;
+  //
+  // 根元を 0.2 → 0.28 に太らせた。5 分割の格子で左右が 0 まで落ちるので、
+  // 実際に光って見える幅は指定の半分ほどしかない。夜のカットで前照灯の光が
+  // 「細い一本の帯」にしか見えなかったのはこれが効いていた。
+  const halfWidth = (t: number): number => 0.28 + t * 0.32;
 
   const pos: number[] = [];
   const col: number[] = [];
@@ -764,7 +772,9 @@ export function beamGeometry(): BufferGeometry {
 /** 車種ごとの光の板の置き方（前端の z・幅・届く距離）。 */
 export function carBeamSpec(kind: CarKind): { z: number; width: number; length: number; y: number } {
   const s = CAR_SPECS[kind];
-  return { z: s.length / 2 + 0.6, width: s.width * 3.4, length: 14, y: 0.03 };
+  // 板の始まりを前端の 0.6m 先から 0.15m 先へ寄せる。離すと、車の真ん前だけが
+  // 暗いまま残って「車と光が繋がっていない」絵になる。
+  return { z: s.length / 2 + 0.15, width: s.width * 4.2, length: 13, y: 0.03 };
 }
 
 /**
@@ -862,7 +872,7 @@ export function busLampGeometry(): BufferGeometry {
 }
 
 export function busBeamSpec(): { z: number; width: number; length: number; y: number } {
-  return { z: BUS_LEN / 2 + 0.8, width: BUS_W * 3.0, length: 15, y: 0.03 };
+  return { z: BUS_LEN / 2 + 0.2, width: BUS_W * 3.6, length: 14, y: 0.03 };
 }
 
 // ---- トラック --------------------------------------------------------------
@@ -938,7 +948,7 @@ export function truckLampGeometry(): BufferGeometry {
 }
 
 export function truckBeamSpec(): { z: number; width: number; length: number; y: number } {
-  return { z: TRUCK_LEN / 2 + 0.8, width: TRUCK_W * 3.0, length: 15, y: 0.03 };
+  return { z: TRUCK_LEN / 2 + 0.2, width: TRUCK_W * 3.6, length: 14, y: 0.03 };
 }
 
 // ---- 電車 ------------------------------------------------------------------
