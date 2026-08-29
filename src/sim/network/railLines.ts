@@ -32,8 +32,23 @@ const RAIL_MS = (RAIL_SPEED_KMH * 1000) / 3600;
  * 車両の寸法は描画単位で決まっているので、線路上に並べるために実距離へ直す。
  */
 export const TRAIN_CAR_PITCH_M = (TRAIN_CAR_LENGTH_M + TRAIN_CAR_GAP_M) * SIM_PER_RENDER;
-/** 1 編成の全長（実距離 m）。これより短い線には電車を走らせない。 */
+/**
+ * 連結面間の距離を**描画単位**で見たもの。
+ *
+ * 連結が保たれるかどうかは、線路に沿って測った距離ではなく画面上の直線距離で
+ * 決まる。カーブでは弦が弧より短いので、線路上の距離を等間隔にすると車体どうしが
+ * 近づきすぎて食い込む（実測で 19m の車体が 4.6m めり込んだ）。
+ */
+const CAR_PITCH_DRAW = TRAIN_CAR_LENGTH_M + TRAIN_CAR_GAP_M;
+/** 1 編成の全長（実距離 m）。 */
 export const TRAIN_LENGTH_M = TRAIN_CARS * TRAIN_CAR_PITCH_M;
+/**
+ * 編成が線路上で食う距離。**弦**を一定に保つので、カーブでは同じ編成でも
+ * 線路上ではより長い距離を占める。90 度の角が連結面間のちょうど真ん中に来ると、
+ * 弦 1 本ぶんに線路 1.42 本ぶんが要る。編成が線からはみ出すと端で連結が
+ * 詰まるので、その最悪値を丸めて確保しておく。
+ */
+const CONSIST_PATH_M = TRAIN_LENGTH_M * 1.45;
 
 export interface RailLine {
   /** 連続した線路ノード列。 */
@@ -56,9 +71,15 @@ export interface RailPose {
   heading: number;
 }
 
-/** 編成の先頭位置。 */
+/** 編成の位置。 */
 export interface TrainHead {
-  /** 起点からの距離 (m)。 */
+  /**
+   * 編成の**起点側の端**（起点に一番近い連結点）の、起点からの距離 (m)。
+   *
+   * 「先頭車の位置」にすると、折り返した瞬間に先頭が編成の反対の端へ飛ぶ。
+   * 位置は進行方向に依らない量で持ち、向きは forward だけで表す。こうすると
+   * 折り返しで入れ替わるのは「どちらが先頭車か」だけになり、車両は動かない。
+   */
   distM: number;
   /** 起点 → 終点の向きに走っているか。 */
   forward: boolean;
@@ -213,9 +234,9 @@ export function railPoseAt(graph: Graph, line: RailLine, distM: number, forward:
   return true;
 }
 
-/** 片道で先頭が動ける距離 (m)。編成が線からはみ出さないぶんだけ短い。 */
+/** 片道で編成が動ける距離 (m)。編成が線からはみ出さないぶんだけ短い。 */
 function travelSpanM(line: RailLine): number {
-  return Math.max(0, line.lengthM - TRAIN_LENGTH_M);
+  return Math.max(0, line.lengthM - CONSIST_PATH_M);
 }
 
 /** 線を端から端まで走り、折り返して戻ってくるまでの秒数（両端の停車を含む）。 */
@@ -224,7 +245,7 @@ export function shuttleCycleSec(line: RailLine): number {
 }
 
 /**
- * 時刻 tickFloat（分、端数可）における各編成の先頭位置。
+ * 時刻 tickFloat（分、端数可）における各編成の位置。
  *
  * 端から端への往復を 1 周期とし、運行間隔がちょうど DEFAULT_HEADWAY_MIN に
  * なる本数を等間隔に配る。線ごとに位相をずらして、全線の電車が
@@ -233,7 +254,9 @@ export function shuttleCycleSec(line: RailLine): number {
  * @returns out に書き込んだ編成数。
  */
 export function trainHeads(line: RailLine, tickFloat: number, out: TrainHead[]): number {
-  if (!line.served || line.lengthM < TRAIN_LENGTH_M) return 0;
+  // 編成がカーブぶんの余裕を含めて収まらない線には走らせない。
+  // 収まらないまま走らせると、線の端で連結点が頭打ちになって車両が重なる。
+  if (!line.served || line.lengthM < CONSIST_PATH_M) return 0;
   const cycle = shuttleCycleSec(line);
   const headwaySec = DEFAULT_HEADWAY_MIN * 60;
   const count = Math.max(1, Math.min(out.length, Math.round(cycle / headwaySec)));
@@ -251,27 +274,91 @@ export function trainHeads(line: RailLine, tickFloat: number, out: TrainHead[]):
     const h = out[k]!;
     // 1 周期 = 往路 → 終端で停車 → 復路 → 起点で停車。
     //
-    // distM は**進行方向の先頭**の位置。編成の残りはその後ろ（＝進行方向と
-    // 逆側）に付くので、先頭が動ける範囲は編成長ぶん狭い。ここを線の端から端に
-    // すると、編成の後ろが線からはみ出して描画から落ち（両端で車両が消える）、
-    // 折り返した瞬間に後続車が先頭を飛び越して反対側へ現れる。
+    // distM は編成の起点側の端なので、往路も復路も同じ [0, span] を往復する
+    // だけになる。折り返しでは forward が反転するだけで、距離は連続している。
     if (phase < runSec) {
-      // 往路。先頭は編成長の位置から終端へ。
-      h.distM = TRAIN_LENGTH_M + phase * RAIL_MS;
+      h.distM = phase * RAIL_MS;
       h.forward = true;
     } else if (phase < runSec + TRAIN_TURNAROUND_SEC) {
-      // 終端で停車。止まっている間に向きが入れ替わるので、走行中に
-      // 車体が反転して見えることがない。
-      h.distM = line.lengthM;
-      h.forward = true;
+      // 終端で停車。向きが変わるのは停車のちょうど真ん中。車両の位置は動かず、
+      // 入れ替わるのは「どちらの端が先頭車か」だけ（＝運転士が反対側の
+      // 運転台へ移る）。発車と同時にやると、動き出す瞬間に編成の見た目が変わる。
+      h.distM = span;
+      h.forward = phase < runSec + TRAIN_TURNAROUND_SEC / 2;
     } else if (phase < 2 * runSec + TRAIN_TURNAROUND_SEC) {
-      // 復路。折り返した直後の先頭は、いま編成の後ろだった端にいる。
       h.distM = span - (phase - runSec - TRAIN_TURNAROUND_SEC) * RAIL_MS;
       h.forward = false;
     } else {
       h.distM = 0;
-      h.forward = false;
+      h.forward = phase >= 2 * runSec + 1.5 * TRAIN_TURNAROUND_SEC;
     }
   }
   return count;
+}
+
+/**
+ * 連結点 c0 から線路を進み、**画面上の直線距離**がちょうど CAR_PITCH_DRAW に
+ * なる線路上の距離を返す。
+ *
+ * 線路に沿った距離を等間隔にするのではなく、隣の車との弦を一定に保つ。車体は
+ * 連結点から連結点までの剛体なので、これが「連結が外れない」の定義そのものに
+ * なる。カーブでは弧より弦が短いぶん、線路上ではより遠くまで進むことになる。
+ *
+ * 弦は距離に対してほぼ比例して伸びるので、`いまの弦 → 目標` の比を掛ける
+ * 反復が下から単調に収束する。直線なら 1 回で当たる。
+ */
+function advanceByChord(graph: Graph, line: RailLine, d0: number, c0: RailPose, tmp: RailPose): number {
+  let step = CAR_PITCH_DRAW * SIM_PER_RENDER;
+  const room = line.lengthM - d0;
+  for (let it = 0; it < 6; it++) {
+    if (step >= room) return line.lengthM;
+    railPoseAt(graph, line, d0 + step, true, tmp);
+    const chord = Math.hypot(tmp.x - c0.x, tmp.z - c0.z);
+    if (chord <= 1e-4) break;
+    const scale = CAR_PITCH_DRAW / chord;
+    if (Math.abs(scale - 1) < 1e-4) break;
+    step *= scale;
+  }
+  return Math.min(line.lengthM, d0 + step);
+}
+
+/**
+ * 編成の各車両の姿勢を、先頭車から順に out に詰める。
+ *
+ * 連結点を線路の上に鎖のように並べ、車体はその 2 点を結ぶ棒として置く。車体の
+ * 端は連結点から (CAR_PITCH_DRAW - TRAIN_CAR_LENGTH_M) / 2 だけ内側にあるので、
+ * カーブで隣の車と角度が付いても、離れられるのは連結面のすきま
+ * (TRAIN_CAR_GAP_M) までに限られる。車両の**中心**を線路上で等間隔に置く方式だと、
+ * 角では中心どうしの直線距離が縮んで車体が食い込み、逆に角をまたぐ組では
+ * 連結面が離れる。
+ *
+ * @param couplers 連結点の作業領域。両数 + 1 以上必要。
+ * @returns out に書き込んだ両数。
+ */
+export function trainCarPoses(
+  graph: Graph,
+  line: RailLine,
+  head: TrainHead,
+  couplers: RailPose[],
+  out: RailPose[],
+): number {
+  const cars = Math.min(TRAIN_CARS, out.length, couplers.length - 1);
+  if (cars < 1) return 0;
+  let d = Math.max(0, Math.min(line.lengthM, head.distM));
+  if (!railPoseAt(graph, line, d, true, couplers[0]!)) return 0;
+  for (let j = 1; j <= cars; j++) {
+    d = advanceByChord(graph, line, d, couplers[j - 1]!, couplers[j]!);
+    railPoseAt(graph, line, d, true, couplers[j]!);
+  }
+  for (let j = 0; j < cars; j++) {
+    const lo = couplers[j]!;
+    const hi = couplers[j + 1]!;
+    // 先頭車は進行方向の端。往路なら距離が大きい側から数える。
+    const slot = head.forward ? cars - 1 - j : j;
+    const pose = out[slot]!;
+    pose.x = (lo.x + hi.x) / 2;
+    pose.z = (lo.z + hi.z) / 2;
+    pose.heading = Math.atan2(hi.x - lo.x, hi.z - lo.z) + (head.forward ? 0 : Math.PI);
+  }
+  return cars;
 }

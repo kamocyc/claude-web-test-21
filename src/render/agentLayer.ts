@@ -24,6 +24,7 @@ import {
   MAX_VISIBLE_VEHICLES,
   PARKED_CAR_LOD_DISTANCE_M,
   PEDESTRIAN_LOD_DISTANCE_M,
+  SIM_PER_RENDER,
   TERRAIN_HEIGHT_SCALE,
   TILE_M,
   TRAIN_CARS,
@@ -41,9 +42,10 @@ import { TruckState } from '@sim/economy/freight';
 import { type PathPose } from '@sim/network/pathfinder';
 import { VehicleKind } from '@sim/network/traffic';
 import {
-  TRAIN_CAR_PITCH_M,
   railPoseAt,
   traceRailLines,
+  TRAIN_LENGTH_M,
+  trainCarPoses,
   trainHeads,
   type RailLine,
   type RailPose,
@@ -550,9 +552,12 @@ export class AgentLayer {
   /** 線路の折れ線。グラフが作り直されたときだけ再計算する。 */
   private railLines: RailLine[] = [];
   private railLinesVersion = -1;
-  /** 編成の先頭位置の受け皿（毎フレーム使い回す）。 */
+  /** 編成の位置の受け皿（毎フレーム使い回す）。 */
   private readonly heads: TrainHead[] = Array.from({ length: 64 }, () => ({ distM: 0, forward: true }));
   private readonly railPose: RailPose = { x: 0, z: 0, heading: 0 };
+  /** 編成 1 本ぶんの連結点と車両姿勢の作業領域。毎フレーム使い回す。 */
+  private readonly couplers: RailPose[] = Array.from({ length: TRAIN_CARS + 1 }, () => ({ x: 0, z: 0, heading: 0 }));
+  private readonly carPoses: RailPose[] = Array.from({ length: TRAIN_CARS }, () => ({ x: 0, z: 0, heading: 0 }));
   /**
    * タイル → その路肩の使用状況（bit0 = 左側、bit1 = 右側）。
    * 毎フレーム clear して使い回す。
@@ -1641,33 +1646,34 @@ export class AgentLayer {
       this.railLinesVersion = sim.graph.version;
     }
     let total = 0;
+    // 編成は 1 本まるごと描くか、まるごと捨てるかのどちらかにする。車両ごとに
+    // 距離や枠で切ると、遠ざかった編成が後ろから 1 両ずつ消えて連結が外れて見える。
+    // 判定は編成の真ん中の 1 点だけで済ませる（姿勢を全部出すのは安くない）。
+    const reach = Math.sqrt(maxDist2) + TRAIN_LENGTH_M / (2 * SIM_PER_RENDER);
+    const reach2 = reach * reach;
     for (const line of this.railLines) {
-      if (total >= MAX_VISIBLE_TRAIN_CARS) break;
+      if (total + TRAIN_CARS > MAX_VISIBLE_TRAIN_CARS) break;
       const heads = trainHeads(line, tick, this.heads);
-      for (let k = 0; k < heads && total < MAX_VISIBLE_TRAIN_CARS; k++) {
+      for (let k = 0; k < heads && total + TRAIN_CARS <= MAX_VISIBLE_TRAIN_CARS; k++) {
         const head = this.heads[k]!;
-        const dir = head.forward ? 1 : -1;
-        for (let carIdx = 0; carIdx < TRAIN_CARS && total < MAX_VISIBLE_TRAIN_CARS; carIdx++) {
-          // 後続車は先頭から編成長ぶん後ろに付く
-          const d = head.distM - dir * carIdx * TRAIN_CAR_PITCH_M;
-          if (d < 0 || d > line.lengthM) continue;
-          if (!railPoseAt(sim.graph, line, d, head.forward, this.railPose)) continue;
-          const dx = this.railPose.x - camX;
-          const dz = this.railPose.z - camZ;
-          if (dx * dx + dz * dz > maxDist2) continue;
+        if (!railPoseAt(sim.graph, line, head.distM + TRAIN_LENGTH_M / 2, true, this.railPose)) continue;
+        const mx = this.railPose.x - camX;
+        const mz = this.railPose.z - camZ;
+        if (mx * mx + mz * mz > reach2) continue;
+        // 車両は連結点どうしを結ぶ棒として置く。詳しくは `trainCarPoses`。
+        const cars = trainCarPoses(sim.graph, line, head, this.couplers, this.carPoses);
+        for (let carIdx = 0; carIdx < cars; carIdx++) {
+          const car = this.carPoses[carIdx]!;
+          const dx = car.x - camX;
+          const dz = car.z - camZ;
           // 0 = 先頭車、TRAIN_CARS-1 = 最後尾、それ以外は中間車。
           // 引いた画では顔も幌も読めないので、中間車 1 種類に畳む。
           const slot = this.trainLod ? 1 : carIdx === 0 ? 0 : carIdx === TRAIN_CARS - 1 ? 2 : 1;
           const fleet = this.trains[slot]!;
-          if (fleet.count >= MAX_VISIBLE_TRAIN_CARS) continue;
-          this.quat.setFromAxisAngle(this.axisY, this.railPose.heading);
+          this.quat.setFromAxisAngle(this.axisY, car.heading);
           // 車両の原点は台車の上端（＝レール面）。線路レイヤのバラストと枕木の上に
           // 台車が載るよう、その厚みぶんだけ持ち上げる。
-          this.pos.set(
-            this.railPose.x,
-            this.groundAt(sim, this.railPose.x, this.railPose.z) + RAIL_TOP_M,
-            this.railPose.z,
-          );
+          this.pos.set(car.x, this.groundAt(sim, car.x, car.z) + RAIL_TOP_M, car.z);
           this.mat.compose(this.pos, this.quat, this.scl);
           fleet.body.setMatrixAt(fleet.count, this.mat);
           this.color.setHex(TRAIN_BODY_COLOR);
@@ -1678,10 +1684,10 @@ export class AgentLayer {
           // 車両の原点はレール面（枕木の 14cm 上）なので、そのまま敷くと
           // 影の板だけが道床から浮いた位置で切り立つ。
           this.shadows.add(
-            this.railPose.x,
+            car.x,
             this.pos.y - 0.12,
-            this.railPose.z,
-            this.railPose.heading,
+            car.z,
+            car.heading,
             // 車と同じ理由で車体幅より広く取る（`addVehicleShadow` の注記）。
             // 等倍だと濃い芯が車体の下に隠れ、道床には何も出ない。
             TRAIN_WIDTH_M * 1.3,

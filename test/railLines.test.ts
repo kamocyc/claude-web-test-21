@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { TILE_SPAN_M } from '@shared/constants';
+import { TILE_SPAN_M, TRAIN_CARS, TRAIN_CAR_GAP_M, TRAIN_CAR_LENGTH_M } from '@shared/constants';
 import { Mode } from '@shared/enums';
 import { Pathfinder, pathPosition, type PathPose } from '@sim/network/pathfinder';
 import {
   TRAIN_LENGTH_M,
   railPoseAt,
+  trainCarPoses,
   shuttleCycleSec,
   traceRailLines,
   trainHeads,
@@ -117,8 +118,8 @@ describe('電車の走行', () => {
     trainHeads(line, 30, a);
     const n = trainHeads(line, 30 + dtMin, b);
     for (let k = 0; k < n; k++) {
-      // 折り返し中の編成を除き、1/60 分で進む距離は表定速度ぶんだけ
-      if (a[k]!.forward !== b[k]!.forward) continue;
+      // 折り返し中でも位置は連続。distM は進行方向に依らない量なので、
+      // 向きが変わっても飛ばない。
       expect(Math.abs(b[k]!.distM - a[k]!.distM)).toBeLessThan(30);
     }
   });
@@ -194,5 +195,79 @@ describe('経路上の位置', () => {
       pathPosition(graph, path, i / 10, out);
       expect(Array.from(path.edges)).toContain(out.edge);
     }
+  });
+});
+
+describe('編成の連結', () => {
+  /** L 字に曲がる線路。連結が破綻するのは角のある線だけ。 */
+  const bent = (): ReturnType<typeof buildGraph> => {
+    const world = makeTestWorld();
+    layRail(world, 20, 20, 20, 40);
+    layRail(world, 20, 40, 45, 40);
+    return buildGraph(world, [idx(21, 30)]);
+  };
+  const poses = (): RailPose[] => Array.from({ length: TRAIN_CARS + 1 }, () => ({ x: 0, z: 0, heading: 0 }));
+
+  /** 車体の前端・後端（連結面の中心）。 */
+  const ends = (p: RailPose): { fx: number; fz: number; bx: number; bz: number } => {
+    const ux = Math.sin(p.heading) * (TRAIN_CAR_LENGTH_M / 2);
+    const uz = Math.cos(p.heading) * (TRAIN_CAR_LENGTH_M / 2);
+    return { fx: p.x + ux, fz: p.z + uz, bx: p.x - ux, bz: p.z - uz };
+  };
+
+  it('カーブでも連結面のすきまは公称値のまま（離れも食い込みもしない）', () => {
+    const graph = bent();
+    const line = traceRailLines(graph).filter((l) => l.served)[0]!;
+    const h = heads();
+    const cp = poses();
+    const cars = poses();
+    const cycleMin = shuttleCycleSec(line) / 60;
+    let minGap = Infinity;
+    let maxGap = -Infinity;
+    for (let s = 0; s <= 2000; s++) {
+      trainHeads(line, (s / 2000) * cycleMin, h);
+      const n = trainCarPoses(graph, line, h[0]!, cp, cars);
+      expect(n).toBe(TRAIN_CARS);
+      for (let k = 0; k + 1 < n; k++) {
+        const a = ends(cars[k]!);
+        const b = ends(cars[k + 1]!);
+        minGap = Math.min(minGap, Math.hypot(a.bx - b.fx, a.bz - b.fz));
+        maxGap = Math.max(maxGap, Math.hypot(a.bx - b.fx, a.bz - b.fz));
+      }
+    }
+    // 剛体の棒を連結点で繋いでいるので、離れるのは連結面のすきまぶんまで。
+    expect(maxGap).toBeLessThanOrEqual(TRAIN_CAR_GAP_M + 1e-3);
+    expect(minGap).toBeGreaterThan(0);
+  });
+
+  it('折り返しでも車両の位置が飛ばない', () => {
+    const graph = bent();
+    const line = traceRailLines(graph).filter((l) => l.served)[0]!;
+    const h = heads();
+    const cp = poses();
+    const cars = poses();
+    const cycleMin = shuttleCycleSec(line) / 60;
+    const steps = 4000;
+    let prev: number[][] = [];
+    let worst = 0;
+    for (let s = 0; s <= steps; s++) {
+      trainHeads(line, (s / steps) * cycleMin, h);
+      const n = trainCarPoses(graph, line, h[0]!, cp, cars);
+      const cur = Array.from({ length: n }, (_, k) => [cars[k]!.x, cars[k]!.z]);
+      if (prev.length === cur.length) {
+        // 折り返すと先頭車は編成の反対の端になる。編成の並びとして見るため、
+        // そのまま対応させた場合と逆順に対応させた場合の小さい方を取る。
+        let same = 0;
+        let rev = 0;
+        for (let k = 0; k < n; k++) {
+          same = Math.max(same, Math.hypot(cur[k]![0]! - prev[k]![0]!, cur[k]![1]! - prev[k]![1]!));
+          rev = Math.max(rev, Math.hypot(cur[n - 1 - k]![0]! - prev[k]![0]!, cur[n - 1 - k]![1]! - prev[k]![1]!));
+        }
+        worst = Math.max(worst, Math.min(same, rev));
+      }
+      prev = cur;
+    }
+    // 1 標本ぶんの移動（往復 2 回ぶんの距離 / steps）を大きく超えなければ連続。
+    expect(worst).toBeLessThan(1);
   });
 });
