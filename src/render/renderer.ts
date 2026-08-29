@@ -1,22 +1,27 @@
 import {
-  AmbientLight,
+  ACESFilmicToneMapping,
   BufferGeometry,
   Color,
   DirectionalLight,
-  Fog,
+  FogExp2,
+  HemisphereLight,
   InstancedMesh,
   Line,
   LineBasicMaterial,
   Matrix4,
   Mesh,
   MeshBasicMaterial,
+  PCFSoftShadowMap,
   PlaneGeometry,
+  PMREMGenerator,
   Raycaster,
   Scene,
   Vector2,
   Vector3,
   WebGLRenderer,
   BufferAttribute,
+  type Texture,
+  type WebGLRenderTarget,
 } from 'three';
 import { MAP_H, MAP_W, MAX_PREVIEW_TILES, TERRAIN_HEIGHT_SCALE, TILE_M } from '@shared/constants';
 import { Overlay } from '@shared/enums';
@@ -30,7 +35,9 @@ import { NatureLayer } from './natureLayer';
 import { RailLayer } from './railLayer';
 import { RoadLayer } from './roadLayer';
 import { TerrainMesh } from './terrainMesh';
-import { PREVIEW_BAD_COLOR, PREVIEW_OK_COLOR, skyColor, sunIntensity } from './theme';
+import { PostFx } from './postfx';
+import { SkyDome, atmosphereAt, sunDirection, type Atmosphere } from './sky';
+import { PREVIEW_BAD_COLOR, PREVIEW_OK_COLOR } from './theme';
 
 /**
  * 描画レイヤの統括。
@@ -49,7 +56,22 @@ export class Renderer {
   private readonly buildings = new BuildingLayer();
   private readonly agents = new AgentLayer();
   private readonly sun: DirectionalLight;
-  private readonly ambient: AmbientLight;
+  /** 空と地面からの回り込み。均一な AmbientLight より上下の差が出る。 */
+  private readonly hemi: HemisphereLight;
+  /** 太陽の反対側から当てる弱い補助光。影の中が真っ黒に潰れるのを防ぐ。 */
+  private readonly fill: DirectionalLight;
+  private readonly sky = new SkyDome();
+  /** 環境マップ（映り込み）を焼くための小さなシーン。空だけが入っている。 */
+  private readonly skyScene = new Scene();
+  private readonly pmrem: PMREMGenerator;
+  private envTarget: WebGLRenderTarget | null = null;
+  private envDayFraction = -1;
+  private readonly postfx: PostFx;
+  private readonly sunDir = new Vector3();
+  private atmo: Atmosphere;
+  private lastFrameMs = 16;
+  /** 起動からの経過秒。雲の流れに使う。 */
+  private elapsed = 0;
 
   /** タイル選択のハイライト。 */
   private readonly cursor: Mesh;
@@ -67,21 +89,60 @@ export class Renderer {
   drawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement) {
-    this.renderer = new WebGLRenderer({ canvas, antialias: true });
+    this.renderer = new WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+    // 物理ベースの材質は、線形で計算して最後にトーンマッピングで畳まないと
+    // 昼の白壁が全部 1.0 に張り付き、階調が消える。
+    this.renderer.toneMapping = ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = PCFSoftShadowMap;
+    // ポストエフェクトのパスも含めた合計を数えたいので、自動リセットを切って
+    // フレームの頭で自分でリセットする。
+    this.renderer.info.autoReset = false;
 
     this.rig = new CameraRig(canvas.clientWidth / Math.max(1, canvas.clientHeight));
     this.rig.attach(canvas);
 
-    this.scene.background = new Color(0x9fc4e0);
-    this.scene.fog = new Fog(0x9fc4e0, 900, 3400);
+    // 背景は空ドームが描く。単色の background を残すと手前に出て台無しになる。
+    this.scene.background = null;
+    // 指数フォグにする。線形フォグは「開始距離」と「消える距離」を
+    // カメラ距離から毎フレーム決め直す必要があり、近景を守ろうとすると
+    // 遠景の空気遠近が消え、遠景を出そうとすると街区が白く洗われる。
+    // 指数なら 1 つの密度で、近くは素通し・遠くだけ空色に溶ける。
+    this.scene.fog = new FogExp2(0xcadbe8, 0.00022);
+    this.scene.add(this.sky.mesh);
+    this.skyScene.add(this.sky.clone());
 
-    this.ambient = new AmbientLight(0xffffff, 0.62);
-    this.scene.add(this.ambient);
-    this.sun = new DirectionalLight(0xfff2e0, 1.05);
-    this.sun.position.set(-800, 1400, 600);
+    this.atmo = atmosphereAt(0.5);
+
+    this.hemi = new HemisphereLight(0xa6c8ea, 0x7d7663, 0.85);
+    this.scene.add(this.hemi);
+
+    this.sun = new DirectionalLight(0xfff6e8, 2.2);
+    this.sun.castShadow = true;
+    this.sun.shadow.mapSize.set(2048, 2048);
+    // 影のアクネ対策。斜面と壁が多いので normalBias を実寸（m）で入れる。
+    this.sun.shadow.bias = -0.0006;
+    this.sun.shadow.normalBias = 0.9;
     this.scene.add(this.sun);
+    this.scene.add(this.sun.target);
+
+    this.fill = new DirectionalLight(0xbcd0e8, 0.25);
+    this.fill.position.set(600, 500, -700);
+    this.scene.add(this.fill);
+
+    this.pmrem = new PMREMGenerator(this.renderer);
+    this.pmrem.compileEquirectangularShader();
+
+    const fx = new URLSearchParams(location.search).get('fx');
+    this.postfx = new PostFx(
+      this.renderer,
+      this.scene,
+      this.rig.camera,
+      fx === 'off' ? 'off' : fx === 'high' ? 'high' : 'auto',
+    );
 
     this.scene.add(this.terrain.group);
     this.scene.add(this.nature.group);
@@ -132,6 +193,11 @@ export class Renderer {
     this.roads.setVisible(o === Overlay.None);
     this.rails.setVisible(o === Overlay.None);
     this.nature.setVisible(o === Overlay.None);
+  }
+
+  /** いまの時刻の大気（各レイヤが夜の演出に使う）。 */
+  get atmosphere(): Atmosphere {
+    return this.atmo;
   }
 
   get overlay(): Overlay {
@@ -251,36 +317,168 @@ export class Renderer {
    *   そのまま見える（1 秒に 1 コマも動かない）。
    */
   render(sim: Simulation, dt: number, tickFraction = 0): void {
+    const t0 = performance.now();
+    this.renderer.info.reset();
     this.rig.update(dt);
 
-    // 時刻に応じた空と日照
+    // ---- 時刻から大気・光をまとめて決める ----
     const frac = sim.clock.dayFraction;
-    (this.scene.background as Color).copy(skyColor(frac));
-    if (this.scene.fog) (this.scene.fog as Fog).color.copy(skyColor(frac));
-    const intensity = sunIntensity(frac);
-    this.sun.intensity = intensity;
-    this.ambient.intensity = 0.28 + intensity * 0.34;
-    // 太陽の位置も時刻で動かす（朝は東、夕は西）
-    const sunAngle = (frac - 0.25) * Math.PI * 2;
+    const atmo = atmosphereAt(frac);
+    this.atmo = atmo;
+    sunDirection(frac, this.sunDir);
+
+    this.elapsed += dt;
+    this.sky.update(atmo, this.sunDir, this.rig.camera.position, this.elapsed);
+
+    // 太陽（夜は月）。注視点を基準に置くことで、影の解像度を街の見えている
+    // 範囲に集中させる。マップ全体を 1 枚の影マップで覆うと 1 タイルあたり
+    // 数ピクセルしか無くなり、影がただのギザギザになる。
+    // 光源までの距離は影の範囲に追随させる。固定 1200m のままだと、
+    // 引いたときに手前の建物が正射影の near より手前に来て、
+    // その建物だけ影を落とさなくなる。
+    const sunDistance = Math.max(1200, this.rig.distance * 2.2);
     this.sun.position.set(
-      this.rig.target.x - Math.cos(sunAngle) * 1400,
-      Math.max(200, Math.sin(sunAngle) * 1400),
-      this.rig.target.z + 500,
+      this.rig.target.x + this.sunDir.x * sunDistance,
+      this.rig.target.y + this.sunDir.y * sunDistance,
+      this.rig.target.z + this.sunDir.z * sunDistance,
     );
     this.sun.target.position.copy(this.rig.target);
     this.sun.target.updateMatrixWorld();
+    this.sun.color.copy(atmo.sunColor);
+    this.sun.intensity = atmo.sunIntensity;
+
+    // 影の範囲はカメラの引き具合に合わせる。
+    //
+    // 以前は「距離 1600 を超えたら影を切る」ことにしていたが、俯瞰こそ
+    // 落ち影で街区のリズムが出るカットで、そこに影が 1 本も無いのが
+    // いちばん大きな減点だった。粗い影でも、無いよりはるかに良い。
+    // そこで、引いたら影マップを 4096 に上げて範囲を広げ、
+    // 日が出ているあいだは切らないことにした。
+    // 太陽が低いほど影は長く伸びる。仰角 10 度なら 30m のビルの影は 170m
+    // 先まで届くので、範囲をカメラ距離だけで決めると夕方の影が途中で
+    // 切り落とされ、「低い太陽なのに影が無い」絵になる。
+    // 伸ばすのは「太陽が低いときだけ」にする。1/y をそのまま使うと南中でも
+    // 1.6 倍に広がり、テクセルが粗くなって影の縁が数十 px のぼけになる。
+    // 正午の半影は角度 0.53 度＝数 px でなければならず、
+    // ぼけた影は「影」ではなく「汚れ」に見える。
+    const lowSun = 1 + Math.max(0, 0.5 - this.sunDir.y) * 4.2;
+    const span = Math.max(110, Math.min(2400, this.rig.distance * 0.9 * lowSun));
+    // 解像度は 2048 に留める。4096 は帯域を倍以上使うわりに、
+    // 実際に見える差は「影の縁が 1px 締まる」程度しかない。
+    const wantSize = 2048;
+    if (this.sun.shadow.mapSize.width !== wantSize) {
+      this.sun.shadow.mapSize.set(wantSize, wantSize);
+      // 解像度を変えたら、確保済みのデプステクスチャは作り直させる
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+    }
+    const cam = this.sun.shadow.camera;
+    if (cam.right !== span) {
+      cam.left = -span;
+      cam.right = span;
+      cam.top = span;
+      cam.bottom = -span;
+      cam.near = 50;
+      cam.far = sunDistance + span * 2.5;
+      cam.updateProjectionMatrix();
+      // テクセルが粗いほど深度の食い違いが大きくなるので、
+      // 押し出し量も範囲に比例させる。固定値だと、引いたときに
+      // 壁と地面の境目に細い光の筋（peter-panning の裏返し）が出る。
+      this.sun.shadow.normalBias = Math.max(0.5, (span * 2) / wantSize * 2.2);
+    }
+    this.sun.castShadow = atmo.sunIntensity > 0.2;
+
+    this.hemi.color.copy(atmo.skyLight);
+    this.hemi.groundColor.copy(atmo.groundLight);
+    this.hemi.intensity = atmo.ambientIntensity;
+    this.fill.color.copy(atmo.skyLight);
+    this.fill.intensity = 0.1 + atmo.ambientIntensity * 0.22;
+    this.fill.position.set(
+      this.rig.target.x - this.sunDir.x * 900,
+      this.rig.target.y + 700,
+      this.rig.target.z - this.sunDir.z * 900,
+    );
+    this.renderer.toneMappingExposure = atmo.exposure;
+
+    // 霞は地平線の色に合わせる。カメラが寄っているときに霞ませると
+    // 近景の造形が全部白くなるので、距離に応じて開始位置を押し出す。
+    if (this.scene.fog) {
+      const fog = this.scene.fog as FogExp2;
+      fog.color.copy(atmo.horizon);
+      // 朝夕は靄が濃く、日中と夜は澄む。2km 先でコントラストが残る濃さ。
+      fog.density = 0.00019 + (1 - Math.abs(atmo.nightAmount - 0.5) * 2) * 0.00016;
+      // 霞み始めをカメラ距離の 2 倍より遠くに置く。ここを近くすると、
+      // 街区を見下ろしている距離で「見えている街の大半」が霞に沈み、
+      // せっかくの造形が白く飛んでしまう。
+    }
+
+    this.updateEnvironment(frac);
 
     this.terrain.update(sim);
-    this.nature.update(sim);
-    this.roads.update(sim);
+    // 距離を渡すのは、遠景で木の幹や路面標示の縞を 1 本ずつ描くのをやめさせるため。
+    // 1px 未満の造形は、絵にならずノイズとちらつきにしかならない。
+    this.nature.update(sim, this.rig.distance);
+    this.applyShadowFlags();
+    this.roads.update(sim, this.rig.distance);
     this.rails.update(sim);
     this.buildings.update(sim);
     this.buildings.setTimeOfDay(frac);
     this.agents.setTimeOfDay(frac);
     this.agents.update(sim, this.rig.target.x, this.rig.target.z, this.rig.distance, tickFraction);
 
-    this.renderer.render(this.scene, this.rig.camera);
+    // 朝は青、夕は橙に少しだけ寄せる
+    const h = frac * 24;
+    const warmth = h > 15 && h < 20 ? 0.9 : h > 5 && h < 8 ? -0.55 : h < 5 || h >= 20 ? -0.7 : 0.1;
+    this.postfx.setMood(atmo.nightAmount, warmth);
+    this.postfx.setAoScale(this.rig.distance);
+    this.postfx.render(this.scene, this.rig.camera, this.lastFrameMs);
+
     this.drawCalls = this.renderer.info.render.calls;
+    this.lastFrameMs = this.lastFrameMs * 0.9 + (performance.now() - t0) * 0.1;
+  }
+
+  /**
+   * 影の落とし方をレイヤ全体に行き渡らせる。
+   *
+   * 各レイヤはメッシュを遅延生成する（建物の形が増えたときなど）ので、
+   * 生成時に付け忘れると「一部の建物だけ影が出ない」ことになる。
+   * 数百オブジェクトの走査は 1 フレームの予算からすれば無視できるので、
+   * ここで毎フレーム押さえておく。
+   */
+  private applyShadowFlags(): void {
+    for (const layer of [this.buildings.group, this.nature.group, this.rails.group, this.agents.group]) {
+      layer.traverse((o) => {
+        const m = o as Mesh;
+        if (!m.isMesh) return;
+        m.castShadow = true;
+        m.receiveShadow = true;
+      });
+    }
+    // 道路は地面に貼り付いた薄板。影を落とさせると自分の厚みで縞が出る。
+    this.roads.group.traverse((o) => {
+      const m = o as Mesh;
+      if (!m.isMesh) return;
+      m.castShadow = false;
+      m.receiveShadow = true;
+    });
+  }
+
+  /**
+   * 空の映り込み（環境マップ）を焼き直す。
+   *
+   * ガラスや車体は、映り込むものが無いと「灰色のプラスチック」にしか見えない。
+   * 空を 1 枚焼いて全材質に配るだけで、金属とガラスがそれらしくなる。
+   * 焼き直しは安くないので、時刻がある程度動いたときだけにする。
+   */
+  private updateEnvironment(dayFraction: number): void {
+    if (this.envDayFraction >= 0 && Math.abs(dayFraction - this.envDayFraction) < 0.006) return;
+    this.envDayFraction = dayFraction;
+    const prev = this.envTarget;
+    this.envTarget = this.pmrem.fromScene(this.skyScene, 0, 0.1, 100);
+    this.scene.environment = this.envTarget.texture as Texture;
+    // 環境マップは映り込み専用。背景としては空ドームが描く。
+    this.scene.environmentIntensity = 1;
+    prev?.dispose();
   }
 
   resize(canvas: HTMLCanvasElement): void {
@@ -288,6 +486,8 @@ export class Renderer {
     const h = canvas.clientHeight;
     this.renderer.setSize(w, h, false);
     this.rig.resize(w / Math.max(1, h));
+    const dpr = this.renderer.getPixelRatio();
+    this.postfx.setSize(w * dpr, h * dpr);
   }
 
   get visibleAgents(): number {
@@ -309,6 +509,10 @@ export class Renderer {
     this.rails.dispose();
     this.buildings.dispose();
     this.agents.dispose();
+    this.sky.dispose();
+    this.postfx.dispose();
+    this.envTarget?.dispose();
+    this.pmrem.dispose();
     // カーソル・プレビュー・経路ラインも自分で捨てる（誰も解放していなかった）。
     for (const o of [this.cursor, this.preview, this.routeLine]) {
       o.geometry.dispose();

@@ -1,107 +1,380 @@
 import {
-  BoxGeometry,
   Color,
   InstancedMesh,
+  Material,
   Matrix4,
-  MeshLambertMaterial,
   Object3D,
   Quaternion,
   Vector3,
+  type BufferGeometry,
 } from 'three';
 import { TERRAIN_HEIGHT_SCALE, TILE_COUNT, TILE_M } from '@shared/constants';
+import { archetype } from '@sim/buildings/archetypes';
 import type { Simulation } from '@sim/simulation';
-import { tileX, tileY } from '@sim/world/tiles';
+import { neighbor, tileX, tileY } from '@sim/world/tiles';
+import { applyVerticalAO, mergeParts, surface, type Part } from './materials';
+import { boxes, prism, type BoxSpec } from './parts';
 
 /**
  * 線路の造形。
- *
- * これまで線路は「地形メッシュのタイルを茶色に塗っただけ」だった。
- * 実寸で描いた 3 両編成がその上を走っているのに、下に軌道が無いので、
- * 電車が茶色い帯の上を滑っているように見えていた。
  *
  * 道路レイヤと同じ作りにする。すなわち **線路のエポックが変わったときだけ**
  * 走査し、部品ごとに 1 つの InstancedMesh に詰める。
  * 毎フレーム 10 万タイルを走査するようなことはしない。
  *
- * 部品は下から順に、盛土とバラスト・枕木・レール 2 本、そして架線柱。
- * 踏切のタイルだけはバラストの代わりに踏切板を敷く
- * （道路レイヤがアスファルトを全面に敷いているので、そこに砂利が乗ると
- * 道の真ん中に土手ができてしまう）。
+ * 以前は「単位の箱を潰して並べる」やり方だったので、バラストは断面が長方形、
+ * レールは平べったい板、架線柱はただの棒、架線に至っては存在しなかった。
+ * ここでは **1 区間ぶんの軌道（バラスト・枕木・レール）を焼き固めた
+ * ジオメトリ**を作り、タイルごとに向きだけ変えて置く。
+ * 区間の長さはタイルの半分 + 重ね代で固定なので、拡大縮小すら要らない。
+ *
+ * 曲がり角・分岐は「隣に線路がある向きごとに半区間を置く」という
+ * 元のやり方をそのまま引き継ぐ。特別扱いを書かずに正しい形が出るのが利点で、
+ * 架線と踏切だけは直線区間に限って足す（曲線に無理に架線を張ると、
+ * 柱と柱の間で線が軌道から外れて破綻するため）。
  */
 
 /** レール面の高さ (m)。電車の台車をここに載せる（agentLayer の RAIL_TOP_M と対）。 */
 export const RAIL_TOP_M = 0.55;
 
-const BALLAST_H = 0.3;
+const BALLAST_H = 0.28;
 /** 斜面でバラストが地面から浮かないよう、下へ埋める深さ (m)。 */
-const BALLAST_SINK = 0.25;
-const SLEEPER_H = 0.12;
-const RAIL_H = RAIL_TOP_M - BALLAST_H - SLEEPER_H;
+const BALLAST_SINK = 0.3;
+const SLEEPER_H = 0.13;
+const SLEEPER_TOP = BALLAST_H + SLEEPER_H;
+/** レールの高さ（底面から頭頂まで）。 */
+const RAIL_H = RAIL_TOP_M - SLEEPER_TOP;
 
-/** バラストの幅 (m)。単線ぶん。 */
-const BALLAST_W = 4.6;
+/** バラストの幅 (m)。単線ぶん。道床は台形なので上面はこれより狭い。 */
+const BALLAST_W = 5.0;
+const BALLAST_TOP_W = 3.5;
 /** 軌間の半分 (m)。狭軌 1067mm。 */
-const GAUGE_HALF = 0.54;
+const GAUGE_HALF = 0.5335;
 /** 枕木の間隔 (m)。実物は 0.6m 間隔だが、それだと 1 タイルに 16 本並んで潰れる。 */
 const SLEEPER_PITCH = 1.25;
-const SLEEPER_LEN = 2.4;
-const SLEEPER_THICK = 0.5;
-const RAIL_W = 0.18;
+const SLEEPER_LEN = 2.3;
+const SLEEPER_THICK = 0.24;
 
-const BALLAST_COLOR = 0x93887b;
-const SLEEPER_COLOR = 0x554639;
-const RAIL_COLOR = 0xc3bbae;
-const DECK_COLOR = 0x8e8880;
-const POLE_COLOR = 0x8f9298;
-const CROSSING_POST_COLOR = 0xe6e6e2;
+/** 1 区間の長さ。タイル中心から辺まで + 交差点で隙間が空かないための重ね代。 */
+const HALF = TILE_M / 2;
+const SEG_BACK = 0.4;
+const SEG_LEN = HALF + SEG_BACK;
+
+const BALLAST_COLOR = 0x8f8378;
+const SLEEPER_COLOR = 0x4a3d32;
+/** レールは頭頂だけ光る。側面は錆色にしておくと金属らしさが出る。 */
+const RAIL_HEAD = 0xd8d4cc;
+const RAIL_WEB = 0x6b5a4c;
+/**
+ * 踏切板。舗装に寄せた暗い灰にする。
+ * 明るいコンクリート色にすると、線路が道路と重なる区間で
+ * 「白い板とバラストが 1 タイルおきに交互に現れる」まだら模様になってしまう。
+ */
+const DECK_COLOR = 0x6e6a64;
+const POLE_COLOR = 0x9aa0a6;
+/**
+ * 架線の色。
+ *
+ * 1 本の色・1 本の太さで全部を張っていたので、遠目には「真っ黒な線が
+ * 何本か平行に走っている」だけになっていた。実際の架線は
+ *
+ *  - **吊架線**（上）: 亜鉛めっき鋼より線。太くて明るい灰。
+ *  - **トロリ線**（下）: パンタグラフが擦り続けるので銅が磨かれて光る。細い。
+ *  - **ハンガー**: その 2 本を繋ぐ短い吊り具。いちばん細い。
+ *
+ * と太さも色も違う。同じジオメトリのままインスタンス行列の断面スケールと
+ * `instanceColor` で描き分ければ、ドローコールを 1 つも増やさずに
+ * 「太さの変化」と「金属の色味」が出る。
+ */
+const WIRE_MESSENGER = 0xb3ab9e;
+const WIRE_CONTACT = 0xc79a63;
+const WIRE_HANGER = 0x726c63;
+/**
+ * 断面の太さの倍率（基準半径 4.5cm に対して）。
+ *
+ * 3 本の差を「1.2 : 0.78 : 0.42」から広げてある。1 本が画面上 1〜2px しか
+ * ないところで 1.5 倍の差を付けても、両方 1px に丸められて差が消える。
+ * 太いほうを 2px 側へ、細いほうを 1px 側へ押し出して初めて
+ * 「太い線と細い線が張ってある」と読める。
+ */
+const R_MESSENGER = 1.45;
+const R_CONTACT = 0.72;
+const R_HANGER = 0.4;
+const PLATFORM_COLOR = 0xc8c4bc;
 
 /** 架線柱。高さと、線路中心からの張り出し。 */
 const POLE_H = 6.2;
 const POLE_SIDE = 3.3;
-/** 架線柱を立てる間隔（タイルのハッシュの周期）。 */
-const POLE_PERIOD = 2;
+/** 架線柱を立てる間隔（タイル）。この間隔で架線がたわむ。 */
+const POLE_PERIOD = 3;
+/** 架線（き電吊架線）の高さと、たわみ量 (m)。 */
+const WIRE_Y = 5.7;
+const CONTACT_Y = 4.9;
+const WIRE_SAG = 0.55;
 
-const MAX_BALLAST = 24_000;
-const MAX_SLEEPERS = 60_000;
-const MAX_RAILS = 40_000;
+const MAX_TRACK = 30_000;
+const MAX_DECK = 4_000;
 const MAX_POLES = 8_000;
+const MAX_WIRE = 40_000;
 const MAX_CROSSING = 4_000;
+const MAX_PLATFORM = 2_000;
+
+/** 4 近傍（北・東・南・西）を +Z 向きの部品に写すための Y 回転。 */
+const DIR_ROT = [Math.PI, Math.PI / 2, 0, -Math.PI / 2];
+
+// ---- ジオメトリ ------------------------------------------------------------
+
+/**
+ * 道床（バラスト + 枕木）1 区間。
+ * 断面を台形にすると、真横から見たときに「土手の上に線路が載っている」ことが分かる。
+ */
+function bedGeometry(): BufferGeometry {
+  const mid = (SEG_LEN - SEG_BACK * 2) / 2 + SEG_BACK / 2;
+  const specs: BoxSpec[] = [
+    {
+      w: BALLAST_W,
+      h: BALLAST_H + BALLAST_SINK,
+      d: SEG_LEN,
+      y: (BALLAST_H - BALLAST_SINK) / 2,
+      z: mid,
+      wt: BALLAST_TOP_W / BALLAST_W,
+      tint: BALLAST_COLOR,
+    },
+  ];
+  // 枕木。区間の内側だけに並べる（隣の区間と重ならないよう中心側から数える）。
+  const n = Math.floor(HALF / SLEEPER_PITCH);
+  for (let k = 0; k < n; k++) {
+    specs.push({
+      w: SLEEPER_LEN,
+      h: SLEEPER_H,
+      d: SLEEPER_THICK,
+      y: BALLAST_H + SLEEPER_H / 2,
+      z: (k + 0.5) * SLEEPER_PITCH,
+      tint: SLEEPER_COLOR,
+    });
+  }
+  const g = mergeParts(boxes(specs));
+  applyVerticalAO(g, 0.6, 1.05, 1.5);
+  return g;
+}
+
+/**
+ * レール 2 本 1 区間。
+ * 底部（フランジ）と頭部の 2 段にすると、断面が「工」の字に見えて細く締まる。
+ */
+function railGeometry(): BufferGeometry {
+  const mid = (SEG_LEN - SEG_BACK * 2) / 2 + SEG_BACK / 2;
+  const specs: BoxSpec[] = [];
+  for (const s of [-1, 1]) {
+    specs.push(
+      { w: 0.14, h: 0.035, d: SEG_LEN, x: s * GAUGE_HALF, y: SLEEPER_TOP + 0.018, z: mid, tint: RAIL_WEB },
+      {
+        w: 0.075,
+        h: RAIL_H - 0.035,
+        d: SEG_LEN,
+        x: s * GAUGE_HALF,
+        y: SLEEPER_TOP + 0.035 + (RAIL_H - 0.035) / 2,
+        z: mid,
+        wt: 1.35,
+        tint: RAIL_HEAD,
+      },
+    );
+  }
+  return mergeParts(boxes(specs));
+}
+
+/**
+ * 踏切板。バラストの代わりに、レールの頭とほぼ同じ高さの舗装板を敷く。
+ *
+ * 道床をそのまま道路に通すと、道の真ん中に砂利の土手ができる。
+ * 実物の踏切は「レール面まで舗装を上げ、車輪のつばが通る溝だけ空けた板」なので、
+ * 天端をレール頭のすぐ下に置いて、レールが数 mm だけ顔を出すようにする。
+ */
+function deckGeometry(): BufferGeometry {
+  const mid = (SEG_LEN - SEG_BACK * 2) / 2 + SEG_BACK / 2;
+  const top = RAIL_TOP_M - 0.02;
+  const specs: BoxSpec[] = [
+    { w: BALLAST_W, h: top + BALLAST_SINK, d: SEG_LEN, y: (top - BALLAST_SINK) / 2, z: mid, tint: DECK_COLOR },
+    // 車輪のフランジが通る溝。レールの内側に暗い筋を入れるだけで踏切に見える。
+    { w: 0.1, h: 0.05, d: SEG_LEN, x: GAUGE_HALF - 0.11, y: top, z: mid, tint: 0x2e2b28 },
+    { w: 0.1, h: 0.05, d: SEG_LEN, x: -GAUGE_HALF + 0.11, y: top, z: mid, tint: 0x2e2b28 },
+  ];
+  const g = mergeParts(boxes(specs));
+  applyVerticalAO(g, 0.78, 1.04, 1.4);
+  return g;
+}
+
+/**
+ * 架線柱。ビームを軌道の上へ張り出し、斜めの筋交いで支える。
+ * 柱は +X 側に立つ。反対側に立てたいときは Y 回転を π 足す。
+ */
+function poleGeometry(): BufferGeometry {
+  const parts: Part[] = boxes([
+    // 柱。上をすぼめると鉄柱らしくなる。
+    { w: 0.24, h: POLE_H, d: 0.24, x: POLE_SIDE, y: POLE_H / 2, wt: 0.7, tint: POLE_COLOR },
+    // ビーム。
+    { w: POLE_SIDE + 0.6, h: 0.16, d: 0.13, x: (POLE_SIDE - 0.6) / 2, y: POLE_H - 0.35, tint: POLE_COLOR },
+    // 碍子とハンガー（架線を吊る点）。
+    { w: 0.1, h: 0.3, d: 0.1, x: 0, y: POLE_H - 0.6, tint: 0x6a5f52 },
+  ]);
+  // 筋交い。棒 1 本で「組まれた鉄柱」に見える。
+  parts.push(
+    ...boxes([
+      { w: 1.5, h: 0.1, d: 0.1, x: POLE_SIDE - 0.6, y: POLE_H - 1.3, rz: 0.6, tint: POLE_COLOR },
+    ]),
+  );
+  const g = mergeParts(parts);
+  applyVerticalAO(g, 0.72, 1.06, 1.6);
+  return g;
+}
+
+/**
+ * 架線 1 区間。+Z へ長さ 1 の細い棒。両端を指定して伸縮・回転させる。
+ *
+ * 角数を 4 から 6 へ、半径を 3.5cm から 4.5cm へ上げてある。
+ * 4 角柱だと真横から見たときに幅がゼロに近づく角度があり、そこで線が
+ * 1px を割ってジャギーとして砕ける。6 角柱にすると見る角度によらず
+ * 半径の 0.87 倍以上の幅が残るので、細い線でもアンチエイリアスが効く。
+ * 三角形は 1 区間 16 枚から 24 枚に増えるが、架線はインスタンスなので
+ * ドローコールは 1 本のままで済む。
+ */
+function wireGeometry(): BufferGeometry {
+  // 頂点カラーは白のまま。線の色は `instanceColor` で 1 本ずつ与える
+  // （吊架線・トロリ線・ハンガーで色が違う）。
+  return mergeParts([
+    prism({ r: 0.045, len: 1, seg: 6, axis: 'z', caps: 'none' }),
+  ]);
+}
+
+/**
+ * 踏切の警報機と遮断機。
+ * 遮断機の腕は上げた状態（開）にしてある。電車が来ていない時間のほうが長いので、
+ * こちらを既定にするほうが街の絵として自然。
+ */
+function crossingGeometry(): BufferGeometry {
+  const specs: BoxSpec[] = [
+    // 支柱。
+    { w: 0.22, h: 3.0, d: 0.22, y: 1.5, tint: 0xe8e6e0 },
+    // 警報灯の台座と赤色灯 2 灯。
+    { w: 1.0, h: 0.26, d: 0.16, y: 2.55, tint: 0x38393b },
+    { w: 0.3, h: 0.3, d: 0.12, x: 0.34, y: 2.55, z: 0.08, tint: 0xd83a2a },
+    { w: 0.3, h: 0.3, d: 0.12, x: -0.34, y: 2.55, z: 0.08, tint: 0xd83a2a },
+    // 交差点標識（X 型）。踏切だとひと目で分かる部品。
+    { w: 1.2, h: 0.16, d: 0.06, y: 3.05, z: 0.06, rz: 0.72, tint: 0xf0eee8 },
+    { w: 1.2, h: 0.16, d: 0.06, y: 3.05, z: 0.06, rz: -0.72, tint: 0xf0eee8 },
+    // 遮断機の基部。
+    { w: 0.3, h: 0.7, d: 0.3, x: 0.44, y: 0.35, tint: 0xe8e6e0 },
+  ];
+  // 遮断機の腕。赤白の縞を 4 分割で入れる。斜めに上げてあるので、
+  // 根元から先端へ向かって位置と高さを進める。
+  const armLen = 4.4;
+  const tilt = 1.05; // 上げ角 (rad)
+  for (let k = 0; k < 4; k++) {
+    const t = (k + 0.5) / 4;
+    specs.push({
+      w: 0.12,
+      h: 0.18,
+      d: armLen / 4,
+      x: 0.44 + Math.cos(tilt) * 0 ,
+      y: 0.75 + Math.sin(tilt) * armLen * t,
+      z: Math.cos(tilt) * armLen * t,
+      rx: -tilt,
+      tint: k % 2 === 0 ? 0xe03a2a : 0xf2f0ea,
+    });
+  }
+  const g = mergeParts(boxes(specs));
+  applyVerticalAO(g, 0.74, 1.05, 1.6);
+  return g;
+}
+
+/**
+ * 駅のホーム 1 タイルぶん。上屋（屋根）と柱、ホーム端の白線まで作る。
+ * 線路の +X 側に置く前提で、反対側は Y 回転で裏返す。
+ *
+ * 幅はタイルの半分（5.0m）に収まる寸法にしてある。以前の 3.4m 幅では
+ * 外縁が線路中心から 6.1m に出ていて、**隣のタイルに建つ駅舎を突き抜けていた**。
+ * ホームは必ず駅舎の隣に敷かれるので、はみ出しは必ず貫通になる。
+ */
+function platformGeometry(): BufferGeometry {
+  const x0 = BALLAST_W / 2 + 0.2;
+  const w = 2.1;
+  const cx = x0 + w / 2;
+  const h = 1.05;
+  const specs: BoxSpec[] = [
+    // 床。レール面より 1.05m 高い（実物の低床ホームに合わせる）。
+    { w, h: h + 0.5, d: TILE_M, x: cx, y: (h - 0.5) / 2, c: 0.06, tint: PLATFORM_COLOR },
+    // ホーム端の白線（線路側）。
+    { w: 0.35, h: 0.04, d: TILE_M, x: x0 + 0.2, y: h + 0.01, tint: 0xf4f2ea },
+    // 点字ブロック。
+    { w: 0.4, h: 0.05, d: TILE_M, x: x0 + 0.62, y: h + 0.01, tint: 0xe0c040 },
+    // 上屋。タイルの縁（線路中心から 5.0m）を越えない幅に留める。
+    { w: w + 0.2, h: 0.16, d: TILE_M, x: cx + 0.05, y: h + 3.0, tint: 0xb4bac0 },
+  ];
+  // 上屋の柱。
+  for (const z of [-3.2, 3.2]) {
+    specs.push({ w: 0.18, h: 2.95, d: 0.18, x: cx + 0.42, y: h + 1.5, z, tint: 0x8f959b });
+  }
+  const g = mergeParts(boxes(specs));
+  applyVerticalAO(g, 0.7, 1.06, 1.5);
+  return g;
+}
+
+// ---- レイヤ ----------------------------------------------------------------
 
 export class RailLayer {
   readonly group = new Object3D();
-  private readonly ballast: InstancedMesh;
-  private readonly sleeper: InstancedMesh;
+  private readonly bed: InstancedMesh;
   private readonly rail: InstancedMesh;
+  private readonly deck: InstancedMesh;
   private readonly pole: InstancedMesh;
-  private readonly post: InstancedMesh;
+  private readonly wire: InstancedMesh;
+  private readonly crossing: InstancedMesh;
+  private readonly platform: InstancedMesh;
   private readonly meshes: InstancedMesh[] = [];
-  private readonly materials: MeshLambertMaterial[] = [];
+  private readonly materials: Material[] = [];
 
   private lastRailEpoch = -1;
   private lastRoadEpoch = -1;
+  private lastNetworkVersion = -1;
 
   private readonly mat = new Matrix4();
   private readonly pos = new Vector3();
-  private readonly scl = new Vector3();
+  private readonly scl = new Vector3(1, 1, 1);
   private readonly quat = new Quaternion();
-  private readonly color = new Color();
+  private readonly axisY = new Vector3(0, 1, 0);
+  private readonly dir = new Vector3();
+  private readonly forward = new Vector3(0, 0, 1);
+  /** 架線 1 本ごとの色を書き込むための作業用。 */
+  private readonly wireColor = new Color();
 
   constructor() {
     this.group.name = 'rails';
-    // バラストだけは踏切で色が変わるので instanceColor を使う。他は単色。
-    this.ballast = this.makeMesh(MAX_BALLAST);
-    this.sleeper = this.makeMesh(MAX_SLEEPERS, SLEEPER_COLOR);
-    this.rail = this.makeMesh(MAX_RAILS, RAIL_COLOR);
-    this.pole = this.makeMesh(MAX_POLES, POLE_COLOR);
-    this.post = this.makeMesh(MAX_CROSSING, CROSSING_POST_COLOR);
+    // 砂利と木は粗く、レールだけ磨かれた金属にする。
+    // 同じ材質にまとめるとレールの光が死ぬので、ここだけメッシュを分ける価値がある。
+    this.bed = this.makeMesh(bedGeometry(), MAX_TRACK, 0.94, 0.02);
+    this.rail = this.makeMesh(railGeometry(), MAX_TRACK, 0.24, 0.92, 1.5);
+    this.deck = this.makeMesh(deckGeometry(), MAX_DECK, 0.88, 0.04);
+    this.pole = this.makeMesh(poleGeometry(), MAX_POLES, 0.55, 0.55);
+    // 架線は金属だが、細い円柱に強い鏡面を乗せると 1px の線の上でハイライトが
+    // 明滅して、かえってちらつく。粗さは残しつつ、**金属度は下げる**。
+    //
+    // 金属度 0.6 では拡散反射が 6 割削られるので、せっかく色を分けても
+    // 線が沈んで「どれも黒い糸」に見えていた（環境マップの映り込みは
+    // 1〜2px の線ではほとんど効かない）。金属度を下げて色そのものを残し、
+    // 空の映り込みは倍率のほうで足す。
+    this.wire = this.makeMesh(wireGeometry(), MAX_WIRE, 0.44, 0.28, 1.8);
+    this.crossing = this.makeMesh(crossingGeometry(), MAX_CROSSING, 0.7, 0.1);
+    this.platform = this.makeMesh(platformGeometry(), MAX_PLATFORM, 0.85, 0.04);
   }
 
-  /** 単位の箱（1×1×1、底面 y=0）。大きさは行列のスケールで決める。 */
-  private makeMesh(count: number, color?: number): InstancedMesh {
-    const geom = new BoxGeometry(1, 1, 1);
-    geom.translate(0, 0.5, 0);
-    // 建物レイヤと同じ理由で vertexColors は付けない（instanceColor だけを使う）。
-    const material = new MeshLambertMaterial(color === undefined ? {} : { color });
+  private makeMesh(
+    geom: BufferGeometry,
+    count: number,
+    roughness: number,
+    metalness: number,
+    envMapIntensity = 1,
+  ): InstancedMesh {
+    const material = surface({ vertexColors: true, roughness, metalness, envMapIntensity });
     this.materials.push(material);
     const mesh = new InstancedMesh(geom, material, count);
     mesh.count = 0;
@@ -124,24 +397,35 @@ export class RailLayer {
 
   update(sim: Simulation): void {
     const world = sim.world;
-    // 踏切は道路の有無でも変わるので、道路のエポックも見る。
-    if (world.epochs.rail === this.lastRailEpoch && world.epochs.roads === this.lastRoadEpoch) return;
+    // 踏切は道路の有無で、ホームは駅の有無で変わる。どちらのエポックも見る。
+    if (
+      world.epochs.rail === this.lastRailEpoch &&
+      world.epochs.roads === this.lastRoadEpoch &&
+      world.networkVersion === this.lastNetworkVersion
+    ) {
+      return;
+    }
     this.lastRailEpoch = world.epochs.rail;
     this.lastRoadEpoch = world.epochs.roads;
+    this.lastNetworkVersion = world.networkVersion;
 
-    let bed = 0;
-    let tie = 0;
-    let steel = 0;
+    let beds = 0;
+    let rails = 0;
+    let decks = 0;
     let poles = 0;
+    let wires = 0;
     let posts = 0;
+    let platforms = 0;
 
     for (let i = 0; i < TILE_COUNT; i++) {
       if (world.rail[i] === 0) continue;
-      const cx = (tileX(i) + 0.5) * TILE_M;
-      const cz = (tileY(i) + 0.5) * TILE_M;
+      const tx = tileX(i);
+      const ty = tileY(i);
+      const cx = (tx + 0.5) * TILE_M;
+      const cz = (ty + 0.5) * TILE_M;
       const gy = world.heightDm[i]! * TERRAIN_HEIGHT_SCALE;
       const conn = world.railConn(i);
-      const crossing = world.isLevelCrossing(i);
+      const isCrossing = world.isLevelCrossing(i);
 
       // 隣に線路がある向きごとに、中心から辺までの半区間を敷く。
       // こうすると曲がり角も分岐も、特別扱いを書かずに正しい形が出る。
@@ -149,110 +433,142 @@ export class RailLayer {
       const dirs = conn === 0 ? 0b0101 : conn;
       for (let d = 0; d < 4; d++) {
         if (!(dirs & (1 << d))) continue;
-        const alongZ = d === 0 || d === 2;
-        const sign = d === 1 || d === 2 ? 1 : -1;
-        const half = TILE_M / 2;
-        // 中心側を少し伸ばして重ねる。伸ばさないと、交差点の真ん中に十字の隙間が空く。
-        const len = half + 0.4;
-        const mid = (sign * (half - 0.4)) / 2;
-        const ox = alongZ ? 0 : mid;
-        const oz = alongZ ? mid : 0;
-
-        if (bed < MAX_BALLAST) {
-          // 踏切はバラストではなく踏切板。高さも道路の高さまで下げる。
-          // 斜面で地面から浮かないよう、少し埋めてから上へ伸ばす。
-          const h = (crossing ? BALLAST_H + SLEEPER_H : BALLAST_H) + BALLAST_SINK;
-          this.box(
-            this.ballast,
-            bed,
-            cx + ox,
-            gy - BALLAST_SINK,
-            cz + oz,
-            alongZ ? BALLAST_W : len,
-            h,
-            alongZ ? len : BALLAST_W,
-          );
-          this.ballast.setColorAt(bed, this.color.setHex(crossing ? DECK_COLOR : BALLAST_COLOR));
-          bed++;
+        const rot = DIR_ROT[d]!;
+        if (isCrossing) {
+          if (decks < MAX_DECK) this.place(this.deck, decks++, cx, gy, cz, rot);
+        } else if (beds < MAX_TRACK) {
+          this.place(this.bed, beds++, cx, gy, cz, rot);
         }
+        if (rails < MAX_TRACK) this.place(this.rail, rails++, cx, gy, cz, rot);
+      }
 
-        // 枕木。踏切では板の下に隠れるので置かない。
-        if (!crossing) {
-          const n = Math.floor(half / SLEEPER_PITCH);
-          for (let k = 0; k < n && tie < MAX_SLEEPERS; k++) {
-            const along = sign * (k + 0.5) * SLEEPER_PITCH;
-            this.box(
-              this.sleeper,
-              tie,
-              cx + (alongZ ? 0 : along),
-              gy + BALLAST_H,
-              cz + (alongZ ? along : 0),
-              alongZ ? SLEEPER_LEN : SLEEPER_THICK,
-              SLEEPER_H,
-              alongZ ? SLEEPER_THICK : SLEEPER_LEN,
-            );
-            tie++;
-          }
-        }
-
-        // レール 2 本。
-        for (let s = -1; s <= 1; s += 2) {
-          if (steel >= MAX_RAILS) break;
-          this.box(
-            this.rail,
-            steel,
-            cx + ox + (alongZ ? s * GAUGE_HALF : 0),
-            gy + BALLAST_H + SLEEPER_H,
-            cz + oz + (alongZ ? 0 : s * GAUGE_HALF),
-            alongZ ? RAIL_W : len,
-            RAIL_H,
-            alongZ ? len : RAIL_W,
+      // --- 架線柱と架線 ---
+      //
+      // 線路は斜めに進むとき「東へ 1 タイル・南へ 1 タイル」の階段状になるので、
+      // 「直線タイルにだけ架線を張る」と曲がり角だらけの路線ではほとんど架線が
+      // 張られない。そこで **tx + ty**（＝経路に沿って 1 タイルごとに 1 増える量）を
+      // 弧長の代わりに使い、直線でも曲がり角でも同じ規則で柱を立て、たわみを作る。
+      //
+      // 架線は「タイル中心 → 各辺」の折れ線として引く。軌道の敷き方と同じ規則なので、
+      // 曲線でも分岐でも線がレールから外れない。
+      const along = tx + ty;
+      const bits = ((dirs >> 0) & 1) + ((dirs >> 1) & 1) + ((dirs >> 2) & 1) + ((dirs >> 3) & 1);
+      // 吊架線のたわみ。柱と柱（POLE_PERIOD タイル）の間で放物線を描く。
+      const sagAt = (t: number): number => {
+        const p = ((((t % POLE_PERIOD) + POLE_PERIOD) % POLE_PERIOD)) / POLE_PERIOD;
+        return WIRE_SAG * 4 * p * (1 - p);
+      };
+      if (bits >= 2) {
+        for (let d = 0; d < 4; d++) {
+          if (!(dirs & (1 << d))) continue;
+          if (wires + 3 > MAX_WIRE) break;
+          // 中心から辺へ。辺は経路長で ±0.5 タイル先にあたる。
+          const ex = cx + (d === 1 ? HALF : d === 3 ? -HALF : 0);
+          const ez = cz + (d === 2 ? HALF : d === 0 ? -HALF : 0);
+          const step = d === 1 || d === 2 ? 0.5 : -0.5;
+          const y0 = gy + WIRE_Y - sagAt(along);
+          const y1 = gy + WIRE_Y - sagAt(along + step);
+          this.segment(this.wire, wires++, cx, y0, cz, ex, y1, ez, R_MESSENGER, WIRE_MESSENGER);
+          // トロリ線（パンタグラフが擦る線）。たわませない。
+          this.segment(
+            this.wire, wires++,
+            cx, gy + CONTACT_Y, cz, ex, gy + CONTACT_Y, ez,
+            R_CONTACT, WIRE_CONTACT,
           );
-          steel++;
+          // ハンガー。吊架線からトロリ線を吊る短い縦の線を、辺の手前に 1 本。
+          // これが無いと 2 本の線がただ平行に走っているだけに見える。
+          const hx = (cx + ex) / 2;
+          const hz = (cz + ez) / 2;
+          const hy = gy + WIRE_Y - sagAt(along + step / 2);
+          this.segment(
+            this.wire, wires++,
+            hx, hy, hz, hx, gy + CONTACT_Y, hz,
+            R_HANGER, WIRE_HANGER,
+          );
+        }
+      }
+      // 架線柱。3 タイルごと、線路の左右に交互に立てる。
+      // 道路が線路と並行に走っている区間（線路が道路敷を共用している）だけは、
+      // 柱が車道の真ん中に立ってしまうので避ける。
+      const railNS0 = (conn & 0b0101) !== 0;
+      const railEW0 = (conn & 0b1010) !== 0;
+      const roadConn0 = world.roadConn(i);
+      const roadParallel =
+        (railNS0 && (roadConn0 & 0b0101) !== 0 && !railEW0) ||
+        (railEW0 && (roadConn0 & 0b1010) !== 0 && !railNS0);
+      if (bits >= 2 && along % POLE_PERIOD === 0 && !roadParallel && poles < MAX_POLES) {
+        const railNS = railNS0 && !railEW0;
+        // 柱は軌道に直交する向きに張り出す。南北の線路なら東西へ。
+        const base = railNS ? 0 : Math.PI / 2;
+        // 立てたい側と、その反対側。
+        //
+        // 柱は線路中心から 3.3m、腕金はさらに軌道の上へ伸びる。隣のタイルが
+        // 建物なら、その庇や外階段が線路側へ張り出しているぶんと重なって
+        // **柱が建物の面を突き抜けて生える**。交互に立てるだけの規則では
+        // それを避けられないので、建物のある側は選ばない
+        //（両側とも建物なら、その 1 本は立てずに飛ばす。3 タイルに 1 本なので
+        //  1 本抜けても架線は繋がったままに見える）。
+        const want = ((along / POLE_PERIOD) | 0) % 2 === 0 ? 1 : -1;
+        let side = 0;
+        for (const cand of [want, -want] as const) {
+          const d = railNS ? (cand > 0 ? 1 : 3) : cand > 0 ? 0 : 2;
+          const nb = neighbor(i, d);
+          if (nb >= 0 && world.buildingRef[nb] !== 0) continue;
+          side = cand;
+          break;
+        }
+        if (side !== 0) this.place(this.pole, poles++, cx, gy, cz, base + (side > 0 ? 0 : Math.PI));
+      }
+
+      // --- 踏切の警報機・遮断機 ---
+      //
+      // 「線路と道路が同じタイルにある」だけで警報機を立てると、線路に沿って
+      // 道が走っている区間では 1 タイルごとに遮断機の林ができてしまう。
+      // **道路が線路を横切っている**ときだけ立てる。置くのは道路の左右 1 組で、
+      // 腕が道路を跨ぐ向きに構える。
+      const roadNS = (roadConn0 & 0b0101) !== 0;
+      const roadEW = (roadConn0 & 0b1010) !== 0;
+      const gated = isCrossing && ((railNS0 && !railEW0 && roadEW) || (railEW0 && !railNS0 && roadNS));
+      if (gated && posts + 2 <= MAX_CROSSING) {
+        // 道路の進む向きに沿って軌道の手前と奥、道路の左側に 1 基ずつ。
+        const alongRoadZ = roadNS;
+        for (const s2 of [1, -1] as const) {
+          // 車道の外（歩道側）に立てる。中に入れると遮断機が路上に生える。
+          const ox = alongRoadZ ? -s2 * 4.3 : s2 * 4.6;
+          const oz = alongRoadZ ? s2 * 4.6 : s2 * 4.3;
+          // 腕は道路の中心へ向かって伸ばす。
+          const rot = alongRoadZ ? (s2 > 0 ? Math.PI / 2 : -Math.PI / 2) : s2 > 0 ? Math.PI : 0;
+          this.place(this.crossing, posts++, cx + ox, gy, cz + oz, rot);
         }
       }
 
-      // --- 架線柱 ---
-      // 直線区間にだけ、間を空けて立てる。日本の鉄道風景はこれで決まる。
-      const straightNS = conn === 0b0101;
-      const straightEW = conn === 0b1010;
-      const h = (i * 2654435761) >>> 0;
-      if ((straightNS || straightEW) && !crossing && h % POLE_PERIOD === 0 && poles + 1 < MAX_POLES) {
-        const side = h & 0x10000 ? 1 : -1;
-        const px = cx + (straightNS ? side * POLE_SIDE : 0);
-        const pz = cz + (straightNS ? 0 : side * POLE_SIDE);
-        this.box(this.pole, poles, px, gy, pz, 0.3, POLE_H, 0.3);
-        poles++;
-        // ビーム（線路の上に張り出す腕）。これが無いとただの棒に見える。
-        this.box(
-          this.pole,
-          poles,
-          px - (straightNS ? (side * POLE_SIDE) / 2 : 0),
-          gy + POLE_H - 0.45,
-          pz - (straightNS ? 0 : (side * POLE_SIDE) / 2),
-          straightNS ? POLE_SIDE : 0.18,
-          0.22,
-          straightNS ? 0.18 : POLE_SIDE,
-        );
-        poles++;
-      }
-
-      // --- 踏切の警報機 ---
-      if (crossing && posts + 4 <= MAX_CROSSING) {
-        for (let k = 0; k < 4; k++) {
-          const sx = k & 1 ? 1 : -1;
-          const sz = k & 2 ? 1 : -1;
-          this.box(this.post, posts, cx + sx * 3.4, gy + 0.35, cz + sz * 3.4, 0.24, 2.6, 0.24);
-          posts++;
+      // --- 駅のホーム ---
+      // 線路の隣が駅の建物なら、その側にホームを敷く。
+      if (platforms < MAX_PLATFORM && !isCrossing) {
+        for (let d = 0; d < 4; d++) {
+          const nb = neighbor(i, d);
+          if (nb < 0 || !isStationTile(sim, nb)) continue;
+          // 線路の走る向きに沿ってホームを敷く（線路と直交させない）。
+          const alongZ = (conn & 0b0101) !== 0 || conn === 0;
+          const toPlusX = d === 1;
+          const toMinusX = d === 3;
+          const toPlusZ = d === 2;
+          if (alongZ && !toPlusX && !toMinusX) continue;
+          if (!alongZ && (toPlusX || toMinusX)) continue;
+          const rot = alongZ ? (toPlusX ? 0 : Math.PI) : toPlusZ ? -Math.PI / 2 : Math.PI / 2;
+          this.place(this.platform, platforms++, cx, gy + RAIL_TOP_M, cz, rot);
+          break;
         }
       }
     }
 
-    this.ballast.count = bed;
-    this.sleeper.count = tie;
-    this.rail.count = steel;
-    this.pole.count = poles;
-    this.post.count = posts;
+    setCount(this.bed, beds);
+    setCount(this.rail, rails);
+    setCount(this.deck, decks);
+    setCount(this.pole, poles);
+    setCount(this.wire, wires);
+    setCount(this.crossing, posts);
+    setCount(this.platform, platforms);
     for (const mesh of this.meshes) {
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -260,21 +576,44 @@ export class RailLayer {
     }
   }
 
-  private box(
-    mesh: InstancedMesh,
-    index: number,
-    x: number,
-    y: number,
-    z: number,
-    sx: number,
-    sy: number,
-    sz: number,
-  ): void {
+  /** 実寸で焼いた部品を、位置と Y 回転だけで置く。 */
+  private place(mesh: InstancedMesh, index: number, x: number, y: number, z: number, rotY: number): void {
     this.pos.set(x, y, z);
-    this.scl.set(sx, sy, sz);
-    this.quat.identity();
+    this.quat.setFromAxisAngle(this.axisY, rotY);
+    this.scl.set(1, 1, 1);
     this.mat.compose(this.pos, this.quat, this.scl);
     mesh.setMatrixAt(index, this.mat);
+  }
+
+  /**
+   * 2 点を結ぶ棒（架線）。+Z 長さ 1 のジオメトリを伸ばして向ける。
+   *
+   * @param radius 断面の太さの倍率。吊架線・トロリ線・ハンガーで変える。
+   * @param color  線の色。`instanceColor` で与えるのでメッシュは 1 本のままでよい。
+   */
+  private segment(
+    mesh: InstancedMesh,
+    index: number,
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number,
+    radius: number,
+    color: number,
+  ): void {
+    this.dir.set(bx - ax, by - ay, bz - az);
+    const len = this.dir.length();
+    if (len < 1e-4) return;
+    this.dir.divideScalar(len);
+    this.quat.setFromUnitVectors(this.forward, this.dir);
+    this.pos.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+    this.scl.set(radius, radius, len);
+    this.mat.compose(this.pos, this.quat, this.scl);
+    mesh.setMatrixAt(index, this.mat);
+    this.wireColor.setHex(color);
+    mesh.setColorAt(index, this.wireColor);
   }
 
   dispose(): void {
@@ -284,4 +623,19 @@ export class RailLayer {
     }
     for (const material of this.materials) material.dispose();
   }
+}
+
+/** そのタイルが駅の建物か。ホームを敷く場所を決めるのに使う。 */
+function isStationTile(sim: Simulation, tile: number): boolean {
+  const ref = sim.world.buildingRef[tile]!;
+  if (ref === 0) return false;
+  const slot = ref - 1;
+  if (sim.buildings.alive[slot] !== 1) return false;
+  return archetype(sim.buildings.archetypeId[slot]!).mesh === 'station';
+}
+
+/** 空のインスタンス群はシーンから外す（count=0 でもドローコールを 1 つ使うため）。 */
+function setCount(mesh: InstancedMesh, n: number): void {
+  mesh.count = n;
+  mesh.visible = n > 0;
 }
